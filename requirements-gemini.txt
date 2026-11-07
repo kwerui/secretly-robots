@@ -1,0 +1,2 @@
+# Optional cloud integration. The offline-first default only needs requirements.txt.
+google-genai>=3.0.0

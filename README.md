@@ -36,13 +36,14 @@ You can use the virtual environment you've already created in your original neut
 ```text
 User: "Bring me the bottle"
              |
-  Intent understanding [offline rules / OPTIONAL local Gemma 4]
+  Intent understanding [offline rules / optional local Gemma 4 / optional Gemini Argon]
              |
     FetchTask(item_id="water_bottle", destination="sofa")
              |
   Fresh sensor-derived observation  <--- MuJoCo + teammates' perception code
              |
-   Task planner selects NEXT action based on current world state
+   Local planner selects NEXT action based on current world state
+       \ optional Gemini Argon proposal only when task-relevant state changes
              |
   Deterministic Python guard checks whether action is permitted
              |
@@ -95,7 +96,23 @@ This sends a **real** structured-output request to your local model, using only 
 
 ### Optional Google DeepMind prize integration (cloud, not required for offline base)
 
-Use the opt-in `brain/gemini_optional.py` adapter only if you decide to demonstrate genuine Gemini 4 Argon API usage. This requires `pip install "google-genai>=2.3.0"`, `GEMINI_API_KEY` as an environment variable and network access; its call path has **not been live-tested with credentials**. The primary offline loop must keep working if Gemini cannot be reached. Never commit credentials or disguise rules as Gemini output. For the Best Use of Gemini prize, add a meaningful, verified multimodal cloud call *if the team has time*.
+Gemini is intentionally opt-in. Install the official SDK separately, set the key only in your shell, then choose the adapter explicitly in application code:
+
+```bash
+python -m pip install -r requirements-gemini.txt
+export GEMINI_API_KEY='your-key'  # never place a real key in a repository file
+python -m scripts.gemini_smoke_test --live
+```
+
+```python
+from brain.engine import Brain
+from brain.gemini_optional import GeminiIntentParser, GeminiPlanner
+
+brain = Brain(parser=GeminiIntentParser(), gemini_planner=GeminiPlanner())
+brain.start_task("Bring the water bottle from the cupboard drawer to the person on the sofa")
+```
+
+The adapter uses `gemini-4-argon` and the official `google-genai` structured JSON schema API. It creates a checked `FetchTask` from the request and can propose one checked next `Decision` from an interpreted `Observation`; it never parses free-form explanations. The cloud proposal is attempted once for each task-relevant state change, not every physics step. The existing local planner remains the default and is used if the API is unavailable, times out, returns invalid JSON, or proposes an action rejected by local safety validation. `python -m scripts.gemini_smoke_test --live` is the deliberate real-API check and may incur API usage; normal tests use mocked SDK responses and never need a key or network access.
 
 ## What is already implemented vs. not
 
@@ -107,7 +124,7 @@ Use the opt-in `brain/gemini_optional.py` adapter only if you decide to demonstr
 | Human-near / lost-sensor stop and retry limit | ✅ High-level decision logic; real emergency braking must be wired |
 | JSONL decision and feedback logging | ✅ Implemented |
 | Local model interpreting requests through Ollama | 🟡 Adapter implemented; requires Ollama/model; not live-tested here |
-| Google Gemini cloud option | 🟡 Optional adapter; requires API credentials; not live-tested here |
+| Google Gemini Argon cloud option | ✅ Structured, locally validated optional adapter; mocked unit-tested; real API requires the deliberate smoke test |
 | Simulated cameras/object-recognition/robot control | ⏳ Teammates' integration needed |
 | Autonomous drawer opening and grasping | ⏳ Teammates' integration needed |
 | One-shot learned manipulation policy from video | ❌ Not implemented; `teach_once.py` stores **symbolic** task goals only |
@@ -121,10 +138,11 @@ brain/
   intent.py           # deterministic parser + optional local Gemma/Ollama parser
   planner.py          # choose next high-level action from fresh observations
   safety.py           # deterministic command validation
-  engine.py           # orchestration, retries, JSONL logs
+  engine.py           # orchestration, local fallback, retries and JSONL logs
   integration.py      # interface teammates implement for actual MuJoCo
   teach_once.py       # small symbolic goal memory; not motor imitation
-  gemini_optional.py  # opt-in cloud Gemini interpreter
+  gemini_client.py    # official google-genai structured-output boundary
+  gemini_optional.py  # checked Gemini task/next-decision adapters
   demo.py             # hand-authored explanatory example
 robot_core/            # original neutral MuJoCo smoke-test scaffold
 scenes/smoke.xml       # real minimal physics test scene
