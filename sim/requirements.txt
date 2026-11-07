@@ -2,3 +2,4 @@ mujoco>=3.3
 numpy
 pillow
 pytest
+opencv-python-headless
