@@ -5,3 +5,4 @@ house.xml
 snapshots/
 .env
 *.key
+MUJOCO_LOG.TXT
