@@ -28,19 +28,11 @@ MuJoCo camera/range/contact -> perception team's detector -> Observation
                                   |
                               REPEAT
 
-Optional CLOUD Gemini 4 Argon: opt-in intent interpretation only;
-never required for the base demo and never silently used as fallback.
+Optional CLOUD Gemini 4 Argon: opt-in request interpretation and one current
+high-level decision proposal per task-relevant observation change. It never
+controls motors and is never required for the base demo.
 ```
 
-## Division of responsibilities
-
-| Layer | Proposed owner | Contract |
-| --- | --- | --- |
-| AI brain / task interpretation / plan + replanning | You | `Brain.start_task(text)` and `Brain.next_action(observation)` |
-| Scene and robot (quadruped + arm if feasible) | Robot team | Valid MuJoCo MJCF, actuators, sensors |
-| Perception (camera/depth/object detection) | Perception teammate | `PerceptionBridge.latest_observation()` |
-| Locomotion, drawer opening and grasping | Robot team | `ControllerBridge.execute_high_level(decision)` |
-| Integration / testing / demo | Shared | Real action feedback, tests, one-take video |
 
 ## Example state and action contract
 
@@ -66,7 +58,15 @@ Only the team's controller translates `open_drawer` into joint control and a gra
 
 - **Rules (default):** offline and instant, but limited to predefined commands; this is NOT a learned or generative AI model.
 - **Gemma 4 via Ollama:** a REAL, fully local text-model call for request interpretation (after downloading weights). It does not do navigation or perceive images in the current scaffold. Failure is explicit; no fake responses.
-- **Gemini 4 Argon:** optional cloud API adapter for contest demonstration or comparison. Requires Wi-Fi and a key; not part of the offline base. Most of the system works if it is unavailable.
+- **Gemini 4 Argon:** optional `google-genai` structured-output adapter. It converts a request into a checked `FetchTask`, or proposes one checked next `Decision` from the latest interpreted observation. The engine calls it only after a task-relevant state change, never merely because a physics tick advanced. Local schema checks and `safety.validate` independently reject invalid or unsafe proposals, then retain the deterministic planner's decision. It requires Wi-Fi and `GEMINI_API_KEY`; it is not part of the offline base.
+
+## Gemini boundary and failure handling
+
+`brain/gemini_client.py` is the only module that imports the optional official SDK and it requests `application/json` with an explicit response JSON schema, following the [Google Gen AI SDK structured-output API](https://googleapis.github.io/python-genai/#json-response-schema). `brain/gemini_optional.py` validates exact keys, permitted task fields and existing action names before a `Decision` can cross into the engine. `brain/engine.py` validates every selected decision again against fresh observation with `brain/safety.py`.
+
+If the SDK is not installed, no key is configured, the request times out, the internet is unavailable, JSON is malformed, a field is invalid, or local safety rejects a proposed target, the engine uses the local deterministic plan. If a cloud intent parser fails, `Brain` falls back to the offline rules parser. API keys are read only from `GEMINI_API_KEY` at runtime and are never logged.
+
+The planner operates on `Observation`, which is interpreted sensor data supplied by teammates; it does not claim camera detection, raw-image reasoning, robot navigation, drawer actuation or grasping has been implemented. `ControllerBridge.execute_high_level()` remains the interface that robot-control code must implement.
 
 Local model memory, size and latency depend on hardware. Measure them on the intended demo device; do not claim unsupported throughput or inference timings.
 
