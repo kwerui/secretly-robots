@@ -1,0 +1,13 @@
+## One-Shot Learning
+Learning to open cupboards and drawers from the carer: yes, this is your best one-shot story. Change three things:
+
+Put the marker on the door or drawer front, not the handle. The carer’s hand will cover a marker on the handle at exactly the moment you need it. A fixed offset still gives you the handle’s path.
+Record the path relative to a second marker fixed on the cabinet body. Then the demo still makes sense when the robot stands somewhere else.
+Fit the motion instead of replaying it. If the path is an arc, it’s a hinge (axis plus radius); if it’s a straight line, it’s a drawer. Then generate your own IK waypoints along that fitted motion. Raw replay carries the camera jitter into the arm, so the arm ends up fighting the hinge’s arc and the contacts in MuJoCo can blow up. Fitting is also easier to defend, because the robot learned how the cupboard moves, not just a recording. That’s the classic idea of learning articulation models from watching. The same fit can also set the sim cabinet’s dimensions.
+Sim tip: if the gripper slips on the handle, turn on a weld constraint when it closes. Everyone does this in sim; just don’t hide it if asked.
+
+## Demonstrations
+A simulated carer: don’t simulate one with physics. Film the real carer, and drive a “ghost” in the sim with MediaPipe Pose, either a stick figure or a MuJoCo humanoid moved purely kinematically. Move the objects in the sim straight from their ArUco poses. The ghost is for show and doesn’t push anything. The learning comes from the marker tracks, not from the robot’s simulated camera watching an avatar. Real video next to its sim twin is the strongest thing you can show, and it’s work a teammate can do. Neat ready-made webcam-to-humanoid pipelines exist, but this is quicker to build than to set up.
+
+## Which Robot?
+Humanoid: yes, it exists, and it is easier to defend for this idea. LeRobot supports the G1 in MuJoCo. A single lerobot-teleoperate command with --robot.is_simulation=true and --robot.controller=GrootLocomotionController starts the sim. The locomotion controller handles the lower body automatically, and you control the upper body (arms, wrists, waist). It also includes an arm IK solver accessible through the G1_29_ArmIK class. For hands, dex1 gives parallel grippers (the default) and dex3 gives three-finger hands; use dex1. In the sim, keys 7 and 8 raise and lower the waist height. The standalone sim on HF has a ROBOT_SCENE environment variable for your own MuJoCo scene, so you can build the home scene.
