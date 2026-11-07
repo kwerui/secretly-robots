@@ -1,33 +1,46 @@
 # House simulation (MuJoCo)
 
-The house the fetch robot works in. It's an 8 × 6 m flat with four rooms (living room, kitchen, bedroom, study) connected by four doorways in a loop. A user sits on the living-room sofa, and a blue water bottle stands on one of five surfaces.
+The house the assistive fetch robot works in. It's an 8 × 6 m flat with four rooms (living room, kitchen, bedroom, study) connected by four doorways in a loop. A user with limited mobility sits on the living-room sofa with a dedicated delivery station, and a target water bottle is placed on furniture surfaces or inside drawers.
 
-- **Doors** are hinged and swing up to 90° either way, so the robot can push them open from either side. Each reset starts them at a random angle, and they stay where they're pushed. A layout can lock a door shut.
-- **Chests of drawers** (bedroom dresser, kitchen drawers, study filing cabinet) have sliding drawers with long bar handles to grab and pull.
-- **Clutter** is moved and jittered on every reset.
+- **Three Testing Modes / Variables**:
+  - `static` (Level 1): Baseline static house layout, nominal furniture, static seated user.
+  - `shuffled` (Level 2): The coffee table, kitchen table, bedside table and desk are moved (up to ±0.4 m, ±20°) on every reset, and target items are placed on tabletops, counters, or inside closed drawers.
+  - `dynamic` (Level 3): A dynamic person walks into the house, approaches an item, and relocates it, testing obstacle avoidance and adaptive replanning.
+- **Doors are push-only**: Hinged leaves with wide stainless steel push plates on both faces and ArUco markers. No knobs or turn latches; the robot pushes through from either side.
+- **Chests of drawers**: Sliding drawers with long bar handles (spanning ~75% of chest width) for easy grasping, ArUco markers on each drawer front, and full support for target items stored inside drawer trays.
+- **Visual Revamp**: Photorealistic procedural textures (oak parquet flooring, ceramic slate tiles, woven loop carpet, wall plaster, marble countertops, natural wood grain, sofa fabric, brushed stainless steel, and Scandinavian geometric rug) with warm recessed room downlights.
+- **Realistic People**: Detailed anatomical models for the seated person with limited mobility and the dynamic walking adult human.
+- **ArUco Markers**: Standard OpenCV `DICT_4X4_50` markers on the target bottle, door push plates, drawer fronts, and user delivery station.
+- **Cameras**: Full dollhouse `overview`, four room cameras (`cam_living`, `cam_kitchen`, `cam_bedroom`, `cam_study`), and a first-person robot head camera (`cam_robot_head`). The head camera follows the attached robot's root body every `step()` (its x, y and heading, at height `HEAD_CAM_Z`). Without a robot it stays at `ROBOT_START`.
 
-Everything lives in this folder and is driven by one file, [`house_env.py`](house_env.py).
+Everything lives in this folder and is driven by [`house_env.py`](house_env.py).
 
 ## Run it
 
 ```bash
 cd sim
-./setup.sh      # makes .venv, installs mujoco/numpy/pillow/pytest, checks every layout, renders snapshots
+./setup.sh      # makes .venv, installs mujoco/numpy/pillow/pytest/opencv, checks every layout, renders snapshots
 ./run_sim.sh    # interactive viewer (uses mjpython on macOS, which the viewer needs)
 ```
 
-Viewer options and keys:
+Viewer options and modes:
 
 ```bash
+./run_sim.sh --mode static                       # Level 1: Static house
+./run_sim.sh --mode shuffled                     # Level 2: Shuffled furniture & drawer targets
+./run_sim.sh --mode dynamic                      # Level 3: Dynamic human walking and moving bottle
 ./run_sim.sh --layout door_shut --target study_desk --seed 3
 ```
 
-| Key   | Action                                       |
-|-------|----------------------------------------------|
-| SPACE | new random layout + bottle position          |
-| L     | next layout (same bottle position)           |
-| T     | next bottle position (same layout)           |
-| O     | new random angles for the unlocked doors     |
+| Key   | Action                                                   |
+|-------|----------------------------------------------------------|
+| SPACE | new random layout + bottle position                      |
+| 1     | switch to Mode 1 (Static House)                          |
+| 2     | switch to Mode 2 (Shuffled Furniture & Drawers)          |
+| 3     | switch to Mode 3 (Dynamic Walking Person Relocating Item)|
+| L     | next layout (same bottle position)                       |
+| T     | next target position (surfaces + drawer targets)         |
+| O     | new random angles for the unlocked doors                 |
 
 To push a door or pull a drawer yourself: double-click it, then hold Ctrl and right-drag.
 
@@ -35,9 +48,46 @@ Other commands (run them from `sim/` with `.venv/bin/python`):
 
 ```bash
 .venv/bin/python house_env.py --check       # table of every layout × target: solvable? path length?
-.venv/bin/python house_env.py --snapshot    # PNGs in sim/snapshots/ (overview, 4 room cams, occupancy grid)
+.venv/bin/python house_env.py --snapshot    # PNGs in sim/snapshots/ (overview, room cams, robot head cam, dynamic)
 .venv/bin/python house_env.py --write-xml   # dump the scene to sim/house.xml
 .venv/bin/python -m pytest -q               # tests
+```
+
+## Challenge Levels / Test Variables
+
+| Mode       | Level | Description | What it tests |
+|------------|-------|-------------|---------------|
+| `static`   | 1     | Nominal furniture, static seated user, push doors, closed drawers | Baseline fetch task |
+| `shuffled` | 2     | Movable furniture (`movable=True` in `FURNITURE`) shifted and rotated each reset, with the bottle on it; jittered clutter; bottle can be placed on surfaces or **inside drawers** | Adapting to relocated furniture, finding items in drawers, pulling long handles |
+
+Each piece is re-drawn until it's clear of walls, other furniture, drawers and door swings. The whole layout is then checked like clutter: the bottle must be reachable and no doorway may be cut off. `info["furniture"]` gives each piece's `(x, y, yaw_deg)`. The dresser is a 1.10 m tallboy so the bottle stands upright in every drawer. Pull drawers steadily (about 10 N): the bottle stays upright, but a yank that slams the drawer into its end stop knocks it over.
+| `dynamic`  | 3     | A person walks in from another room, picks up the water bottle, carries it to another surface and walks back out | Obstacle avoidance (`person_too_close`), dynamic replanning when item moves mid-run |
+
+The person's route is planned on the occupancy grid at every reset, after the clutter is placed, so they walk round furniture, clutter, open door leaves and the robot instead of through them. If half-open doors cut off every route, they push the unlocked ones fully open first. The bottle goes to the first surface in `PERSON_DROPS` that isn't where it started and that both the person and the robot can reach (`info["person_drop"]`). Once it's put down it's an ordinary free body again, so the robot can pick it up. Tunables: `PERSON_R`, `PERSON_SPEED`, `PERSON_REACH`, `PERSON_ENTRIES`, `PERSON_DROPS`.
+
+## ArUco Marker Registry
+
+Pre-generated into `sim/assets/aruco/` using standard OpenCV `DICT_4X4_50`:
+
+| Marker ID | Name | Entity |
+|-----------|------|--------|
+| **0** | `target_bottle` | Water bottle target item badge |
+| **1** | `target_medicine` | Secondary medicine target item |
+| **10 / 11** | `door_living_kitchen_a/b` | Living ↔ Kitchen push plates (Side A / Side B) |
+| **12 / 13** | `door_bedroom_study_a/b` | Bedroom ↔ Study push plates (Side A / Side B) |
+| **14 / 15** | `door_living_bedroom_a/b`| Living ↔ Bedroom push plates (Side A / Side B) |
+| **16 / 17** | `door_kitchen_study_a/b` | Kitchen ↔ Study push plates (Side A / Side B) |
+| **20–23** | `drawer_dresser_0..3` | Bedroom dresser sliding drawers (bottom to top) |
+| **24–26** | `drawer_kitchen_0..2` | Kitchen drawer unit sliding drawers (bottom to top) |
+| **27–29** | `drawer_filing_0..2` | Study filing cabinet sliding drawers (bottom to top) |
+| **30–34** | `anchor_*` | Table / counter / desk location anchors |
+| **40** | `user_station` | Seated user delivery tray station |
+| **45** | `dynamic_person` | Dynamic walking human tracking badge |
+
+Perception helper:
+```python
+from sim.aruco import detect_markers
+dets = detect_markers(rgb_image)  # returns [{'id': int, 'name': str, 'kind': str, 'center': (x,y), ...}]
 ```
 
 ## Layouts
@@ -48,86 +98,51 @@ Other commands (run them from `sim/` with `.venv/bin/python`):
 | `laundry_day`    | none             | laundry basket, 3 clothes piles, bag, chair   | narrow gaps, small obstacles                   |
 | `door_shut`      | living ↔ kitchen | chair, box                                    | must go round via bedroom + study              |
 | `moving_house`   | none             | 8 cardboard boxes in every room               | heavy clutter, some doorways semi-blocked      |
-| `long_way_round` | living ↔ bedroom | basket, clothes, bag, chair                   | longest detour (9.25 m to the bedside table)   |
+| `long_way_round` | living ↔ bedroom | basket, clothes, bag, chair                   | longest detour (9.10 m to the bedside table)   |
 
 `moving_house` also starts the bedroom ↔ study door closed. That door isn't locked, so the robot can push it open.
 
-On each reset every obstacle is jittered by ±15 cm and ±10°. A jittered layout is only kept if three things hold:
-- no obstacle penetrates a wall, furniture, a door, a drawer or another obstacle;
-- no obstacle sits anywhere in an unlocked door's swing or in front of a drawer, so every door can be pushed fully both ways and every drawer pulled fully out;
-- the robot can still drive from its start pose to within reach of the bottle. Unlocked doors count as passable here, since the robot can push them. Otherwise the jitter is resampled, and after 50 failed tries the un-jittered layout is used (the tests check that one is always valid).
+## Target Locations (`ALL_TARGETS`)
 
-Bottle positions (`TARGETS`): `tv_unit`, `kitchen_counter`, `kitchen_table`, `bedside_table`, `study_desk`.
-
-## Changing things
-
-All the settings are plain dicts and constants at the top of `house_env.py`, in the `CONFIG` section.
-
-**Move or add clutter.** Edit a layout in `LAYOUTS`. Each obstacle is `(type, x, y, yaw_deg)`, and the types come from `OBSTACLE_TYPES`. Coordinates are in metres: the house spans x ∈ [-4, 4] and y ∈ [-3, 3]. The living room is at bottom-left (−x, −y), the kitchen bottom-right, the bedroom top-left and the study top-right. The robot starts at `ROBOT_START = (-1.8, -1.0)`.
-
-**Add a layout.** Add a new key to `LAYOUTS`. `doors_locked` doors are shut and can't be pushed. `doors_closed` doors start shut but can be pushed. Every other door starts at a random angle.
-
-```python
-"chaos": dict(
-    doors_locked=["kitchen_study"],
-    doors_closed=["living_bedroom"],
-    obstacles=[("box_large", 1.0, -0.5, 30), ("bag", -1.0, 1.0, 0)],
-),
-```
-
-Then run `--check`. It lists any combination that's blocked or overlapping, and `--snapshot` writes a `<layout>__grid.png` showing what the planner sees: grey is blocked, green is the start, blue is the bottle and the area within reach of it.
-
-**Add a bottle position.** Add `"name": (x, y, "furniture_name")` to `TARGETS`. The z height comes from that furniture's `h`, so the point must lie on its top.
-
-**New obstacle shape.** Add an entry to `OBSTACLE_TYPES` made of `("box", (hx, hy, hz), (px, py, pz))` / `("cyl", (r, hz), (px, py, pz))` geoms. Sizes are half-extents and the body origin is on the floor.
-
-**Furniture / walls / doors.** These are set in `FURNITURE`, `WALLS` and `DOORWAYS`. Doorways cut gaps into walls automatically, and `hinge` picks which jamb the door hangs on. Each door's swing is trimmed automatically if the leaf would hit furniture or an open drawer; `--check` prints the resulting ranges.
-
-**Drawers.** Each chest in `DRAWER_UNITS` has a footprint centre `pos`, a `facing` (the direction in degrees the drawers pull out), a `size` of (width, depth), a height `h` and a drawer count `n`. Drawers are named `drawer_<chest>_<i>` (0 = bottom), with slide joint `drawer_<chest>_<i>_slide`, and a site `drawer_<chest>_<i>_handle` at the middle of the handle bar for grasping.
+- **Surfaces**: `tv_unit`, `kitchen_counter`, `kitchen_table`, `bedside_table`, `study_desk`, `coffee_table`
+- **Drawers**: `dresser_drawer` (top dresser drawer), `kitchen_drawer` (top kitchen drawer), `filing_drawer` (top filing drawer)
 
 ### Tunables
 
 | Name                       | Default | Meaning                                                           |
 |----------------------------|---------|-------------------------------------------------------------------|
-| `ROBOT_R`                  | 0.30 m  | robot footprint radius used to inflate obstacles in the checker  |
-| `ROBOT_H`                  | 0.80 m  | geoms whose underside is above this don't block the robot         |
-| `REACH`                    | 0.80 m  | robot centre must get this close (xy) to the bottle               |
-| `ROBOT_START`              | (-1.8, -1.0, 0°) | start / delivery pose in front of the user               |
+| `ROBOT_R`                  | 0.28 m  | humanoid robot footprint radius used to inflate obstacles in grid |
+| `ROBOT_H`                  | 1.65 m  | humanoid standing height                                          |
+| `REACH`                    | 0.85 m  | humanoid robot arm reach envelope                                 |
+| `ROBOT_START`              | (-1.8, -1.0, 0°) | start / delivery pose in front of user in living room     |
 | `DOOR_W`                   | 1.00 m  | doorway width                                                     |
-| `WALL_H`                   | 1.20 m  | wall height (low so the angled cameras can see in)                |
+| `WALL_H`                   | 1.20 m  | wall height (low so angled cameras can see in)                    |
 | `JITTER_XY`, `JITTER_YAW`  | 0.15 m, 10° | per-reset randomisation                                       |
-| `DOOR_SWING_DEG`           | 90°     | max door swing each way                                           |
-| `DOOR_DAMPING`, `DOOR_FRICTION`, `DOOR_MASS` | 1.5, 0.3, 12 kg | how heavy a door feels to push; friction keeps it where it's left |
+| `DOOR_SWING_DEG`           | 90°     | max door swing each way (push-only)                               |
+| `DOOR_DAMPING`, `DOOR_FRICTION`, `DOOR_MASS` | 1.8, 0.35, 12 kg | push door inertia and friction stay   |
 | `DRAWER_EXTENSION`         | 0.8     | fraction of its depth a drawer can slide out                      |
-| `HANDLE_FRACTION`, `HANDLE_R`, `HANDLE_STANDOFF` | 0.75, 12 mm, 45 mm | handle bar length (× chest width), radius, and gap from the front |
-| `DRAWER_DAMPING`, `DRAWER_FRICTION` | 4 N·s/m, 0.5 N | how stiff a drawer feels                               |
+| `HANDLE_FRACTION`, `HANDLE_R`, `HANDLE_STANDOFF` | 0.75, 12 mm, 45 mm | long bar handle length, radius, standoff |
+| `DRAWER_DAMPING`, `DRAWER_FRICTION` | 25 N·s/m, 0.5 N | sliding resistance of drawers (10 N pull ≈ 0.4 m/s) |
+| `SHUFFLE_XY`, `SHUFFLE_YAW`, `SHUFFLE_TRIES` | 0.40 m, 20°, 30 | shuffled-mode furniture moves, and draws per piece |
+| `HEAD_CAM_Z`               | 1.55 m  | height of `cam_robot_head`                                        |
 | `GRID_RES`                 | 0.05 m  | occupancy grid cell size                                          |
-
-The Aliengo + Z1 body is about 0.65 × 0.30 m, so its circumscribed radius is about 0.38 m. `ROBOT_R = 0.30` assumes it turns carefully in doorways. Raise it to 0.38 for a conservative check, and widen doorways or move furniture if `--check` then fails.
 
 ## Using it from code
 
 ```python
-from house_env import HouseEnv
-env = HouseEnv(seed=0)                        # or HouseEnv(robot_xml=".../aliengo_z1.xml")
-info = env.reset()                            # random layout + target; or reset("door_shut", "study_desk")
-env.step(500)
-env.bottle_xyz(), env.data.site("waterbottle_site").xpos
-env.check().grid                              # bool occupancy grid (True = blocked), useful for a planner
-env.info["doors"], env.locked_doors           # door start angles (deg) and which are locked
-env.door_angle("kitchen_study"); env.set_door("kitchen_study", 0.0)
-env.set_drawers(0.5)                          # all drawers half open
-env.data.site("drawer_dresser_3_handle").xpos # top dresser drawer's handle
+from sim.house_env import HouseEnv, Mode
+env = HouseEnv(seed=0)
+
+# Mode 1: Static baseline
+info = env.reset(mode=Mode.STATIC)
+
+# Mode 2: Shuffled furniture and drawer targets
+info = env.reset("tidy", "kitchen_drawer", mode=Mode.SHUFFLED)
+env.bottle_xyz()                              # bottle is located inside drawer tray
+env.data.site("drawer_kitchen_drawers_2_handle").xpos # drawer handle site for grasping
+
+# Mode 3: Dynamic human walking and moving bottle
+env.reset("tidy", "kitchen_counter", mode=Mode.DYNAMIC)
+env.step(4000)                                # person walks in and carries bottle
+print(env.dynamic_state)                      # {'active': True, 'carrying': True, 'person_too_close': False, ...}
 ```
-
-Names follow the robot repo's MuJoCo scene: body `waterbottle` with site `waterbottle_site`, whose world orientation matches theirs. The user's hand-over point is the site `user_hand`. The cameras are `overview` (top-down) and `cam_living`, `cam_kitchen`, `cam_bedroom`, `cam_study`.
-
-## Adding the robot
-
-```bash
-./run_sim.sh --robot ../trash-collection-isaaclab/deploy/mujoco/models/aliengo_z1.xml
-```
-
-The robot MJCF is attached with `MjSpec.attach`, so mesh paths resolve relative to the robot file and its names (`trunk`, keyframes `home`/`down`) are kept unchanged. Any floor plane or light in the robot file is dropped. The root free joint is auto-detected (override it with `--robot-joint`). The robot is placed at `ROBOT_START`, at the height from its `home` keyframe. No controller is attached here; that's the robot team's code.
-
-**Open question for the team:** the walking policy was trained in Isaac Lab. The robot repo already ships a MuJoCo sim-to-sim runner (`deploy/play_mujoco.py`, MuJoCo 3.7), so it should transfer, but nobody has run it in this house yet. That repo pins MuJoCo 3.7. This folder works with any MuJoCo ≥ 3.3 and was tested on 4.0.
