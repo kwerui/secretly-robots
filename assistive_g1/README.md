@@ -29,14 +29,11 @@ python run_demo.py --fps 12.5 --size 800 450   # lighter video if you have no GP
 
 All offscreen rendering (robot camera, video, `--watch`) uses EGL (`MUJOCO_GL=egl`, set
 automatically), so it needs no X/GLX. Only `--viewer` opens a GLFW window, which needs a
-working GLX in your Python env. If it fails with
-`GLX: No GLXFBConfigs returned` / `gladLoadGL error` inside anaconda, the usual cause is
-conda's old `libstdc++` shadowing the system one that Mesa needs:
-
-```bash
-conda install -c conda-forge libstdcxx-ng      # or, per run:
-LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 python run_demo.py --viewer
-```
+working GLX in your Python env. Inside anaconda, GLX fails (`GLX: No GLXFBConfigs
+returned` / `gladLoadGL error`) because conda's old `libstdc++` shadows the newer system
+one that Mesa needs. `viewer_env.py` handles this: with `--viewer` from a conda Python,
+the script restarts itself once with `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6`.
+New scripts that open the viewer should call `relaunch_for_viewer()` before importing mujoco.
 
 ## Why not the stock LeRobot G1 stack
 

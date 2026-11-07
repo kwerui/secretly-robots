@@ -157,6 +157,15 @@ class G1WBC:
         w, x, y, z = self.base_quat
         return float(np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)))
 
+    @property
+    def base_vel_body(self) -> np.ndarray:
+        """(vx, vy, wz) of the pelvis in its own heading frame."""
+        v = self.data.qvel[self._root_v:self._root_v + 3]  # world frame for a free joint
+        th = self.base_yaw
+        vx = np.cos(th) * v[0] + np.sin(th) * v[1]
+        vy = -np.sin(th) * v[0] + np.cos(th) * v[1]
+        return np.array([vx, vy, self.data.qvel[self._root_v + 5]])
+
     def fallen(self) -> bool:
         return self.base_pos[2] < 0.25 or gravity_in_body(self.base_quat)[2] > -0.5
 

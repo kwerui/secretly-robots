@@ -14,6 +14,7 @@ import numpy as np
 
 from g1_wbc import G1WBC, ARM_HOME, SIM_DT
 from ik import ArmIK
+from nav import Navigator
 from perception import HeadCamera, MarkerPose, ID_TO_ITEM
 from articulation import ArticulationModel, rot_axis_angle
 from scene import ITEMS, STATIONS, DOOR_MARKER, ANCHOR_MARKER, build_scene
@@ -38,6 +39,7 @@ class AssistiveRobot:
         self.wbc = G1WBC(self.model, self.data)
         self.ik = ArmIK(self.model, self.data, "right")
         self.cam = HeadCamera(self.model, self.data)
+        self.nav = Navigator()
         self.on_frame = on_frame  # called every CONTROL_DT, e.g. to record video
         self.holding: str | None = None
         self.hold_up_axis = None
@@ -66,36 +68,28 @@ class AssistiveRobot:
         self.wbc.set_arm_targets(full)
 
     # ------------------------------------------------------------------ navigation
-    def _drive_to(self, x: float, y: float, yaw: float | None, tol: float = 0.05, timeout: float = 25.0) -> bool:
+    def _drive_to(self, x: float, y: float, yaw: float | None, tol: float = 0.04, timeout: float = 25.0,
+                  pass_through: bool = False) -> bool:
+        """Walk to (x, y[, yaw]) with the smooth PD navigator (nav.py).
+
+        pass_through: a waypoint. Return as soon as we're within `tol`, keeping the current
+        velocity (no stop), so the next leg continues smoothly.
+        """
+        self.nav.p.pos_tol = tol
+        self.nav.arrived = False  # keep self.nav.cmd: continue from the current velocity
         for _ in range(int(timeout / CONTROL_DT)):
             p = self.wbc.base_pos
-            th = self.wbc.base_yaw
-            dx, dy = x - p[0], y - p[1]
-            dist = np.hypot(dx, dy)
-            # error in the body frame
-            ex = np.cos(th) * dx + np.sin(th) * dy
-            ey = -np.sin(th) * dx + np.cos(th) * dy
-            if dist > 0.35:
-                head_err = wrap(np.arctan2(dy, dx) - th)
-                wz = np.clip(2.5 * head_err, -1.2, 1.2)
-                vx = 0.0 if abs(head_err) > 0.6 else np.clip(0.9 * dist, 0.15, 0.45) * np.cos(head_err)
-                vy = 0.0
-            else:
-                yaw_err = wrap((yaw if yaw is not None else th) - th)
-                if dist < tol and abs(yaw_err) < 0.06:
-                    break
-                vx = np.clip(1.2 * ex, -0.25, 0.25)
-                vy = np.clip(1.2 * ey, -0.2, 0.2)
-                wz = np.clip(2.5 * yaw_err, -1.0, 1.0)
-                # keep the walking policy engaged (below 0.05 it switches to balance)
-                if np.linalg.norm([vx, vy, wz]) < 0.06:
-                    s = 0.06 / max(np.linalg.norm([vx, vy, wz]), 1e-6)
-                    vx, vy, wz = vx * s, vy * s, wz * s
-            self.wbc.set_velocity(vx, vy, wz)
+            if pass_through and np.hypot(x - p[0], y - p[1]) < tol:
+                return True
+            cmd = self.nav.step((p[0], p[1], self.wbc.base_yaw), self.wbc.base_vel_body, (x, y, yaw), CONTROL_DT)
+            self.wbc.set_velocity(*cmd)
             self._tick()
             if self.wbc.fallen():
                 self.wbc.set_velocity(0, 0, 0)
                 return False
+            if self.nav.stopped:
+                break
+        self.nav.reset()
         self.wbc.set_velocity(0, 0, 0)
         self.wait(0.8)
         return True
@@ -107,7 +101,7 @@ class AssistiveRobot:
         s = STATIONS[station]
         p = self.wbc.base_pos
         if np.hypot(p[0] - HUB[0], p[1] - HUB[1]) > 0.3 and station != self.station:
-            if not self._drive_to(*HUB, None, tol=0.15):
+            if not self._drive_to(*HUB, None, tol=0.25, pass_through=True):
                 return {"ok": False, "error": "fell over"}
         ok = self._drive_to(s.x, s.y, s.yaw)
         if ok:

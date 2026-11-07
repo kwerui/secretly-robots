@@ -10,6 +10,10 @@ from __future__ import annotations
 import os
 import sys
 
+from viewer_env import relaunch_for_viewer
+
+relaunch_for_viewer()  # --viewer from anaconda: restart with the system libstdc++ (GLX fix)
+
 os.environ.setdefault("MUJOCO_GL", "egl")  # offscreen rendering without GLX
 
 import time

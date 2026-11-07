@@ -19,6 +19,10 @@ from __future__ import annotations
 import os
 import sys
 
+from viewer_env import relaunch_for_viewer
+
+relaunch_for_viewer()  # --viewer from anaconda: restart with the system libstdc++ (GLX fix)
+
 # Offscreen rendering (robot camera, video) through EGL: uses the GPU without X/GLX. The
 # MuJoCo --viewer window still needs GLX. Must run before anything imports mujoco.
 # Override with MUJOCO_GL=glfw/osmesa.
