@@ -1,0 +1,4 @@
+mujoco>=3.3
+pytest>=8
+# Optional, cloud-only: install separately when intentionally using Gemini
+# google-genai>=2.3.0
