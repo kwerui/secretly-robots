@@ -1,0 +1,5 @@
+mujoco>=3.3
+onnxruntime>=1.18
+opencv-contrib-python>=4.10   # needs the aruco module (contrib); use -headless on servers
+numpy>=1.26
+anthropic>=0.40               # only for agent.py

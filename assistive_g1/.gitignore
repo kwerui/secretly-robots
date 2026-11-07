@@ -1,0 +1,6 @@
+assets/g1/
+assets/policy/
+assets/markers/
+*.mp4
+calib.npz
+__pycache__/
