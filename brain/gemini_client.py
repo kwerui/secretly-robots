@@ -17,11 +17,18 @@ class GeminiApiError(RuntimeError):
 
 
 class _ModelsApi(Protocol):
-    def generate_content(self, **kwargs: Any) -> Any: ...
+    def generate_content(
+        self,
+        *,
+        model: str,
+        contents: str,
+        config: Any,
+    ) -> Any: ...
 
 
 class _SdkClient(Protocol):
-    models: _ModelsApi
+    @property
+    def models(self) -> _ModelsApi: ...
 
 
 class GeminiArgonClient:
