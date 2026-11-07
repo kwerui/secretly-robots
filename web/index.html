@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Browser A/V check</title>
+<style>body{font:16px system-ui;max-width:720px;margin:40px auto;padding:0 16px}video{width:100%;max-width:620px;background:#111}button{margin-right:8px;padding:8px}</style></head>
+<body><h1>Browser audio/video permission check</h1>
+<p>This tests local microphone/camera access only. It is NOT WebRTC peer streaming and does not transmit anything.</p>
+<button id="start">Start preview</button><button id="stop">Stop preview</button>
+<p id="status">Not started</p><video autoplay muted playsinline id="preview"></video>
+<script>
+let stream;
+document.querySelector('#start').onclick = async () => {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({audio:true,video:true});
+    document.querySelector('#preview').srcObject = stream;
+    document.querySelector('#status').textContent = 'Camera and microphone permission granted';
+  } catch (err) {
+    document.querySelector('#status').textContent = `${err.name}: ${err.message}`;
+  }
+};
+document.querySelector('#stop').onclick = () => {
+  if (stream) { stream.getTracks().forEach(t=>t.stop()); stream = undefined; }
+  document.querySelector('#preview').srcObject = null;
+  document.querySelector('#status').textContent = 'Stopped';
+};
+</script></body></html>
