@@ -4,6 +4,6 @@
 |------|--------|-----------|
 | Jack | Mechanical Engineering | Mechatronics, hardware |
 | Kristina | Computer Science | Web development |
-| Eren | Mechanical Engineering | TBD |
+| Eren | Mechanical Engineering | Robotics | ML | 
 | Kazuki | Mechanical Engineering | TBD |
 | Erica | TBD | TBD |
