@@ -6,4 +6,4 @@
 | Kristina | Computer Science | Web development |
 | Eren | Mechanical Engineering | Robotics , ML | 
 | Kazuki | Mechanical Engineering | Thermofluids, Claude |
-| Erica | Mechanical Engineering | TBD |
+| Erica | Mechanical Engineering | Mechatronics, Business case building/ Presentation |
