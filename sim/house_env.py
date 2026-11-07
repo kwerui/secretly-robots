@@ -1,15 +1,22 @@
 """Simulated house for the fetch-robot project (MuJoCo).
 
 An 8 x 6 m house with four rooms (living room, kitchen, bedroom, study) joined
-by four doorways that form a loop. Walls and furniture are static geoms. Clutter
-obstacles and doors are mocap bodies that `HouseEnv.reset()` moves around, so
-the model is compiled once and every episode just repositions things. Unused
-obstacles are parked under the floor. A water bottle (free body) is placed on
-one of several surfaces, and a seated user sits on the living-room sofa.
+by four doorways that form a loop. Walls and furniture are static geoms.
 
-Every reset is checked: no obstacle may penetrate a wall or furniture, and an
+- Doors are hinged leaves that swing up to 90 degrees either way, so the robot
+  can push them open from either side. Each reset gives them a random starting
+  angle. A layout can lock a door shut (it then can't be pushed).
+- Chests of drawers have sliding drawers with long bar handles.
+- Clutter obstacles are mocap bodies that `HouseEnv.reset()` moves around, so the
+  model is compiled once. Unused obstacles are parked under the floor.
+- A water bottle (free body) stands on one of several surfaces, and a seated
+  user sits on the living-room sofa.
+
+Every reset is checked: no obstacle may penetrate a wall, furniture, door or
+drawer; no obstacle may sit in a door's swing or in front of a drawer; and an
 occupancy grid + BFS confirms the robot can drive from its start pose to within
-arm's reach of the bottle (and therefore back again).
+arm's reach of the bottle (and therefore back again). Unlocked doors count as
+passable, since the robot can push them.
 
 Everything you are likely to tweak is in the CONFIG section below.
 
@@ -68,16 +75,19 @@ WALLS = {
     "inner_h_e": (0.0, 0.0, 4.0, 0.0),  # kitchen | study
 }
 
-# Doorways: which wall, where along it (centre), and how the door leaf hangs.
-#   hinge: "start" or "end" jamb (relative to the wall's x0,y0 -> x1,y1 direction)
-#   swing: +1 / -1, which side of the wall the open leaf swings into (left / right
-#          of the wall direction)
+# Doorways: which wall, where along it (centre), and which jamb the door hangs on
+# ("start" or "end", relative to the wall's x0,y0 -> x1,y1 direction). Every door
+# swings both ways (push from either side), up to DOOR_SWING_DEG.
 DOORWAYS = {
-    "living_kitchen": dict(wall="inner_v_s", center=(0.0, -1.5), hinge="end", swing=-1),
-    "bedroom_study": dict(wall="inner_v_n", center=(0.0, 1.5), hinge="end", swing=-1),
-    "living_bedroom": dict(wall="inner_h_w", center=(-2.0, 0.0), hinge="start", swing=-1),
-    "kitchen_study": dict(wall="inner_h_e", center=(2.0, 0.0), hinge="end", swing=+1),
+    "living_kitchen": dict(wall="inner_v_s", center=(0.0, -1.5), hinge="end"),
+    "bedroom_study": dict(wall="inner_v_n", center=(0.0, 1.5), hinge="end"),
+    "living_bedroom": dict(wall="inner_h_w", center=(-2.0, 0.0), hinge="start"),
+    "kitchen_study": dict(wall="inner_h_e", center=(2.0, 0.0), hinge="end"),
 }
+DOOR_SWING_DEG = 90.0  # max swing each way; trimmed automatically if a leaf would hit furniture
+DOOR_DAMPING = 1.5  # N m s/rad: how sluggish the door is when pushed
+DOOR_FRICTION = 0.3  # N m: static friction, so a door stays where it's left
+DOOR_MASS = 12.0  # kg
 
 ROOMS = {  # x0, y0, x1, y1, floor colour
     "living": (-4.0, -3.0, 0.0, 0.0, (0.80, 0.70, 0.55)),
@@ -100,23 +110,39 @@ FURNITURE = {
     "coffee_table": dict(kind="table", pos=(-2.70, -1.5), size=(0.50, 0.90), h=0.40, rgb=_LIGHT_WOOD),
     "tv_unit": dict(kind="box", pos=(-1.80, -2.775), size=(1.20, 0.35), h=0.50, rgb=(0.25, 0.25, 0.28)),
     # kitchen
-    "counter": dict(kind="box", pos=(1.95, -2.65), size=(2.70, 0.60), h=0.90, rgb=_WHITE),
+    "counter": dict(kind="box", pos=(2.25, -2.65), size=(2.10, 0.60), h=0.90, rgb=_WHITE),
     "fridge": dict(kind="box", pos=(3.62, -2.64), size=(0.65, 0.62), h=1.80, rgb=(0.85, 0.87, 0.90)),
     "kitchen_table": dict(kind="table", pos=(3.30, -1.00), size=(0.80, 0.60), h=0.75, rgb=_WOOD),
     # bedroom
     "bed": dict(kind="box", pos=(-2.95, 2.25), size=(2.00, 1.40), h=0.50, rgb=(0.90, 0.85, 0.80)),
     "bedside_table": dict(kind="box", pos=(-3.70, 1.10), size=(0.40, 0.40), h=0.55, rgb=_LIGHT_WOOD),
-    "wardrobe": dict(kind="box", pos=(-0.90, 2.65), size=(1.20, 0.60), h=1.10, rgb=_WOOD),
     # study
     "desk": dict(kind="table", pos=(3.60, 1.50), size=(0.70, 1.40), h=0.75, rgb=_LIGHT_WOOD),
     "bookshelf": dict(kind="box", pos=(2.00, 2.80), size=(1.40, 0.30), h=1.10, rgb=_WOOD),
 }
 
+# Chests of drawers. pos = footprint centre, facing = direction (deg) the drawers
+# pull out towards, size = (width, depth), h = height, n = number of drawers.
+# Each drawer slides out up to DRAWER_EXTENSION of its depth and has a long bar
+# handle (HANDLE_FRACTION of the chest width) with a site "<drawer>_handle" at
+# its centre for grasping.
+DRAWER_UNITS = {
+    "dresser": dict(pos=(-0.90, 2.725), facing=-90, size=(1.00, 0.45), h=0.85, n=4, rgb=_WOOD),
+    "kitchen_drawers": dict(pos=(0.90, -2.65), facing=90, size=(0.60, 0.60), h=0.90, n=3, rgb=_WHITE),
+    "filing_cabinet": dict(pos=(3.725, 2.60), facing=180, size=(0.60, 0.45), h=1.00, n=3, rgb=(0.45, 0.50, 0.55)),
+}
+DRAWER_EXTENSION = 0.80  # fraction of drawer depth it can slide out
+HANDLE_FRACTION = 0.75  # handle length as a fraction of chest width
+HANDLE_R = 0.012  # handle bar radius
+HANDLE_STANDOFF = 0.045  # gap between drawer front and handle bar centre
+DRAWER_DAMPING = 4.0  # N s/m
+DRAWER_FRICTION = 0.5  # N
+
 # Where the bottle can be: name -> (x, y, furniture it stands on).
 # z is taken from that furniture's height.
 TARGETS = {
     "tv_unit": (-1.50, -2.78, "tv_unit"),
-    "kitchen_counter": (1.20, -2.62, "counter"),
+    "kitchen_counter": (1.80, -2.62, "counter"),
     "kitchen_table": (3.10, -0.90, "kitchen_table"),
     "bedside_table": (-3.70, 1.10, "bedside_table"),
     "study_desk": (3.50, 1.20, "desk"),
@@ -140,49 +166,51 @@ OBSTACLE_TYPES = {
     ),
 }
 
-# Layouts: which doors are shut + clutter as (type, x, y, yaw_deg).
+# Layouts: clutter as (type, x, y, yaw_deg), plus optional door settings:
+#   doors_locked: shut and locked (can't be pushed, blocks the planner)
+#   doors_closed: start shut but can still be pushed open
+# Any other door starts at a random angle within its swing.
 LAYOUTS = {
-    "tidy": dict(doors_shut=[], obstacles=[]),
+    "tidy": dict(obstacles=[]),
     "laundry_day": dict(
-        doors_shut=[],
         obstacles=[
             ("laundry_basket", -1.00, 0.80, 0),
             ("clothes_pile", -1.10, -2.10, 20),
             ("clothes_pile", 1.10, 1.00, -30),
-            ("clothes_pile", -2.80, 0.60, 10),
+            ("clothes_pile", -1.55, 1.45, 10),
             ("bag", 0.80, -0.50, 45),
-            ("chair", 2.40, -0.40, -90),
+            ("chair", 2.30, -1.80, 0),
         ],
     ),
     "door_shut": dict(
-        doors_shut=["living_kitchen"],
+        doors_locked=["living_kitchen"],
         obstacles=[
             ("chair", 1.40, -1.30, 0),
             ("box_small", -0.80, -2.30, 0),
         ],
     ),
     "moving_house": dict(
-        doors_shut=[],
+        doors_closed=["bedroom_study"],
         obstacles=[
             ("box_large", -0.80, -0.60, 10),
             ("box_small", -0.70, -2.40, 0),
-            ("box_large", 0.90, -1.90, -15),
+            ("box_large", 1.70, -1.75, -15),
             ("box_small", 3.20, -0.60, 30),
             ("box_large", 0.90, 2.40, 0),
             ("box_small", 3.00, 0.50, 15),
-            ("box_large", -1.20, 1.40, 0),
+            ("box_large", -1.35, 1.25, 0),
             ("box_small", -3.30, 0.50, 5),
         ],
     ),
-    # The longest detour: the bedroom door is shut and the kitchen is cluttered,
+    # The longest detour: the bedroom door is locked and the kitchen is cluttered,
     # so reaching the bedroom means living -> kitchen -> study -> bedroom.
     "long_way_round": dict(
-        doors_shut=["living_bedroom"],
+        doors_locked=["living_bedroom"],
         obstacles=[
             ("laundry_basket", 1.00, -0.60, 0),
             ("clothes_pile", 3.20, -1.00, 60),
             ("bag", 2.80, 0.70, 0),
-            ("chair", 1.00, 1.60, 180),
+            ("chair", 1.30, 2.20, 180),
         ],
     ),
 }
@@ -237,22 +265,23 @@ def _bottle_site_quat() -> np.ndarray:
     return q
 
 
-def door_poses(name: str):
-    """Return (shut_pos, shut_quat, open_pos, open_quat) for a door leaf centre."""
+HINGE_INSET = 0.03  # hinge axis sits this far inside the doorway from the jamb
+DOOR_LEAF_L = DOOR_W - HINGE_INSET - 0.02  # leaves a 1 cm gap at each end
+DOOR_LEAF_T = 0.04  # leaf thickness
+
+
+def door_frame(name: str):
+    """Return (hinge_xy, yaw_deg): the hinge axis position and the direction the
+    shut leaf points from the hinge (across the doorway)."""
     dw = DOORWAYS[name]
     x0, y0, x1, y1 = WALLS[dw["wall"]]
     u = np.array([x1 - x0, y1 - y0], float)
     u /= np.linalg.norm(u)
-    n = np.array([-u[1], u[0]])  # left of wall direction
     c = np.array(dw["center"], float)
     sgn = 1.0 if dw["hinge"] == "end" else -1.0
-    hinge = c + sgn * u * (DOOR_W / 2)
-    wall_yaw = math.degrees(math.atan2(u[1], u[0]))
-    z = DOOR_H / 2 + 0.01
-    shut_pos = np.array([c[0], c[1], z])
-    open_c = hinge + dw["swing"] * n * (DOOR_W / 2) - sgn * u * 0.03
-    open_pos = np.array([open_c[0], open_c[1], z])
-    return shut_pos, yaw_quat(wall_yaw), open_pos, yaw_quat(wall_yaw + 90.0)
+    hinge = c + sgn * u * (DOOR_W / 2 - HINGE_INSET)
+    d = -sgn * u
+    return hinge, math.degrees(math.atan2(d[1], d[0]))
 
 
 def _wall_segments():
@@ -374,12 +403,26 @@ def build_xml() -> str:
     a('      <site name="user_hand" pos="0.30 -0.25 0.25" size="0.03" rgba="1 0.8 0 1"/>')
     a("    </body>")
 
-    # doors (mocap, start open)
+    # doors: hinged leaves that swing both ways (push from either side)
+    sw = math.radians(DOOR_SWING_DEG)
+    leaf_vol = DOOR_LEAF_L * DOOR_LEAF_T * DOOR_H
     for dname in DOORWAYS:
-        _, _, op, oq = door_poses(dname)
-        a(f'    <body name="door_{dname}" mocap="true" pos="{_fmt(op)}" quat="{_fmt(oq)}">')
-        a(f'      <geom name="door_{dname}" type="box" size="{_fmt([DOOR_W / 2 - 0.02, 0.02, DOOR_H / 2])}" material="door"/>')
+        hinge, yaw = door_frame(dname)
+        lx = 0.01 + DOOR_LEAF_L / 2
+        a(f'    <body name="door_{dname}" pos="{_fmt([hinge[0], hinge[1], 0])}" quat="{_fmt(yaw_quat(yaw))}">')
+        a(f'      <joint name="door_{dname}_hinge" type="hinge" axis="0 0 1" range="{-sw:.6g} {sw:.6g}" '
+          f'damping="{DOOR_DAMPING}" frictionloss="{DOOR_FRICTION}" armature="0.05"/>')
+        a(f'      <geom name="door_{dname}" type="box" pos="{_fmt([lx, 0, DOOR_H / 2 + 0.01])}" '
+          f'size="{_fmt([DOOR_LEAF_L / 2, DOOR_LEAF_T / 2, DOOR_H / 2])}" material="door" density="{DOOR_MASS / leaf_vol:.6g}"/>')
+        for side in (-1, 1):  # push plates on both faces (visual only)
+            a(f'      <geom name="door_{dname}_plate{"ab"[side > 0]}" type="box" '
+              f'pos="{_fmt([DOOR_LEAF_L - 0.08, side * (DOOR_LEAF_T / 2 + 0.002), 0.6])}" size="0.05 0.002 0.12" '
+              f'rgba="0.75 0.75 0.78 1" contype="0" conaffinity="0" mass="0"/>')
         a("    </body>")
+
+    # chests of drawers: a static carcass body with sliding drawers inside
+    for uname, u in DRAWER_UNITS.items():
+        _drawer_unit_xml(a, uname, u)
 
     # clutter obstacles (mocap, parked)
     for typ, count in _obstacle_pool().items():
@@ -417,8 +460,67 @@ def build_xml() -> str:
         q = lookat_quat([px, py, 3.0], [cx, cy, 0.3])
         a(f'    <camera name="cam_{rname}" pos="{_fmt([px, py, 3.0])}" quat="{_fmt(q)}" fovy="70"/>')
     a("  </worldbody>")
+    # door locks (activated per layout by HouseEnv.reset)
+    a("  <equality>")
+    for dname in DOORWAYS:
+        a(f'    <joint name="lock_{dname}" joint1="door_{dname}_hinge" polycoef="0 1 0 0 0" active="false"/>')
+    a("  </equality>")
     a("</mujoco>")
     return "\n".join(L)
+
+
+def _drawer_unit_xml(a, uname: str, u: dict):
+    """Append XML for one chest of drawers. Local frame: +x = front (pull direction)."""
+    (x, y), (w, d), h, n, rgb = u["pos"], u["size"], u["h"], u["n"], u["rgb"]
+    t, plinth, ft = 0.018, 0.06, 0.02  # panel thickness, kick plinth height, drawer-front thickness
+    col = f'rgba="{_fmt(rgb)} 1"'
+    front_rgb = tuple(min(1.0, c * 1.08 + 0.03) for c in rgb)
+    fcol = f'rgba="{_fmt(front_rgb)} 1"'
+    metal = 'rgba="0.78 0.78 0.80 1"'
+    cx = (-d / 2 + d / 2 - ft) / 2  # carcass sits behind the drawer fronts
+    cd = d - ft
+    a(f'    <body name="chest_{uname}" pos="{_fmt([x, y, 0])}" quat="{_fmt(yaw_quat(u["facing"]))}">')
+    a(f'      <geom name="chest_{uname}_top" type="box" pos="{_fmt([0, 0, h - t / 2])}" size="{_fmt([d / 2, w / 2, t / 2])}" {col}/>')
+    for i, sy in enumerate((-1, 1)):
+        a(f'      <geom name="chest_{uname}_side{i}" type="box" pos="{_fmt([cx, sy * (w / 2 - t / 2), (h - t) / 2])}" '
+          f'size="{_fmt([cd / 2, t / 2, (h - t) / 2])}" {col}/>')
+    a(f'      <geom name="chest_{uname}_back" type="box" pos="{_fmt([-d / 2 + t / 2, 0, (h - t) / 2])}" '
+      f'size="{_fmt([t / 2, w / 2 - t, (h - t) / 2])}" {col}/>')
+    a(f'      <geom name="chest_{uname}_plinth" type="box" pos="{_fmt([cx - 0.015, 0, (plinth + t) / 2])}" '
+      f'size="{_fmt([cd / 2 - 0.015, w / 2 - t, (plinth + t) / 2])}" {col}/>')
+
+    z0, z1 = plinth + t, h - t
+    s = (z1 - z0) / n  # slot height
+    di = d - t - ft - 0.02  # tray depth
+    wi = w - 2 * t - 0.012  # tray width
+    ht = min(0.7 * s, s - 0.03)  # tray wall height
+    xb = d / 2 - ft - di / 2  # tray centre (x)
+    hl = HANDLE_FRACTION * w
+    hx = d / 2 + HANDLE_STANDOFF
+    ext = DRAWER_EXTENSION * di
+    for i in range(n):
+        name = f"drawer_{uname}_{i}"
+        zc = z0 + s * (i + 0.5)
+        zb = -s / 2 + 0.015  # tray floor (relative)
+        a(f'      <body name="{name}" pos="{_fmt([0, 0, zc])}">')
+        a(f'        <joint name="{name}_slide" type="slide" axis="1 0 0" range="0 {ext:.6g}" '
+          f'damping="{DRAWER_DAMPING}" frictionloss="{DRAWER_FRICTION}" armature="0.05"/>')
+        a(f'        <geom name="{name}_front" type="box" pos="{_fmt([d / 2 - ft / 2, 0, 0])}" '
+          f'size="{_fmt([ft / 2, w / 2 - 0.003, s / 2 - 0.003])}" {fcol} density="500"/>')
+        a(f'        <geom name="{name}_floor" type="box" pos="{_fmt([xb, 0, zb])}" size="{_fmt([di / 2, wi / 2, 0.005])}" {col} density="500"/>')
+        for j, sy in enumerate((-1, 1)):
+            a(f'        <geom name="{name}_wall{j}" type="box" pos="{_fmt([xb, sy * (wi / 2 - 0.005), zb + ht / 2])}" '
+              f'size="{_fmt([di / 2, 0.005, ht / 2])}" {col} density="500"/>')
+        a(f'        <geom name="{name}_rear" type="box" pos="{_fmt([d / 2 - ft - di + 0.005, 0, zb + ht / 2])}" '
+          f'size="{_fmt([0.005, wi / 2, ht / 2])}" {col} density="500"/>')
+        # long bar handle on two standoffs
+        a(f'        <geom name="{name}_handle" type="capsule" fromto="{_fmt([hx, -hl / 2, 0, hx, hl / 2, 0])}" size="{HANDLE_R}" {metal}/>')
+        for j, sy in enumerate((-1, 1)):
+            a(f'        <geom name="{name}_post{j}" type="box" pos="{_fmt([d / 2 + HANDLE_STANDOFF / 2, sy * (hl / 2 - 0.03), 0])}" '
+              f'size="{_fmt([HANDLE_STANDOFF / 2, 0.008, 0.008])}" {metal}/>')
+        a(f'        <site name="{name}_handle" pos="{_fmt([hx, 0, 0])}" size="0.015" rgba="1 0.5 0 1" group="1"/>')
+        a("      </body>")
+    a("    </body>")
 
 
 # =============================================================================
@@ -458,7 +560,9 @@ class HouseEnv:
         self.bottle_body = m.body("waterbottle").id
         self.bottle_qadr = m.jnt_qposadr[m.joint("waterbottle_joint").id]
         self.bottle_dadr = m.jnt_dofadr[m.joint("waterbottle_joint").id]
-        self.door_mocap = {d: m.body(f"door_{d}").mocapid[0] for d in DOORWAYS}
+        self.door_jnt = {d: m.joint(f"door_{d}_hinge").id for d in DOORWAYS}
+        self.door_eq = {d: m.equality(f"lock_{d}").id for d in DOORWAYS}
+        self.drawer_jnt = [j for j in range(m.njnt) if m.joint(j).name.startswith("drawer_")]
         self.obs_mocap = {}  # type -> list of mocap ids
         for typ, count in _obstacle_pool().items():
             self.obs_mocap[typ] = [m.body(f"obs_{typ}_{i}").mocapid[0] for i in range(count)]
@@ -466,7 +570,9 @@ class HouseEnv:
         # geom sets
         mocap_bodies = {i for i in range(m.nbody) if m.body_mocapid[i] >= 0}
         robot_bodies = self._subtree(self.robot_root) if self.robot_root is not None else set()
-        self.mocap_geoms, self.static_geoms = [], []
+        self.mocap_geoms, self.static_geoms, self.drawer_geoms = [], [], []
+        self.door_geoms = {dn: [] for dn in DOORWAYS}
+        door_body = {m.body(f"door_{dn}").id: dn for dn in DOORWAYS}
         skip = {"floor", "waterbottle", "waterbottle_neck", "waterbottle_cap"}
         for g in range(m.ngeom):
             name = m.geom(g).name
@@ -475,7 +581,17 @@ class HouseEnv:
                 continue
             if m.geom_contype[g] == 0 and m.geom_conaffinity[g] == 0:
                 continue
-            (self.mocap_geoms if b in mocap_bodies else self.static_geoms).append(g)
+            if b in mocap_bodies:
+                self.mocap_geoms.append(g)
+            elif b in door_body:
+                self.door_geoms[door_body[b]].append(g)
+            elif m.body(b).name.startswith("drawer_"):
+                self.drawer_geoms.append(g)
+            else:
+                self.static_geoms.append(g)
+        self.all_door_geoms = [g for gs in self.door_geoms.values() for g in gs]
+        self.locked_doors: set = set()
+        self.door_range = self._fit_door_ranges()
 
         # robot root joint
         self.robot_qadr = None
@@ -493,6 +609,99 @@ class HouseEnv:
         self.target = None
         self.bottle_pos = None
         self.info = {}
+
+    # ---- doors / drawers ------------------------------------------------------
+    def _overlaps(self, geoms_a, geoms_b, tol=1e-4):
+        m, d = self.model, self.data
+        for g in geoms_a:
+            for h in geoms_b:
+                if m.geom_bodyid[h] == m.geom_bodyid[g]:
+                    continue
+                if np.linalg.norm(d.geom_xpos[g, :2] - d.geom_xpos[h, :2]) > m.geom_rbound[g] + m.geom_rbound[h]:
+                    continue
+                if mujoco.mj_geomDistance(m, d, g, h, 0.05, None) < -tol:
+                    return (m.geom(g).name, m.geom(h).name)
+        return None
+
+    def _fit_door_ranges(self):
+        """Trim each door's swing so the leaf never hits walls, furniture or a fully
+        open drawer. Returns {door: (lo_rad, hi_rad)} and writes it to jnt_range."""
+        m, d = self.model, self.data
+        mujoco.mj_resetData(m, d)
+        self.set_drawers(1.0)
+        ranges = {}
+        others = self.static_geoms + self.drawer_geoms
+        for dn, j in self.door_jnt.items():
+            qa = m.jnt_qposadr[j]
+            lim = []
+            for sign in (-1, 1):
+                ok = 0
+                for deg in range(1, int(DOOR_SWING_DEG) + 1):
+                    d.qpos[qa] = sign * math.radians(deg)
+                    mujoco.mj_kinematics(m, d)
+                    if self._overlaps(self.door_geoms[dn], others + [g for g in self.all_door_geoms if g not in self.door_geoms[dn]]):
+                        break
+                    ok = deg
+                lim.append(math.radians(max(ok - 2, 0)) if ok < DOOR_SWING_DEG else math.radians(DOOR_SWING_DEG))
+            d.qpos[qa] = 0.0
+            ranges[dn] = (-lim[0], lim[1])
+            m.jnt_range[j] = ranges[dn]
+        mujoco.mj_resetData(m, d)
+        return ranges
+
+    def set_drawers(self, frac: float):
+        """Open every drawer to `frac` of its travel (0 = shut, 1 = fully out)."""
+        m = self.model
+        for j in self.drawer_jnt:
+            self.data.qpos[m.jnt_qposadr[j]] = frac * m.jnt_range[j, 1]
+            self.data.qvel[m.jnt_dofadr[j]] = 0.0
+
+    def door_angle(self, name: str) -> float:
+        return float(self.data.qpos[self.model.jnt_qposadr[self.door_jnt[name]]])
+
+    def set_door(self, name: str, angle: float):
+        j = self.door_jnt[name]
+        self.data.qpos[self.model.jnt_qposadr[j]] = angle
+        self.data.qvel[self.model.jnt_dofadr[j]] = 0.0
+
+    def randomise_doors(self):
+        """Give every unlocked door that isn't forced closed a random angle."""
+        lay = LAYOUTS[self.layout]
+        for dn in DOORWAYS:
+            if dn in self.locked_doors or dn in lay.get("doors_closed", []):
+                self.set_door(dn, 0.0)
+            else:
+                lo, hi = self.door_range[dn]
+                self.set_door(dn, float(self.rng.uniform(lo, hi)))
+
+    def sweeps_clear(self, steps: int = 13):
+        """True if no active obstacle sits anywhere in an unlocked door's swing or
+        in front of a drawer (so doors can be pushed both ways and drawers pulled
+        fully out). Leaves qpos untouched."""
+        m, d = self.model, self.data
+        active = self.active_mocap_geoms()
+        if not active:
+            return True
+        saved = d.qpos.copy()
+        try:
+            for dn in DOORWAYS:
+                if dn in self.locked_doors:
+                    continue
+                lo, hi = self.door_range[dn]
+                for ang in np.linspace(lo, hi, steps):
+                    self.set_door(dn, ang)
+                    mujoco.mj_kinematics(m, d)
+                    if self._overlaps(self.door_geoms[dn], active):
+                        return False
+                d.qpos[:] = saved
+            self.set_drawers(1.0)
+            mujoco.mj_kinematics(m, d)
+            if self._overlaps(self.drawer_geoms, active):
+                return False
+            return True
+        finally:
+            d.qpos[:] = saved
+            mujoco.mj_kinematics(m, d)
 
     # ---- robot merging --------------------------------------------------------
     def _attach_robot(self, spec: mujoco.MjSpec, robot_xml: str):
@@ -549,20 +758,36 @@ class HouseEnv:
         self._place_robot()
         self._place_bottle(target)
 
-        res = None
+        lay = LAYOUTS[layout]
+        self.locked_doors = set(lay.get("doors_locked", []))
+        for dn, eq in self.door_eq.items():
+            self.data.eq_active[eq] = dn in self.locked_doors
+        self.randomise_doors()
+
+        res, why = None, ""
         for attempt in range(MAX_RESET_TRIES):
             use_jitter = jitter and attempt < MAX_RESET_TRIES - 1
             self._place_layout(layout, use_jitter)
             mujoco.mj_forward(self.model, self.data)
-            if self.penetrations():
+            pen = self.penetrations()
+            if pen:
+                why = f"overlap {pen[0][:2]}"
+                continue
+            if not self.sweeps_clear():
+                why = "an obstacle is in a door swing or in front of a drawer"
                 continue
             res = self.check()
             if res.solvable:
                 break
+            why = "bottle unreachable"
         else:
-            raise RuntimeError(f"layout {layout!r} + target {target!r} is not valid even without jitter")
+            raise RuntimeError(f"layout {layout!r} + target {target!r} is not valid even without jitter: {why}")
 
-        self.info = dict(layout=layout, target=target, attempts=attempt + 1, path_len=res.path_len)
+        self.info = dict(
+            layout=layout, target=target, attempts=attempt + 1, path_len=res.path_len,
+            doors={dn: round(math.degrees(self.door_angle(dn))) for dn in DOORWAYS},
+            locked=sorted(self.locked_doors),
+        )
         return self.info
 
     def _place_robot(self):
@@ -586,11 +811,6 @@ class HouseEnv:
     def _place_layout(self, layout: str, jitter: bool):
         lay = LAYOUTS[layout]
         d = self.data
-        for dname, mid in self.door_mocap.items():
-            sp, sq, op, oq = door_poses(dname)
-            shut = dname in lay["doors_shut"]
-            d.mocap_pos[mid] = sp if shut else op
-            d.mocap_quat[mid] = sq if shut else oq
         used = {t: 0 for t in self.obs_mocap}
         for typ, x, y, yaw in lay["obstacles"]:
             mid = self.obs_mocap[typ][used[typ]]
@@ -612,10 +832,11 @@ class HouseEnv:
 
     def penetrations(self, tol: float = 1e-4):
         """Pairs (geomA, geomB, dist) where an active mocap geom overlaps a wall,
-        furniture, the user, another obstacle, or the bottle."""
+        furniture, a drawer, a door (at its current angle), the user, another
+        obstacle, or the bottle."""
         m, d = self.model, self.data
         active = self.active_mocap_geoms()
-        others = self.static_geoms + [self.bottle_geom_id()]
+        others = self.static_geoms + self.drawer_geoms + self.all_door_geoms + [self.bottle_geom_id()]
         bad = []
         for i, g in enumerate(active):
             cands = others + active[i + 1 :]
@@ -636,7 +857,8 @@ class HouseEnv:
         """Bool grid (ny, nx): True where the robot centre can't be."""
         m, d = self.model, self.data
         blocked = np.zeros_like(self.GX, dtype=bool)
-        for g in self.static_geoms + self.active_mocap_geoms():
+        locked = [g for dn in self.locked_doors for g in self.door_geoms[dn]]
+        for g in self.static_geoms + self.drawer_geoms + locked + self.active_mocap_geoms():
             pos, mat = d.geom_xpos[g], d.geom_xmat[g].reshape(3, 3)
             size = m.geom_size[g]
             typ = m.geom_type[g]
@@ -658,6 +880,10 @@ class HouseEnv:
                 dist = np.hypot(ox, oy)
             elif typ in (mujoco.mjtGeom.mjGEOM_CYLINDER, mujoco.mjtGeom.mjGEOM_CAPSULE, mujoco.mjtGeom.mjGEOM_SPHERE) and abs(mat[2, 2]) > 0.99:
                 dist = np.hypot(dx, dy) - size[0]
+            elif typ == mujoco.mjtGeom.mjGEOM_CAPSULE and abs(mat[2, 2]) < 0.01:  # horizontal bar
+                ax = mat[:2, 2]
+                t = np.clip(dx * ax[0] + dy * ax[1], -size[1], size[1])
+                dist = np.hypot(dx - t * ax[0], dy - t * ax[1]) - size[0]
             else:  # fall back to bounding sphere
                 dist = np.hypot(dx, dy) - m.geom_rbound[g]
             blocked |= dist <= ROBOT_R
@@ -715,6 +941,8 @@ def _has_key(model, name):
 
 def cmd_check(env: HouseEnv, seeds: int = 5) -> bool:
     ok = True
+    print("door swing (deg): " + ", ".join(
+        f"{dn} {math.degrees(lo):.0f}..{math.degrees(hi):+.0f}" for dn, (lo, hi) in env.door_range.items()))
     print(f"{'layout':<16}{'target':<18}{'path m':>8}{'tries':>7}  status")
     for lay in LAYOUTS:
         for tgt in TARGETS:
@@ -753,6 +981,8 @@ def cmd_snapshot(env: HouseEnv, outdir: Path):
         # free-camera 3/4 view of the tidy house
         env.reset("tidy", "kitchen_table", seed=0)
         env.step(500)
+        env.set_drawers(0.6)  # show the drawers pulled out
+        mujoco.mj_forward(env.model, env.data)
         cam = mujoco.MjvCamera()
         cam.lookat[:] = [0, 0, 0.3]
         cam.distance, cam.azimuth, cam.elevation = 10.5, 120, -50
@@ -788,12 +1018,13 @@ def cmd_view(env: HouseEnv, layout=None, target=None, seed=None):
     def show():
         i = env.info
         print(f"layout={i['layout']:<15} target={i['target']:<16} path={i['path_len']:.2f} m  (tries {i['attempts']})")
+        print("  doors (deg): " + ", ".join(f"{k} {v:+d}" + (" LOCKED" if k in i["locked"] else "") for k, v in i["doors"].items()))
 
     env.reset(layout, target, seed=seed)
     show()
 
     def on_key(key):
-        # SPACE: random layout + target. L / T: cycle layout / target. O: toggle all doors.
+        # SPACE: random layout + target. L / T: cycle layout / target. O: new random door angles.
         if key == 32:
             state["pending"] = ("random",)
         elif key == ord("L"):
@@ -803,11 +1034,11 @@ def cmd_view(env: HouseEnv, layout=None, target=None, seed=None):
         elif key == ord("O"):
             state["pending"] = ("doors",)
 
-    print("keys: SPACE random reset | L next layout | T next target | O toggle doors")
+    print("keys: SPACE random reset | L next layout | T next target | O re-randomise doors")
+    print("push a door or pull a drawer: double-click it, then Ctrl + right-drag")
     with mujoco.viewer.launch_passive(env.model, env.data, key_callback=on_key) as v:
         v.cam.lookat[:] = [0, 0, 0.3]
         v.cam.distance, v.cam.azimuth, v.cam.elevation = 10.5, 120, -55
-        doors_flipped = False
         while v.is_running():
             t0 = time.time()
             p, state["pending"] = state["pending"], None
@@ -820,16 +1051,10 @@ def cmd_view(env: HouseEnv, layout=None, target=None, seed=None):
                     elif p[0] == "target":
                         env.reset(env.layout, tgts[(tgts.index(env.target) + 1) % len(tgts)])
                     elif p[0] == "doors":
-                        doors_flipped = not doors_flipped
-                        for dname, mid in env.door_mocap.items():
-                            sp, sq, op, oq = door_poses(dname)
-                            shut = (dname in LAYOUTS[env.layout]["doors_shut"]) != doors_flipped
-                            env.data.mocap_pos[mid] = sp if shut else op
-                            env.data.mocap_quat[mid] = sq if shut else oq
-                        print("doors " + ("flipped" if doors_flipped else "back to layout"))
-                    if p[0] != "doors":
-                        doors_flipped = False
-                        show()
+                        env.randomise_doors()
+                        mujoco.mj_forward(env.model, env.data)
+                        env.info["doors"] = {dn: round(math.degrees(env.door_angle(dn))) for dn in DOORWAYS}
+                    show()
             with v.lock():
                 env.step(int(round(1 / 60 / env.model.opt.timestep)))
             v.sync()
