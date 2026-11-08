@@ -35,27 +35,36 @@ class Brain:
         self.task: FetchTask | None = None
         self.failures: dict[tuple[str, str | None], int] = {}
         self._last_cloud_observation: tuple | None = None
+        # Evaluation reads this transient value after next_action().  It is intentionally
+        # not part of Observation and cannot influence planning or control.
+        self.last_decision_provenance = "deterministic_planner"
+        self.last_cloud_event: dict[str, str] | None = None
 
     def start_task(self, user_request: str) -> FetchTask:
+        self.last_cloud_event = None
         try:
             self.task = self.parser.parse(user_request)
         except IntentError as exc:
             if self.parser is self.fallback_parser:
                 raise
             self.task = self.fallback_parser.parse(user_request)
-            self._log("cloud_intent_rejected", {"reason": str(exc)})
+            self.last_cloud_event = {"event": "cloud_intent_rejected", "reason": str(exc)}
+            self._log("cloud_intent_rejected", self.last_cloud_event)
         self.failures.clear()
         self._last_cloud_observation = None
         self._log("task_started", {"request": user_request, "task": asdict(self.task)})
         return self.task
 
     def next_action(self, obs: Observation) -> Decision:
+        self.last_cloud_event = None
         if self.task is None:
             decision = Decision("ask_for_help", reason="No active request")
+            self.last_decision_provenance = "deterministic_planner"
             self._log("decision", {"observation": asdict(obs), "decision": asdict(decision)})
             return decision
         local_decision = choose_action(self.task, obs)
-        decision = self._propose_with_fallback(local_decision, obs)
+        decision, provenance = self._propose_with_fallback(local_decision, obs)
+        self.last_decision_provenance = provenance
         signature = (decision.action, decision.target)
         if self.failures.get(signature, 0) >= 2 and decision.action not in ("stop", "ask_for_help", "complete"):
             decision = Decision("ask_for_help", reason="Repeated action failure; request human assistance")
@@ -63,14 +72,14 @@ class Brain:
         self._log("decision", {"observation": asdict(obs), "decision": asdict(decision)})
         return decision
 
-    def _propose_with_fallback(self, local_decision: Decision, obs: Observation) -> Decision:
+    def _propose_with_fallback(self, local_decision: Decision, obs: Observation) -> tuple[Decision, str]:
         """Consult cloud only on meaningful new state, then validate locally."""
         # These safety/terminal outcomes need no cloud interpretation at all.
         if local_decision.action in ("stop", "complete", "ask_for_help"):
-            return local_decision
+            return local_decision, "deterministic_planner"
         signature = self._observation_signature(obs)
         if self.gemini_planner is None or signature == self._last_cloud_observation:
-            return local_decision
+            return local_decision, "deterministic_planner"
         self._last_cloud_observation = signature
         task = self.task
         assert task is not None
@@ -78,9 +87,13 @@ class Brain:
             candidate = self.gemini_planner.propose(task, obs)
             validate(candidate, task, obs)
         except (ValueError, RejectedAction) as exc:
-            self._log("cloud_plan_rejected", {"reason": str(exc)})
-            return local_decision
-        return candidate
+            reason = str(exc)
+            self.last_cloud_event = {"event": "cloud_plan_rejected", "reason": reason}
+            self._log("cloud_plan_rejected", self.last_cloud_event)
+            return local_decision, "fallback_after_cloud_rejection_or_failure"
+        self.last_cloud_event = {"event": "cloud_plan_accepted", "reason": candidate.reason}
+        self._log("cloud_plan_accepted", {"decision": asdict(candidate)})
+        return candidate, "gemini_argon"
 
     @staticmethod
     def _observation_signature(obs: Observation) -> tuple:

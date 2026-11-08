@@ -83,6 +83,19 @@ def test_jsonl_log_contains_real_decision_not_claimed_execution(tmp_path):
     lines = (tmp_path / "events.jsonl").read_text().splitlines()
     assert len(lines) == 2 and '"event": "decision"' in lines[1]
 
+def test_rejected_cloud_plan_records_fallback_provenance(tmp_path):
+    class InvalidCloudPlanner:
+        def propose(self, task, observation):
+            return Decision("deliver", "sofa", "deliver without holding", source="gemini_argon")
+
+    brain = Brain(gemini_planner=InvalidCloudPlanner(), log_file=tmp_path / "events.jsonl")
+    brain.start_task("bring my water bottle")
+    decision = brain.next_action(world())
+    assert decision.source == "deterministic_planner"
+    assert brain.last_decision_provenance == "fallback_after_cloud_rejection_or_failure"
+    assert brain.last_cloud_event["event"] == "cloud_plan_rejected"
+    assert '"event": "cloud_plan_rejected"' in (tmp_path / "events.jsonl").read_text()
+
 def test_teach_once_requires_verified_demo(tmp_path):
     memory = RoutineMemory(tmp_path / "routine.json")
     with pytest.raises(ValueError):

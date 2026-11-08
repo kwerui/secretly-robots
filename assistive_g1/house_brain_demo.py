@@ -11,7 +11,7 @@ What happens:
   1. The carer opens the top kitchen drawer once (drawer camera) -> articulation model.
   2. Location memory from "watching the carer for a week": the bottle has mostly been left on
      the kitchen counter, once in the kitchen drawers; the cup on the counter.
-  3. Each request -> brain.start_task -> loop of brain/integration.take_turn: the brain looks at
+  3. Each request -> brain.start_task -> decision/feedback loop: the brain looks at
      the robot's observation (head-camera sightings, station, drawer open, holding, delivered),
      decides the next step, safety-checks it, and the bridge runs it on the robot.
      For "I'm thirsty" the bottle isn't in sight -> search: the counter first (memory), not
@@ -36,13 +36,13 @@ from pathlib import Path  # noqa: E402
 
 from brain_bridge import Container, RobotBridge  # noqa: E402  (also puts the repo root on sys.path)
 from brain.engine import Brain  # noqa: E402
-from brain.integration import take_turn  # noqa: E402
 from brain.safety import RejectedAction  # noqa: E402
 from articulation import ArticulationModel  # noqa: E402
 from demo_capture import capture_sim_drawer  # noqa: E402
 from house import G1House, KITCHEN_TOP  # noqa: E402
 from memory import LocationMemory  # noqa: E402
 from skills import AssistiveRobot  # noqa: E402
+from evaluation import EpisodeMetrics, MujocoTruthReader, TrialRecorder, TruthSnapshot, write_results  # noqa: E402
 
 DAY = 86400.0
 SEARCHABLE = ["kitchen_counter", "kitchen_drawers", "kitchen_table"]
@@ -69,6 +69,11 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-turns", type=int, default=15)
     ap.add_argument("--reuse-demo", action="store_true", help="load drawer_model.json instead of watching the carer")
+    ap.add_argument("--results-dir", type=Path, help="write evaluation JSON, results.csv and summary.md")
+    ap.add_argument("--experiment-id", help="stable ID prefix for evaluation output")
+    ap.add_argument("--settle-s", type=float, default=1.0, help="simulated seconds before tray verification")
+    ap.add_argument("--drawer-first", action="store_true",
+                    help="evaluation only: search kitchen_drawers before learned-memory ranking")
     args = ap.parse_args()
     requests = args.request or ["I'm thirsty", "Could you bring me my cup?"]
 
@@ -112,8 +117,9 @@ def main():
     say(f"Drawer model: {model.kind}, {model.amount * 100:.0f} cm, residual {model.residual_m * 1000:.1f} mm")
 
     containers = {"kitchen_drawers": Container(model, KITCHEN_TOP.anchor_marker, f"grasp_{KITCHEN_TOP.body}",
-                                               (KITCHEN_TOP.front_marker,))}
-    bridge = RobotBridge(robot, learned_memory(), containers, say=say)
+                                               (KITCHEN_TOP.front_marker,), drawer=KITCHEN_TOP)}
+    bridge = RobotBridge(robot, learned_memory(), containers, say=say,
+                         search_first=("kitchen_drawers",) if args.drawer_first else ())
 
     use_gemini = not args.offline
     if use_gemini:
@@ -137,30 +143,83 @@ def main():
         print("Brain: offline rules (deterministic planner)")
 
     summary = []
+    evaluation_records = []
     try:
-        for req in requests:
+        for request_index, req in enumerate(requests, start=1):
+            experiment_id = args.experiment_id or f"house-brain-{int(time.time())}-{request_index}"
+            metrics = EpisodeMetrics.baseline(experiment_id, "unknown")
+            metrics.model_mode = "offline" if not use_gemini else "gemini_optional"
+            metrics.layout, metrics.seed = args.layout, args.seed
+            metrics.bottle_placement = {
+                "configured_target": env.target,
+                "container": env.target_container,
+                "position_xyz": [round(float(x), 4) for x in env.bottle_xyz()],
+                "jitter": False,
+            }
+            metrics.environment_configuration = {
+                "mode": env.info.get("mode"),
+                "reset_attempts": env.info.get("attempts"),
+                "doors_deg": env.info.get("doors"),
+                "locked_doors": env.info.get("locked"),
+                "search_first": list(bridge.search_first),
+            }
+            recorder = TrialRecorder(metrics)
             say(f'Person: "{req}"')
             try:
                 task = brain.start_task(req)
             except Exception as e:  # noqa: BLE001  (IntentError etc.)
                 say(f"  couldn't understand: {e}")
                 summary.append((req, "not understood"))
+                metrics.failure_stage, metrics.failure_reason = "intent", str(e)
+                evaluation_records.append(recorder.finish(TruthSnapshot(robot_fallen=robot.wbc.fallen()),
+                                                         simulation_duration_s=float(env.data.time)))
                 continue
+            metrics.requested_item = task.item_id
+            if brain.last_cloud_event is not None:
+                recorder.record_cloud_event(**brain.last_cloud_event)
             say(f"  task: fetch {task.item_id} -> {task.destination}")
             bridge.new_task(task.item_id)
             outcome = "turn limit"
             for _ in range(args.max_turns):
                 try:
-                    decision = take_turn(brain, bridge, bridge)
+                    observation = bridge.latest_observation()
+                    decision = brain.next_action(observation)
                 except RejectedAction as e:  # brain/safety.py vetoed the planner's own step
                     say(f"  safety rejected the next step: {e}")
                     outcome = "rejected by safety"
+                    metrics.failure_stage, metrics.failure_reason = "safety", str(e)
                     break
+                recorder.record_decision(decision.action, decision.source,
+                                         fallback=brain.last_decision_provenance == "fallback_after_cloud_rejection_or_failure")
+                if brain.last_cloud_event is not None:
+                    recorder.record_cloud_event(**brain.last_cloud_event)
                 say(f"  brain [{decision.source}]: {decision.action}({decision.target or ''}) - {decision.reason}")
                 if decision.action in ("complete", "ask_for_help"):
                     outcome = decision.action
                     break
+                feedback = bridge.execute_high_level(decision)
+                brain.record_feedback(feedback)
+                recorder.record_feedback(feedback.action, feedback.succeeded, feedback.detail, target=feedback.target,
+                                         retry_count=int(bridge.last_execution.get("grasp_retry_count", 0)))
+                recorder.record_navigation_attempts(bridge.last_execution.get("navigation_attempts", []))
+                recorder.record_drawer_opening_attempts(bridge.last_execution.get("drawer_opening_attempts", []))
+                if bridge.last_execution.get("drawer_open_attempted"):
+                    recorder.record_stage("drawer_opening", bool(bridge.last_execution["drawer_open_succeeded"]))
+                if bridge.last_execution.get("drawer_close_attempted"):
+                    recorder.record_stage("drawer_closing", bool(bridge.last_execution["drawer_close_succeeded"]))
             summary.append((req, outcome))
+            # Ground truth is queried only after planning/control is done.  It is never added
+            # to the bridge observation seen by the brain.
+            truth_reader = MujocoTruthReader(env, robot, KITCHEN_TOP, task.item_id)
+            before_settling = truth_reader.snapshot()
+            robot.wait(args.settle_s)
+            after_settling = truth_reader.snapshot()
+            truth = TruthSnapshot(item_on_tray=before_settling.item_on_tray,
+                                  item_on_tray_after_settling=after_settling.item_on_tray,
+                                  grasp_attached=after_settling.grasp_attached,
+                                  drawer_closed=after_settling.drawer_closed,
+                                  robot_fallen=after_settling.robot_fallen)
+            evaluation_records.append(recorder.finish(truth, simulation_duration_s=float(env.data.time)))
     finally:
         print("\nSummary:")
         for req, outcome in summary:
@@ -171,6 +230,9 @@ def main():
         print(f"  drawer open: {env.drawer_open_m(KITCHEN_TOP):.3f} m, fallen: {robot.wbc.fallen()}, sim {d.time:.1f} s")
         if robot.estimator is not None:
             print(f"  localization (estimate vs truth): {robot.estimator.error()}, LiDAR {robot.estimator.stats}")
+        if args.results_dir is not None:
+            paths = write_results(evaluation_records, args.results_dir)
+            print(f"  evaluation: {paths['csv']} and {paths['summary']}")
         if viewer is not None:
             print("Close the viewer window (or Ctrl+C) to exit.")
             try:
