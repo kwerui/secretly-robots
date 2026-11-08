@@ -142,10 +142,6 @@ class G1WBC:
         return self.data.qpos[self._qpos_ids].copy()
 
     @property
-    def dq(self) -> np.ndarray:
-        return self.data.qvel[self._qvel_ids].copy()
-
-    @property
     def arm_q(self) -> np.ndarray:
         return self.data.qpos[self._qpos_ids[ARM_SLICE]].copy()
 
