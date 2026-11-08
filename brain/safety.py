@@ -19,7 +19,9 @@ def validate(decision: Decision, task: FetchTask, obs: Observation) -> None:
         candidates = [o for o in obs.visible_objects if o.item_id == task.item_id and o.confidence >= 0.70]
         if not any(o.area == obs.robot_area and (o.container != "drawer" or obs.drawer_open) for o in candidates):
             raise RejectedAction("Item not verified at accessible grasp location")
-    if decision.action == "open_drawer" and obs.robot_area != "cupboard":
+    # (G1 integration, 8 Nov: was `obs.robot_area != "cupboard"`; Jack's house has several
+    # containers, so: the robot must be at an area where the item was seen inside a container)
+    if decision.action == "open_drawer" and obs.robot_area not in {o.area for o in obs.visible_objects if o.container}:
         raise RejectedAction("Cannot open a drawer remotely")
     if decision.action == "deliver" and (obs.holding_item != task.item_id or obs.robot_area != task.destination):
         raise RejectedAction("Cannot claim delivery unless robot has the item at recipient")

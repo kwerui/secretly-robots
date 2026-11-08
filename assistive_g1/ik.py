@@ -42,6 +42,20 @@ LIMIT_GAIN = 0.0
 ELBOW_REF = -0.10
 ELBOW_GAIN = float(os.environ.get("G1_ELBOW_GAIN", "0.0"))
 
+# Elbow ceiling for a *planned* reach (m above the shoulder). Plans above it are rejected
+# outright (skills.py), not just ranked lower: ranking alone still let elbow-behind-head plans win
+# when nothing else reached.
+ELBOW_MAX = float(os.environ.get("G1_ELBOW_MAX", "0.05"))
+
+# Comfort range (rad) the IK may use, inside the hardware limits. Order: shoulder pitch, roll,
+# yaw, elbow, wrist roll, pitch, yaw. Shoulder pitch >= -1.9 (arm at most ~20 deg above
+# horizontal) and |roll| <= 1.3 outward make overhead / behind-the-head solutions impossible.
+# Roll is mirrored between the arms (right: negative = away from the body).
+COMFORT = {
+    "right": [(-1.9, 1.2), (-1.3, 0.6), (-1.8, 1.8), (-1.05, 2.09), (-1.97, 1.97), (-1.61, 1.61), (-1.61, 1.61)],
+    "left": [(-1.9, 1.2), (-0.6, 1.3), (-1.8, 1.8), (-1.05, 2.09), (-1.97, 1.97), (-1.61, 1.61), (-1.61, 1.61)],
+}
+
 ARM_JOINTS = {
     "left": BODY_JOINTS[15:22],
     "right": BODY_JOINTS[22:29],
@@ -62,8 +76,9 @@ class ArmIK:
         jids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, j) for j in ARM_JOINTS[side]]
         self.qadr = np.array([model.jnt_qposadr[j] for j in jids])
         self.vadr = np.array([model.jnt_dofadr[j] for j in jids])
-        self.lo = model.jnt_range[jids, 0] + 0.02
-        self.hi = model.jnt_range[jids, 1] - 0.02
+        comfort = np.array(COMFORT[side])
+        self.lo = np.maximum(model.jnt_range[jids, 0] + 0.02, comfort[:, 0])
+        self.hi = np.minimum(model.jnt_range[jids, 1] - 0.02, comfort[:, 1])
         self.home = ARM_HOME[:7] if side == "left" else ARM_HOME[7:]
         # Bodies of this arm (shoulder down to the fingers), for collision checks
         first = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{side}_shoulder_pitch_link")
@@ -170,6 +185,11 @@ class ArmIK:
         """Penalty for a raised elbow (above ELBOW_REF relative to the shoulder), worst of qs."""
         return max(max(0.0, self.elbow_lift(q) - ELBOW_REF) for q in qs)
 
+    def elbow_too_high(self, *qs: np.ndarray, limit: float | None = None) -> bool:
+        """True if any of qs raises the elbow above `limit` (default ELBOW_MAX): a plan to reject."""
+        lim = ELBOW_MAX if limit is None else limit
+        return any(self.elbow_lift(q) > lim for q in qs)
+
     def limit_margin(self, q: np.ndarray) -> float:
         """Smallest distance (rad) of any joint of q to its limit."""
         return float(np.minimum(q - self.lo, self.hi - q).min())
@@ -189,15 +209,21 @@ class ArmIK:
         tol: float = 0.004,
         avoid: bool = True,
         elbow_gain: float | None = None,
+        q_ref: np.ndarray | None = None,
+        ref_weight: float = 0.15,
     ) -> tuple[np.ndarray, float]:
         """Return (7 arm joint angles, final position error in metres).
 
         axes: list of (site axis index 0/1/2, desired world direction, weight).
+        q_ref: planned configuration to stay near (null-space pull, ref_weight) instead of the
+        home pose: keeps the executed motion on the branch the plan was checked on.
         """
         s = self.scratch
         s.qpos[:] = self.data.qpos
         s.qvel[:] = 0
         q = s.qpos[self.qadr].copy() if q_init is None else np.array(q_init, dtype=float)
+        q = np.clip(q, self.lo, self.hi)
+        rest, w_rest = (self.home, posture_weight) if q_ref is None else (np.asarray(q_ref, dtype=float), ref_weight)
         axes = axes or []
         err_pos = np.inf
         s.qpos[self.qadr] = q
@@ -235,7 +261,7 @@ class ArmIK:
             dq = J.T @ np.linalg.solve(JJt, e)
             # Null-space pull towards a comfortable posture
             N = np.eye(7) - np.linalg.pinv(J, rcond=1e-3) @ J
-            dq += N @ (posture_weight * (self.home - q))
+            dq += N @ (w_rest * (rest - q))
             # ...and away from joint limits: within LIMIT_ZONE of a limit the solver tends to flip
             # to a very different solution next tick (wrist/shoulder-yaw), which is what made the
             # arm jerk

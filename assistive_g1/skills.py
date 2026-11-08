@@ -7,6 +7,8 @@ used for the robot's own base pose (localisation is out of scope for the hackath
 
 from __future__ import annotations
 
+import os
+
 from typing import Callable
 
 import mujoco
@@ -32,8 +34,16 @@ BACKOFF_SPEED = 0.15  # m/s
 STEP_BACK = 0.30  # m, after a grasp: the carried item's swing circle when turning must clear the furniture
 HUB = (0.35, 0.0)  # all station-to-station routes pass through here
 MAX_ARM_RATE = 3.0  # rad/s, cap on how fast any arm joint target may move (no more jerks)
+HOLD_ELBOW_GAIN = 0.3  # IK pulls the elbow down while the right hand holds an item (not while reaching)
 ELBOW_W = 0.3  # m of reach error a solution may trade per m of elbow raised above the shoulder band
 SETTLE_MAX = 1.0  # s, extra time move_hand may track a target until the palm arrives
+# Top-down grasps raise the elbow out to the side ("chicken wing"), as a person's does: allow it
+# higher than for side grasps (ik.ELBOW_MAX). The comfort joint ranges still rule out overhead poses.
+ABOVE_ELBOW_MAX = float(os.environ.get("G1_ABOVE_ELBOW_MAX", "0.20"))
+# How far above the grasp the hand comes in over an open drawer (m), lowest first. Jack's drawer
+# front is only ~3.5 cm above the bottle's cap, so 30 cm (the old value) was far more than needed
+# and put the hand near shoulder height, i.e. the elbow above the head.
+ABOVE_CLEARS = (0.12, 0.18, 0.26)
 ABOVE_STANDOFF = 0.45  # m, pelvis behind an item picked from above (body ~0.28 m clear of an open drawer's handle)
 
 
@@ -218,11 +228,14 @@ class AssistiveRobot:
         cv2.imwrite(str(path), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
 
     # ------------------------------------------------------------------ arm
-    def move_hand(self, target: np.ndarray, axes=None, duration: float = 1.0, settle: float = 0.3) -> float:
+    def move_hand(self, target: np.ndarray, axes=None, duration: float = 1.0, settle: float = 0.3,
+                  q_ref: np.ndarray | None = None) -> float:
         """Interpolate the palm to `target` (world) and track it with IK. Returns final error (m).
 
         The joint targets are rate-limited (MAX_ARM_RATE), so after the interpolation it keeps
         tracking the target (up to SETTLE_MAX s) until the palm has actually arrived.
+        q_ref: planned arm configuration for this move (from _plan): the IK's null space is pulled
+        towards it instead of the home pose, so the arm stays on the branch that was checked.
         """
         start, _ = self.ik.palm_pose()
         n = max(1, int(duration / CONTROL_DT))
@@ -232,13 +245,19 @@ class AssistiveRobot:
             a = min(1.0, k / n)
             a = a * a * (3 - 2 * a)  # smoothstep
             goal = (1 - a) * start + a * np.asarray(target)
-            q, _ = self.ik.solve(goal, axes, q_init=q, iters=15)
+            q, _ = self.ik.solve(goal, axes, q_init=q, iters=15, elbow_gain=self._elbow_gain(), q_ref=q_ref)
             self._set_right_arm(q)
             self._tick()
             if k >= k_min and np.linalg.norm(self.ik.palm_pose()[0] - target) < 0.01:
                 break
         p, _ = self.ik.palm_pose()
         return float(np.linalg.norm(p - target))
+
+    def _elbow_gain(self) -> float | None:
+        """Elbow-down pull for the right arm's IK: on while holding something (the carry with a
+        top grasp otherwise lifts the elbow by the head and tilts the item), off while reaching
+        (it made the grasps worse). None = ik.py's default."""
+        return HOLD_ELBOW_GAIN if self.holding is not None else None
 
     def _swing(self, side: str, q_goal: np.ndarray, min_duration: float) -> None:
         """Joint-space move of one arm to q_goal (smoothstep), slow enough for the rate limit,
@@ -352,12 +371,18 @@ class AssistiveRobot:
             self._set_posture(0.74, 0.0)
             return {"ok": False, "error": f"no collision-free grasp for {item} from here (score {best:.3f})"}
 
-        # Come in along the approach line: far pre-grasp (outside any cupboard), pre-grasp, grasp.
-        self.move_hand(grasp - (back + 0.10) * approach + np.array([0, 0, 0.04]), axes, duration=1.0, settle=0.1)
-        e1 = self.move_hand(pre, axes, duration=0.7)
-        e2 = self.move_hand(grasp, axes, duration=0.9)
+        # Come in along the approach line: far pre-grasp (outside any cupboard), pre-grasp, grasp,
+        # all on the planned configurations (joint-space swing to the far pre-grasp).
+        q_pre, q_g = self._best_q
+        far = grasp - (back + 0.10) * approach + np.array([0, 0, 0.04])
+        q_far, _ = self.ik.solve(far, axes, q_init=q_pre, iters=150, q_ref=q_pre)
+        if self.ik.elbow_too_high(q_far):
+            q_far = q_pre
+        self._reach("right", q_far, far, pre, q_pre, axes, duration=0.7)
+        e1 = float(np.linalg.norm(self.ik.palm_pose()[0] - pre))
+        e2 = self.move_hand(grasp, axes, duration=0.9, q_ref=q_g)
         if e2 > 0.04:
-            self.move_hand(pre, axes, duration=0.8)
+            self.move_hand(pre, axes, duration=0.8, q_ref=q_pre)
             self.arm_home()
             self._set_posture(0.74, 0.0)
             return {"ok": False, "error": f"could not reach {item} (residual {e2:.3f} m)", "pre_err": round(e1, 3)}
@@ -370,38 +395,74 @@ class AssistiveRobot:
         idx = axes[1][0] if len(axes) > 1 else 2
         self.hold_vert = (idx, R_palm[:, idx].copy())
         self.hold_mode, self.hold_dz = "side", grasp[2] - centre[2]
-        self.move_hand(grasp + np.array([0, 0, 0.04]), axes, duration=0.6, settle=0.0)
-        self.move_hand(grasp - (back + 0.10) * approach + np.array([0, 0, 0.05]), axes, duration=0.9, settle=0.0)
+        self.move_hand(grasp + np.array([0, 0, 0.04]), axes, duration=0.6, settle=0.0, q_ref=q_g)
+        self.move_hand(grasp - (back + 0.10) * approach + np.array([0, 0, 0.05]), axes, duration=0.9, settle=0.0,
+                       q_ref=q_far)
         # Step back with the arm frozen: pulls the item straight out of a cupboard / off the
         # table before the carry motion swings it sideways (it would snag on the frame).
         self._step_back(STEP_BACK)
         self.carry()
         return {"ok": True, "item": item, "grasp_error_m": round(e2, 4)}
 
-    def _choose(self, pre, grasp, candidates, postures, multi_start: bool = False):
-        """Try postures in order; return the hand-axis candidate with the best collision-free IK.
+    def _plan(self, ik: ArmIK, q_now: np.ndarray, pre: np.ndarray, target: np.ndarray, candidates,
+              multi_start: bool = True, elbow_max: float | None = None):
+        """Plan a reach: joint configurations for the pre-pose and the target, for the best of the
+        hand-axis candidates. Returns (axes, raw error score, q_pre, q_target), score inf if none.
 
-        multi_start: also seed the IK from the home arm pose and from a solution for the grasp
-        alone (the IK has local minima, e.g. fingers-down grasps reached from a raised hand).
+        Seeds: the current arm, home, and a solution for the target alone (the IK has local
+        minima). Plans that lift the elbow above ELBOW_MAX are rejected outright, the rest are
+        ranked by error + collisions + a raised-elbow cost. The motion that runs afterwards
+        (_reach) follows these configurations, so what was checked here is what happens.
         """
-        axes, best, rank = None, None, None
+        best = (None, np.inf, None, None)
+        rank = np.inf
+        for cand in candidates:
+            seeds = [q_now]
+            if multi_start:
+                seeds += [ik.home, ik.solve(target, None, q_init=ik.home, iters=100)[0]]
+            for q0 in seeds:
+                q_pre, e_pre = ik.solve(pre, cand, q_init=q0, iters=200)
+                q_t, e_t = ik.solve(target, cand, q_init=q_pre, iters=200, q_ref=q_pre)
+                if ik.elbow_too_high(q_pre, q_t, limit=elbow_max):
+                    continue
+                raw = e_pre + e_t + 0.1 * len(ik.collisions(q_pre) + ik.collisions(q_t))
+                score = raw + ELBOW_W * ik.elbow_cost(q_pre, q_t)
+                if score < rank:
+                    rank, best = score, (cand, raw, q_pre, q_t)
+        return best
+
+    def _path_clear(self, ik: ArmIK, q0: np.ndarray, q1: np.ndarray, n: int = 8) -> bool:
+        """No arm collisions along the straight joint-space path q0 -> q1 (sampled)."""
+        return all(not ik.collisions((1 - a) * q0 + a * q1, margin=0.0) for a in np.linspace(0, 1, n)[1:])
+
+    def _reach(self, side: str, q_pre: np.ndarray, pre: np.ndarray, target: np.ndarray, q_t: np.ndarray,
+               axes, duration: float = 0.9) -> float:
+        """Execute a plan: joint-space swing to q_pre (Cartesian with q_ref if the swing would hit
+        something), then straight in to the target, staying on the plan's branch. Returns the error."""
+        ik, cmd = (self.ik, self.arm_cmd) if side == "right" else (self.left_ik, self.left_cmd)
+        mover = self.move_hand if side == "right" else self.move_left_hand
+        if self._path_clear(ik, cmd.copy(), q_pre):
+            self._swing(side, q_pre, 1.2)
+        else:
+            mover(pre, axes, duration=1.2, settle=0.1, q_ref=q_pre)
+        return mover(target, axes, duration=duration, q_ref=q_t)
+
+    def _choose(self, pre, grasp, candidates, postures, multi_start: bool = True, elbow_max: float | None = None):
+        """Try postures in order; return (axes, score) of the best plan (see _plan). The plan's
+        configurations are left in self._best_q for _reach."""
+        axes, best, posture = None, np.inf, None
+        self._best_q = None
         for height, pitch in postures:
             self._set_posture(height, pitch)
-            for cand in candidates:
-                seeds = [self.arm_cmd]
-                if multi_start:
-                    seeds += [self.ik.home, self.ik.solve(grasp, None, q_init=self.ik.home, iters=100)[0]]
-                for q0 in seeds:
-                    q_pre, e_pre = self.ik.solve(pre, cand, q_init=q0, iters=200)
-                    q_g, e_g = self.ik.solve(grasp, cand, q_init=q_pre, iters=200)
-                    hits = self.ik.collisions(q_pre) + self.ik.collisions(q_g)
-                    raw = e_pre + e_g + 0.1 * len(hits)
-                    score = raw + ELBOW_W * self.ik.elbow_cost(q_pre, q_g)  # rank elbow-down first
-                    if rank is None or score < rank:
-                        axes, rank, best = cand, score, raw
-                        self._best_q = (q_pre, q_g)
+            cand, raw, q_pre, q_g = self._plan(self.ik, self.arm_cmd.copy(), pre, grasp, candidates, multi_start,
+                                               elbow_max)
+            if cand is not None and raw < best:
+                axes, best, posture = cand, raw, (height, pitch)
+                self._best_q = (q_pre, q_g)
             if best <= 0.03:
                 break
+        if posture is not None:
+            self._set_posture(*posture)  # back to the posture the plan was made in
         return axes, best
 
     def _pick_low(self, item: str, top: np.ndarray, centre: np.ndarray) -> dict:
@@ -434,9 +495,8 @@ class AssistiveRobot:
             self._set_posture(0.74, 0.0)
             self.arm_home()
             return {"ok": False, "error": f"{item} is too low to reach from a squat (score {best:.3f})"}
-        self.move_hand(pre + np.array([0, 0, 0.08]), axes, duration=1.0, settle=0.1)
-        self.move_hand(pre, axes, duration=0.6)
-        e = self.move_hand(grasp, axes, duration=0.9)
+        q_pre, q_g = self._best_q
+        e = self._reach("right", q_pre, pre, grasp, q_g, axes, duration=0.9)
         if e > 0.04:
             self.move_hand(pre, axes, duration=0.6)
             self._set_posture(0.74, 0.0)
@@ -448,7 +508,7 @@ class AssistiveRobot:
         _, R_palm = self.ik.palm_pose()
         self.hold_vert = (0, R_palm[:, 0].copy())  # fingers (pointing down) keep their direction
         self.hold_mode, self.hold_dz = "top", grasp[2] - centre[2]
-        self.move_hand(pre + np.array([0, 0, 0.1]), axes, duration=0.8, settle=0.0)
+        self.move_hand(pre + np.array([0, 0, 0.1]), axes, duration=0.8, settle=0.0, q_ref=q_pre)
         self.carry()
         return {"ok": True, "item": item, "grasp_error_m": round(e, 4), "from": "floor"}
 
@@ -467,7 +527,6 @@ class AssistiveRobot:
         up = np.array([0, 0, 1.0])
         candidates = [[(0, -up, 0.6), (1, left, 0.3)], [(0, -up, 0.6), (1, fwd, 0.3)],
                       [(0, -up, 0.6), (1, -left, 0.3)], [(0, -up, 0.6)]]
-        clear = 0.30  # hand comes in this far above the grasp (over the drawer front)
         # The item's distance varies with how far the drawer actually opened: try a few stances
         for standoff in (ABOVE_STANDOFF, ABOVE_STANDOFF + 0.05, ABOVE_STANDOFF - 0.04):
             goal = top[:2] - standoff * fwd[:2] + GRASP_LATERAL * left[:2]
@@ -478,9 +537,12 @@ class AssistiveRobot:
                 top = det[it.marker_id].position
                 centre = top - np.array([0, 0, it.size[2] + 0.001])
             grasp = top - np.array([0, 0, min(0.03, it.size[2])])
-            pre = grasp + np.array([0, 0, clear])
-            axes, best = self._choose(pre, grasp, candidates, [(0.74, 0.3), (0.74, 0.15), (0.70, 0.45), (0.64, 0.5)],
-                                      multi_start=True)
+            for clear in ABOVE_CLEARS:  # lowest first: the lower the hand, the lower the elbow
+                pre = grasp + np.array([0, 0, clear])
+                axes, best = self._choose(pre, grasp, candidates, [(0.74, 0.3), (0.74, 0.15), (0.70, 0.45), (0.64, 0.5)],
+                                          multi_start=True, elbow_max=ABOVE_ELBOW_MAX)
+                if best <= 0.05:
+                    break
             if best <= 0.05:
                 break
         if best > 0.05:
@@ -489,10 +551,10 @@ class AssistiveRobot:
             return {"ok": False, "error": f"no collision-free top grasp for {item} (score {best:.3f})"}
         # Swing the arm to the chosen pre-grasp configuration in joint space (a Cartesian
         # interpolation from the raised hand would drag the IK back into its local minimum).
-        self._swing("right", self._best_q[0], 1.2)
-        e = self.move_hand(grasp, axes, duration=1.0)
+        q_pre, q_g = self._best_q
+        e = self._reach("right", q_pre, pre, grasp, q_g, axes, duration=1.0)
         if e > 0.04:
-            self.move_hand(pre, axes, duration=0.8)
+            self.move_hand(pre, axes, duration=0.8, q_ref=q_pre)
             self._set_posture(0.74, 0.0)
             self.arm_home()
             return {"ok": False, "error": f"could not reach {item} from above (residual {e:.3f} m)"}
@@ -502,7 +564,10 @@ class AssistiveRobot:
         _, R_palm = self.ik.palm_pose()
         self.hold_vert = (0, R_palm[:, 0].copy())  # fingers (pointing down) keep their direction
         self.hold_mode, self.hold_dz = "top", grasp[2] - centre[2]
-        self.move_hand(pre + np.array([0, 0, 0.05]), axes, duration=1.0, settle=0.1)
+        # Lift until the item's base clears the drawer front (it stands between us and the item),
+        # however low the hand came in
+        lift = max(clear, it.size[2] * 2 + 0.06) + 0.05
+        self.move_hand(grasp + np.array([0, 0, lift]), axes, duration=1.2, settle=0.1, q_ref=q_pre)
         self._step_back(STEP_BACK)
         self.carry()
         return {"ok": True, "item": item, "grasp_error_m": round(e, 4), "from": "above"}
@@ -628,6 +693,7 @@ class AssistiveRobot:
         pelvis (along the heading), e.g. while pulling a door open towards the body.
         """
         q = self.arm_cmd.copy()
+        q_ref = q.copy()  # the grasp configuration: stay on its branch along the whole path
         bad = 0
         v_back = 0.0
         for i, (p, axes) in enumerate(zip(targets, axes_list)):
@@ -637,7 +703,7 @@ class AssistiveRobot:
                 want = -BACKOFF_SPEED if fwd < keep_reach else 0.0
                 v_back += np.clip(want - v_back, -0.5 * dt, 0.5 * dt)  # 0.5 m/s^2 ramp
                 self.wbc.set_velocity(v_back if abs(v_back) > 0.05 else 0.0, 0.0, 0.0)
-            q, _ = self.ik.solve(p, axes, q_init=q, iters=25)
+            q, _ = self.ik.solve(p, axes, q_init=q, iters=25, q_ref=q_ref)
             self._set_right_arm(q)
             self._tick()
             err = float(np.linalg.norm(self.ik.palm_pose()[0] - p))
@@ -680,22 +746,16 @@ class AssistiveRobot:
         self._raise_hand(handle[2], toward=handle)
         candidates = [[(0, into, 0.6), (1, up, 0.4)], [(0, into, 0.6), (1, -up, 0.4)],
                       [(0, into, 0.6), (2, up, 0.4)], [(0, into, 0.6), (2, -up, 0.4)]]
-        axes, best, q_pre, rank = None, None, None, None
-        for cand in candidates:
-            # multi-start: the IK has local minima (seed: current arm, home, handle-only solution)
-            for q0 in (self.arm_cmd, self.ik.home, self.ik.solve(handle, None, q_init=self.ik.home, iters=100)[0]):
-                q1, e1 = self.ik.solve(pre, cand, q_init=q0, iters=200)
-                q2, e2 = self.ik.solve(handle, cand, q_init=q1, iters=200)
-                raw = e1 + e2 + 0.1 * len(self.ik.collisions(q1) + self.ik.collisions(q2))
-                score = raw + ELBOW_W * self.ik.elbow_cost(q1, q2)  # rank elbow-down first
-                if rank is None or score < rank:
-                    axes, rank, best, q_pre = cand, score, raw, q1
+        axes, best, q_pre, q_h = self._plan(self.ik, self.arm_cmd.copy(), pre, handle, candidates)
         if best > 0.05:
             self.arm_home()
-            return {"ok": False, "error": f"handle not reachable from here (score {best:.3f})"}
+            th = self.wbc.base_yaw
+            d = handle - self.wbc.base_pos
+            rel = [d[0] * np.cos(th) + d[1] * np.sin(th), -d[0] * np.sin(th) + d[1] * np.cos(th), d[2]]
+            return {"ok": False, "error": f"handle not reachable from here (score {best:.3f}; handle at "
+                    f"fwd {rel[0]:.2f} left {rel[1]:.2f} up {rel[2]:.2f} m from the pelvis)"}
 
-        self._swing("right", q_pre, 1.2)  # joint-space swing to the chosen pre-grasp
-        e = self.move_hand(handle, axes, duration=0.8)
+        e = self._reach("right", q_pre, pre, handle, q_h, axes, duration=0.8)
         if e > 0.045:
             self.arm_home()
             return {"ok": False, "error": f"could not reach handle (residual {e:.3f} m)"}
@@ -747,7 +807,8 @@ class AssistiveRobot:
         return {"ok": reached > 0.6 * n, f"opened_{unit}": round(opened, 3), f"of_demo_{unit}": round(model.amount, 3)}
 
     # ------------------------------------------------------------------ closing (left hand)
-    def move_left_hand(self, target: np.ndarray, axes=None, duration: float = 1.0, settle: float = 0.3) -> float:
+    def move_left_hand(self, target: np.ndarray, axes=None, duration: float = 1.0, settle: float = 0.3,
+                       q_ref: np.ndarray | None = None) -> float:
         """move_hand for the left arm (the right arm keeps its joint targets, e.g. holding an item)."""
         start, _ = self.left_ik.palm_pose()
         n = max(1, int(duration / CONTROL_DT))
@@ -756,7 +817,7 @@ class AssistiveRobot:
         for k in range(1, k_min + int(SETTLE_MAX / CONTROL_DT) + 1):
             a = min(1.0, k / n)
             a = a * a * (3 - 2 * a)
-            q, _ = self.left_ik.solve((1 - a) * start + a * np.asarray(target), axes, q_init=q, iters=15)
+            q, _ = self.left_ik.solve((1 - a) * start + a * np.asarray(target), axes, q_init=q, iters=15, q_ref=q_ref)
             self._set_left_arm(q)
             self._tick()
             if k >= k_min and np.linalg.norm(self.left_ik.palm_pose()[0] - target) < 0.01:
@@ -790,7 +851,7 @@ class AssistiveRobot:
         best, best_t = None, None
         for f, l, u in candidates:
             t = self.wbc.base_pos + f * fwd + l * left + np.array([0, 0, u])
-            q, e = self.ik.solve(t, axes, q_init=self.arm_cmd, iters=150)
+            q, e = self.ik.solve(t, axes, q_init=self.arm_cmd, iters=150, elbow_gain=self._elbow_gain())
             upright = float(self.scratch_palm_axis(q, idx) @ vert)
             margin = self.ik.limit_margin(q)
             score = (e + 0.3 * (1 - upright) + 0.1 * len(self.ik.collisions(q)) + 0.3 * max(0.0, 0.3 - margin)
@@ -922,23 +983,14 @@ class AssistiveRobot:
         pre = handle - 0.12 * into
         candidates = [[(0, into, 0.6), (1, up, 0.4)], [(0, into, 0.6), (1, -up, 0.4)],
                       [(0, into, 0.6), (2, up, 0.4)], [(0, into, 0.6), (2, -up, 0.4)]]
-        axes, best, q_best, rank = None, None, None, None
-        for cand in candidates:
-            for q0 in (self.left_cmd, self.left_ik.home, self.left_ik.solve(handle, None, q_init=self.left_ik.home)[0]):
-                q1, e1 = self.left_ik.solve(pre, cand, q_init=q0, iters=200)
-                q2, e2 = self.left_ik.solve(handle, cand, q_init=q1, iters=200)
-                raw = e1 + e2 + 0.1 * len(self.left_ik.collisions(q1) + self.left_ik.collisions(q2))
-                score = raw + ELBOW_W * self.left_ik.elbow_cost(q1, q2)  # rank elbow-down first
-                if rank is None or score < rank:
-                    axes, rank, best, q_best = cand, score, raw, q1
+        axes, best, q_best, q_h = self._plan(self.left_ik, self.left_cmd.copy(), pre, handle, candidates)
         if best > 0.05:
             rel = handle - self.wbc.base_pos
             return {"ok": False, "error": f"handle not reachable with the left hand (score {best:.3f})",
                     "handle_rel_pelvis": rel.round(3).tolist(), "yaw": round(self.wbc.base_yaw, 3),
                     "yaw_goal": round(yaw_goal, 3)}
         # joint-space swing to the pre-grasp (avoids IK local minima from the hand-by-the-hip pose)
-        self._swing("left", q_best, 1.0)
-        e = self.move_left_hand(handle, axes, duration=0.8)
+        e = self._reach("left", q_best, pre, handle, q_h, axes, duration=0.8)
         if e > 0.04:
             self.left_arm_home()
             return {"ok": False, "error": f"could not reach the handle with the left hand (residual {e:.3f} m)"}
@@ -960,6 +1012,7 @@ class AssistiveRobot:
             R, t = model.transform(opened * (1 - s))
             targets.append(Ra @ (R @ g0 + t) + pa)
         q = self.left_cmd.copy()
+        q_ref = q.copy()  # stay on the grasp configuration's branch
         bad, reached = 0, 0
         vel = np.zeros(2)
         hand_home = np.array([0.36, GRASP_LATERAL])  # where the handle should sit in the body frame (well within reach)
@@ -976,7 +1029,7 @@ class AssistiveRobot:
             wz = float(np.clip(1.5 * yerr, -0.5, 0.5)) if abs(yerr) > 0.08 else 0.0
             v_cmd = np.where(np.abs(vel) > 0.05, vel, 0.0)
             self.wbc.set_velocity(float(v_cmd[0]), float(v_cmd[1]), wz)
-            q, _ = self.left_ik.solve(p, [(axes[1][0], axes[1][1], 0.2)], q_init=q, iters=25)
+            q, _ = self.left_ik.solve(p, [(axes[1][0], axes[1][1], 0.2)], q_init=q, iters=25, q_ref=q_ref)
             self._set_left_arm(q)
             self._tick()
             err = float(np.linalg.norm(self.left_ik.palm_pose()[0] - p))

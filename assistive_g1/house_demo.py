@@ -195,10 +195,15 @@ def main():
     if rec is not None:
         rec.close()
     if viewer is not None:
-        print("Done - close the viewer window to exit.")
-        while viewer.is_running():
-            time.sleep(0.1)
-        viewer.close()
+        print("Done - close the viewer window (or Ctrl+C) to exit.")
+        try:
+            while viewer.is_running():
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            pass
+        import sys
+        sys.stdout.flush()
+        os._exit(0)  # viewer.close() can hang on an X error
     d = env.data
     for item, body in env.item_body.items():
         p = d.body(body).xpos

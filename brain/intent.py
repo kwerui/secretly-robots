@@ -26,6 +26,9 @@ class RulesIntentParser:
     """Predictable offline fallback, not an LLM or imitation learner."""
     def parse(self, request: str) -> FetchTask:
         text = request.lower()
+        # (G1 integration, 8 Nov) needs, not just commands: "I'm thirsty" -> the water bottle
+        if re.search(r"\b(thirsty|drink)\b", text):
+            return FetchTask("water_bottle")
         if not re.search(r"\b(bring|fetch|get|pass|hand)\b", text):
             raise IntentError("I can only handle a simple fetch request for now")
         if "bottle" in text or "water" in text:

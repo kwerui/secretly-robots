@@ -19,7 +19,9 @@ SYSTEM_LIBSTDCXX = "/usr/lib/x86_64-linux-gnu/libstdc++.so.6"
 
 
 def _is_conda_python() -> bool:
-    return os.path.isdir(os.path.join(sys.prefix, "conda-meta"))
+    # sys.base_prefix: a venv made from conda's Python (e.g. the repo's .venv) still uses conda's
+    # old libstdc++, but its sys.prefix is the venv
+    return any(os.path.isdir(os.path.join(p, "conda-meta")) for p in {sys.prefix, sys.base_prefix})
 
 
 def relaunch_for_viewer() -> None:
