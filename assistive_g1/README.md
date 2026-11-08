@@ -1,15 +1,22 @@
 # assistive_g1: a Unitree G1 that learns from the carer
 
 A humanoid (Unitree G1, MuJoCo) fetches things for someone with limited mobility. It
-learns two things by watching the carer:
+has two adaptive components:
 
 - **Where things live.** It keeps a location memory, a probability for each item over
-  stations, built from the carer putting things away.
+  stations. The current relocation benchmark reloads saved memory; live carer-to-memory
+  teaching remains incomplete.
 - **How to open things.** From one demonstration it fits an articulation model (hinge
   axis, opening angle, grasp point), all relative to an ArUco anchor on the furniture.
 
 Walking and balance come from NVIDIA's GR00T decoupled whole-body-control policy. The arm
 uses our own damped-least-squares IK, and perception is ArUco on the robot's head camera.
+
+**Current evidence:** in a three-episode MuJoCo relocation benchmark, physical delivery
+was independently verified in **3/3** episodes; full-task success was **1/3** because
+drawer closing failed in episodes 1–2. Episode 3 reloaded memory and searched the counter
+first. See [`../docs/G1_EVALUATION.md`](../docs/G1_EVALUATION.md); do not present 3/3
+deliveries as 3/3 complete task successes.
 
 ## Quick start
 
@@ -121,7 +128,8 @@ from `decoupled_wbc/control/policy/g1_gear_wbc_policy.py`, and they match LeRobo
 
 ## Known shortcuts (say them if asked)
 
-- Localisation uses the simulator's base pose; the stations are fixed.
+- Localisation uses simulated IMU, leg-odometry, LiDAR and RGB-D inputs against the static
+  house map; it is still simulation-only, and stations are fixed.
 - Grasping is a weld switched on when the palm reaches the item (the hand mesh is
   rigid). The door grip is position-only (torquescale 0), like a loose grip on a bar
   handle.

@@ -1,74 +1,41 @@
-# Secretly Robots — two-day hackathon execution roadmap
+# Secretly Robots — final demo roadmap
 
-**Dates:** 7–8 November 2026. **Target:** a simulated assistive robot that fetches a light bottle for an older adult seated on a sofa. In the existing house, the bottle starts on one of five furniture surfaces; the scene may be changed during the run. **Stack:** Python + MuJoCo directly (no ROS 2 or Dora), deterministic offline planner, optional local Gemma 4 and optional cloud Gemini 4 Argon.
+**Scope:** a simulation-only Unitree G1 assistive-fetch prototype. The final story is perception-driven search with adaptive location memory, learned drawer motion, verified delivery, and honest reporting of failure modes.
 
-## Non-negotiable scope
+## What we can claim
 
-ONE house layout, ONE bottle, ONE named furniture surface, ONE delivery target, ONE unannounced change. Prioritise a reliable complete sequence over adding extra tasks. If grasping is too hard, demo only the verified subset and explain the limitation; do not script or fake the rest.
+- The G1 uses head-camera observations and a recency-weighted memory to choose where to search.
+- The three-episode relocation benchmark verified physical delivery in **3/3** episodes.
+- Only **1/3** episodes achieved the full-task criterion: episodes 1–2 left the drawer open, while episode 3 reloaded memory and searched the counter first.
+- The system runs in MuJoCo. It is not real-world validated, medically certified, or safe for unsupervised use.
 
-## Priority 0: team agreement (30–45 min)
+## What we must not claim
 
-- [ ] Decide which MuJoCo quadruped/mobile manipulator model and arm controller to use.
-- [ ] Confirm whether the carer demonstration is **symbolic task teaching** or a genuine teleoperated robot demo; do not claim one-shot motor imitation unless built.
-- [ ] Agree on the `Observation` and `Decision` fields; identify who builds each bridge.
-- [ ] Write down baseline success criteria: reach target, grasp, deliver, verify, zero unsafe contacts.
-- [ ] Assign a demo operator and an integration owner.
+- Do not call 3/3 physical deliveries “3/3 task success.”
+- Do not describe simulator truth checks as real-world perception or safety validation.
+- Do not claim a carer demonstration teaches location memory live unless that exact flow is shown; the current memory benchmark reloads saved memory.
+- Do not hide the weld-based grasp abstraction or the drawer-closing failures if asked.
 
-## Saturday — make one end-to-end loop
+## Recording run sheet
 
-| Priority | Work | Exit criteria | Suggested owner |
-|---|---|---|---|
-| P0 | Use the existing HouseEnv | Robot (when attached), room doors, furniture, bottle and sofa visible | Simulation team |
-| P0 | Implement basic locomotion and manipulation calls | Controller can navigate/grasp/place with manually chosen targets | Control team |
-| P0 | Use the ground-truth observation baseline | Adapter reads actual `MjModel`/`MjData`; clearly label it as simulator ground truth | AI/integration |
-| P0 | Add sensor observations | Position and named-furniture object state derived from configured simulated sensors with confidence | Perception team |
-| P0 | Integrate AI brain with the fresh observation bridge | `Brain.next_action()` emits correct grounded high-level action | You |
-| P0 | Validate command, log action and outcome | Failure cannot be mistaken for success | You + controller team |
+1. Start from a clean, known seed and show the on-screen perception/memory state.
+2. Show the robot search according to its current memory ranking.
+3. Relocate the target as part of the scenario; show that the next search decision follows the new observation or reloaded memory.
+4. Show delivery verification separately from drawer-close verification.
+5. If drawer closing fails, say so on camera and use the recorded successful full-task episode as the backup—label it as a recording.
 
-**Checkpoint:** A real (possibly manually assisted) MuJoCo pick-and-deliver trial that uses fresh state. If not achievable, simplify robot/environment by end of Saturday rather than working on extra features.
+## Pitch structure (five minutes)
 
-## Sunday morning — earn the high-value judging marks
+1. **Need (20 seconds):** people with limited mobility can benefit from help with simple retrieval; this prototype supports carers rather than replacing them.
+2. **System (45 seconds):** G1 in MuJoCo; camera observations → memory-ranked search → high-level planner → locomotion/manipulation → independent simulator verification.
+3. **Evidence (60 seconds):** 3/3 verified physical deliveries; 1/3 full-task successes; drawer closing was the failure point in two episodes; episode 3 reloaded memory and searched the counter first.
+4. **Demo (up to 60 seconds):** show a continuous run, including the changed-location or memory behavior.
+5. **Limits and next step (30 seconds):** improve drawer-close reliability, test across more randomized layouts, and validate sensing/manipulation beyond simulation.
 
-| Priority | Work | Exit criteria |
-|---|---|---|
-| P0 | Replace fixed object position with live perception | Moved bottle updates detection and selected action |
-| P0 | Demonstrate replan | Object moved mid-run -> robot revises goal/route rather than replaying old positions |
-| P0 | Safety stop | Person-approach or sensor-failure event visibly halts action |
-| P1 | Local model inference | Gemma 4 via Ollama interprets a real request without Wi-Fi; record actual latency (optional; not yet live-confirmed) |
-| P1 | Teach-once symbolic goal | Carer stores object/destination once, robot reattempts using current perception |
-| P2 | Cloud Gemini prize path | Gemini 4 Argon is implemented and live-tested; keep it optional and never required for basic autonomy |
+## Before publishing or submitting
 
-**Freeze:** Stop feature work at least **two hours before the confirmed submission deadline**, then rehearse and fix only blockers.
-
-## Submission and demo
-
-- [ ] **One-page technical summary:** user, problem, system diagram, components/models, where inference runs, observed latency/compute, safety, limitation and failure response.
-- [ ] **Up to 60-second continuous simulation video** showing perception alongside real actions and an unscripted change (from the track slide).
-- [ ] **Five-minute live pitch** for the track judges: need, working demo, evidence of adaptation, limits, impact.
-- [ ] Backup screen recording; explain honestly if used instead of live.
-- [ ] Public repository copy with source, setup instructions, test output, acknowledgement of dependencies, no API keys.
-
-The general Google Builder Guide also suggests a sub-three-minute live *working-app demonstration*. Rehearse a short demo segment inside the longer five-minute track pitch; confirm timings with organisers.
-
-## Fast no-go decisions
-
-1. **Arm not controllable:** show navigation/planning to an open furniture surface; explain the manipulation limitation.
-2. **Object detection unreliable:** start with simulated ground-truth object poses explicitly disclosed as an engineering baseline; do not pretend camera AI works.
-3. **Local model too slow/no RAM:** use deterministic offline rules for demo; show model upgrade separately only if actually working.
-4. **No safe grasp:** stop rather than forcibly moving object; show a verified navigation and planning demo.
-5. **No Wi-Fi:** continue the offline pipeline; do not depend on cloud to progress.
-
-## Current capability status
-
-- **Completed and tested:** deterministic Python planner; Gemini 4 Argon integration/live test; HouseEnv ground-truth `Observation` adapter; detection of named bottle-location changes; planner re-decision after a HouseEnv bottle move.
-- **In progress:** robot model, navigation, grasp and delivery controllers; sensor-derived perception with confidence; end-to-end feedback wiring.
-- **Not yet implemented:** confirmed Gemma 4 live inference; camera object recognition; one-shot learned manipulation; real-world operation.
-
-Prioritise a genuine end-to-end fetching, adaptation and safety demonstration over optional models or enhancements.
-
-## Ownership proposal
-
-- **You:** local/offline AI brain, intent interpretation, high-level task planning, adaptive replanning, structural validation and decision logs.
-- **Robotics teammate(s):** quadruped/arm in MuJoCo, low-level control, grasp and placement.
-- **Perception teammate:** camera/sensor-to-observation translation and confidence.
-- **Whole team:** integration, live scenario changes, realistic testing and submission.
+- [ ] Keep only the current judge-facing README, roadmap, architecture/evaluation evidence and run instructions.
+- [ ] Remove or redact internal handovers, team rosters, personal names, local setup notes and stale branch-specific claims from any public copy.
+- [ ] Confirm `git status` is clean and that generated logs, models, videos, and `.env*` files are not tracked.
+- [ ] Search the complete history for credentials before changing repository visibility.
+- [ ] Label any prerecorded video as prerecorded and do not edit out a material failure without saying so.
