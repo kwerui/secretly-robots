@@ -45,8 +45,9 @@ place**, and when the straight arm swing was blocked, **the arm got stuck on its
    planned point (touch detected from contacts), the push starts from there instead of failing.
 5. **Smaller fixes:** the side pick skips the far pre-grasp when it isn't cleanly reachable;
    `hand_over` refuses to let go if the robot isn't at the tray (it used to drop the bottle on
-   the kitchen floor when the walk failed); the brain log prints each decision *before* its
-   result (Gemini's "not holding anything" was the reason for the grasp, written before it).
+   the kitchen floor when the walk failed) and only once the item is down (see below); the
+   brain log prints each decision *before* its result (Gemini's "not holding anything" was the
+   reason for the grasp, written before it).
 
 ## Testing
 
@@ -61,12 +62,21 @@ G1_STANCE_SEARCH=0 python batch_eval.py ... --tag nosearch      # A/B on the sam
 
 Each sim process uses ~2.5 GB of RAM, so pick `-j` by memory as well as cores.
 
-Results so far (this machine, headless):
+Results (this machine, headless; old = the working tree as it was this morning):
 
-| test | before | after |
+| test | old | new |
 |---|---|---|
-| drawer pick + close, 8 start offsets (`probe_pick --close --opened 0.42`) | 1/8 | 6/8 (before the last two fixes) |
-| full scripted demo, tidy + laundry_day seeds 0-3 (runs that finished) | 1/4 full; close 1/4 | see `logs/batch/` |
+| drawer pick + push-close from 8 shifted starts (`probe_pick --item water_bottle --close --opened 0.42`) | 1/8 | 7/8 (6/8, then 1 of the 2 remaining fixed by the later changes; the last is a top grasp 5.1 cm short of the 5 cm tolerance) |
+| counter side grasp from 8 shifted starts (`probe_pick --item cup`) | 3/8 | 7/8 |
+| `house_demo --with-cup`, tidy seed 1 (old: close failed) | close failed | all steps ok (open stopped at 19 of 36 cm, pick still worked) |
+| `house_brain_demo --offline` | both complete, drawer left open | both complete, drawer shut, both items on the tray |
+| batch, tidy + laundry_day seeds 0-3, old code | 1/4 full runs that finished (close 1/4); 4 runs killed for memory here | run it on the laptop |
+
+Hand-over: the usable tray area was a 10 x 10 cm square (10 cm edge margin on a 30 cm tray), so
+the second item came down on the first and the hand stopped above it, and it was released
+10+ cm up (both items ended on the floor in one brain run). Now the margin is 6.5 cm, it tries
+up to 3 spots and only lets go within 7 cm of the tray. In the last run the bottle still ended
+up lying down on the tray: the cup's first try pressed on it.
 
 ## Still shortcuts
 

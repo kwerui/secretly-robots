@@ -1120,25 +1120,40 @@ class AssistiveRobot:
         others = [p.position for m, p in self.cam.detect().items()
                   if m in self.marker_to_item and self.marker_to_item[m] != self.holding]
         others += self.placed
-        best_spot, best_clear = None, -1.0
+        spots = []
         for f, l in [(0.42, -0.14), (0.40, -0.02), (0.45, -0.24), (0.36, -0.20), (0.38, 0.06)]:
             cand = base + f * fwd + l * left
-            m = 0.10  # keep well clear of the edge (arm tracking error is a few cm)
+            # keep clear of the edge (arm tracking error is a few cm), but not so far that a 30 cm
+            # tray leaves a 10 cm square for two items (the second one landed on the first)
+            m = 0.065
             cand[0] = np.clip(cand[0], cx - hx + m, cx + hx - m)
             cand[1] = np.clip(cand[1], cy - hy + m, cy + hy - m)
             clear = min([np.hypot(*(cand[:2] - o[:2])) for o in others], default=1.0)
-            if clear > best_clear + 0.02:
-                best_spot, best_clear = cand, clear
-        spot = best_spot
-        spot[2] = surface["top"] + it.size[2] + self.hold_dz + 0.006  # palm height when the item rests on the table
-        # Come in from above (clear of anything already on the table), set down, leave upwards.
-        self.move_hand(spot + np.array([0, 0, 0.17]), axes, duration=1.2)
-        self.move_hand(spot, axes, duration=0.9)
+            cand[2] = surface["top"] + it.size[2] + self.hold_dz + 0.006  # palm height when the item rests on the table
+            if all(np.hypot(*(cand[:2] - c[:2])) > 0.03 for _, c in spots):
+                spots.append((clear, cand))
+        spots.sort(key=lambda t: -t[0])  # farthest from what is already there first
         item = self.holding
-        if DEBUG:
-            b = self.model.body(self.item_body[item]).id
-            print(f"   hand_over: spot {spot.round(3)} palm {self.ik.palm_pose()[0].round(3)} item {self.data.xpos[b].round(3)} "
-                  f"item z-axis {self.data.xmat[b].reshape(3, 3)[:, 2].round(2)} surface top {surface['top']:.3f}")
+        spot = None
+        for clear, cand in spots[:3]:
+            # Come in from above (clear of anything already on the table) and set down; only let go
+            # once the item is actually down (the hand can be stopped above the tray by something
+            # already on it: a cup released 10 cm up knocked the bottle off)
+            self.move_hand(cand + np.array([0, 0, 0.17]), axes, duration=1.2)
+            self.move_hand(cand, axes, duration=0.9)
+            dz = float(self.ik.palm_pose()[0][2] - cand[2])
+            if DEBUG:
+                b = self.model.body(self.item_body[item]).id
+                print(f"   hand_over: spot {cand.round(3)} palm {self.ik.palm_pose()[0].round(3)} item {self.data.xpos[b].round(3)} "
+                      f"item z-axis {self.data.xmat[b].reshape(3, 3)[:, 2].round(2)} surface top {surface['top']:.3f} "
+                      f"clear {clear:.2f} still {dz:.3f} m above")
+            if dz < 0.07:  # a short drop is fine (the old code released here too); 10+ cm knocked things over
+                spot = cand
+                break
+            self.move_hand(cand + np.array([0, 0, 0.17]), axes, duration=0.7)
+        if spot is None:
+            self.carry()
+            return {"ok": False, "error": f"couldn't set the {item} down on the tray (blocked); still holding it"}
         self._weld(f"grasp_{self.item_body[item]}", False)
         self.holding = None
         self.placed.append(spot.copy())
@@ -1156,6 +1171,8 @@ class AssistiveRobot:
         keep_reach: if set, walk backwards whenever the target comes closer than this to the
         pelvis (along the heading), e.g. while pulling a door open towards the body.
         """
+        if keep_reach is not None:
+            return self._follow_paced(targets, axes_list, keep_reach)
         q = self.arm_cmd.copy()
         q_ref = q.copy()  # the grasp configuration: stay on its branch along the whole path
         bad = 0
@@ -1173,10 +1190,67 @@ class AssistiveRobot:
             err = float(np.linalg.norm(self.ik.palm_pose()[0] - p))
             bad = bad + 1 if err > max_err else 0
             if bad >= 10:  # persistently off the path (out of reach or blocked)
+                if DEBUG:
+                    print(f"   follow: lost the path at {i}/{len(targets)}: err {err:.3f} "
+                          f"target rel {self._body_rel(p).round(2)} v_back {v_back:.2f} hits {self.ik.collisions(self.arm_cmd)[:2]}")
                 self.wbc.set_velocity(0, 0, 0)
                 return i
         self.wbc.set_velocity(0, 0, 0)
         return len(targets)
+
+    def _follow_paced(self, targets: list[np.ndarray], axes_list: list, keep_reach: float,
+                      stall_s: float = 1.5) -> int:
+        """Pull a part (drawer/door) along `targets`, paced by the feet (same scheme as the push
+        close): the target only moves on while the hand keeps up, and the feet walk so the
+        handle stays where it was in front of the body when grasped (never closer than
+        keep_reach), holding the heading. The old fixed-timeline follow gave up after 0.2 s of
+        lag: the drawer came at the body faster than GR00T started walking back, the arm folded
+        and the pull stopped part-way (15-31 cm of 36). Returns how many targets were reached."""
+        q = self.arm_cmd.copy()
+        q_ref = q.copy()  # the grasp configuration: stay on its branch along the whole path
+        yaw0 = self.wbc.base_yaw
+        palm0 = self.ik.palm_pose()[0]
+        # The weld held the handle wherever the palm was (up to GRASP_TOL off the handle point):
+        # run the learned path from the palm's actual grip point, not the nominal one
+        start = 2 * np.asarray(targets[0]) - np.asarray(targets[1]) if len(targets) > 1 else np.asarray(targets[0])
+        targets = [np.asarray(t) + (palm0 - start) for t in targets]
+        r0 = self._body_rel(palm0)
+        hand_home = np.array([max(r0[0], keep_reach + 0.05), r0[1]])  # body-frame (fwd, left) to hold
+        vel = np.zeros(2)
+        k, i, stall = 0, 0, 0
+        n = len(targets)
+        while k < n and i < 4 * n:
+            p = targets[k]
+            i += 1
+            rel = self._body_rel(p)[:2]
+            e = rel - hand_home
+            lim = np.array([BACKOFF_SPEED, 0.10])
+            want = np.where(np.abs(e) > 0.02, np.clip(1.5 * e, -lim, lim), 0.0)
+            want[0] = min(want[0], 0.05)  # mostly backwards; only creep forward
+            vel += np.clip(want - vel, -0.5 * CONTROL_DT, 0.5 * CONTROL_DT)
+            yerr = wrap(yaw0 - self.wbc.base_yaw)
+            wz = float(np.clip(1.5 * yerr, -0.5, 0.5)) if abs(yerr) > 0.06 else 0.0
+            v_cmd = np.where(np.abs(vel) > 0.05, vel, 0.0)
+            self.wbc.set_velocity(float(v_cmd[0]), float(v_cmd[1]), wz)
+            q, _ = self.ik.solve(p, axes_list[k], q_init=q, iters=25, q_ref=q_ref)
+            self._set_right_arm(q)
+            self._tick()
+            err = float(np.linalg.norm(self.ik.palm_pose()[0] - p))
+            # move the target on while the hand keeps up and the handle isn't crowding the body
+            if err < 0.05 and rel[0] > keep_reach - 0.03:
+                k += 1
+                stall = 0
+            else:
+                stall += 1
+            if stall * CONTROL_DT > stall_s:  # no progress (end stop, blocked, or lost the grip)
+                if DEBUG:
+                    print(f"   follow: stalled at {k}/{n}: err {err:.3f} target rel {np.round(rel, 2)} "
+                          f"vel {np.round(v_cmd, 2)} hits {self.ik.collisions(self.arm_cmd)[:2]}")
+                break
+        self.wbc.set_velocity(0, 0, 0)
+        if DEBUG:
+            print(f"   follow: reached {k}/{n} in {i * CONTROL_DT:.1f} s")
+        return k
 
     def open_cupboard(self, model: ArticulationModel, fraction: float = 1.0, seconds: float = 5.0) -> dict:
         """Open the cupboard the way the carer did (see open_articulated)."""
