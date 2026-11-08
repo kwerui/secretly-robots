@@ -67,6 +67,11 @@ def fetch(
         if not res["ok"]:
             say(f"Pick failed: {res['error']}")
             return {"ok": False, "stage": "pick", **res}
+        if robot.open_state is not None:
+            say(f"Closing the {station} with my other hand")
+            res_c = robot.close_opened()
+            if not res_c["ok"]:
+                say(f"Couldn't close it fully: {res_c}")
         say("Bringing it over")
         res = robot.go_to("person")
         if not res["ok"]:

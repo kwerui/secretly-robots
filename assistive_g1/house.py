@@ -37,7 +37,7 @@ from sim import house_env as H  # noqa: E402
 from sim.house_env import HouseEnv, DRAWER_UNITS, FURNITURE, ROBOT_START  # noqa: E402
 
 from g1_wbc import ASSET_DIR  # noqa: E402
-from scene import (ITEMS, Item, Station, RIGHT_HAND_BODIES, DOOR_MARKER_SIZE, add_robot_extras,  # noqa: E402
+from scene import (ITEMS, Item, Station, RIGHT_HAND_BODIES, LEFT_HAND_BODIES, DOOR_MARKER_SIZE, add_robot_extras,  # noqa: E402
                    _sticker, _box, _look_at_xyaxes, _quat_facing)
 
 G1_XML = ASSET_DIR / "g1" / "g1.xml"
@@ -197,6 +197,11 @@ class G1House(HouseEnv):
                 targets.append(b)
                 spec.add_equality(name=f"grasp_{b}", type=mujoco.mjtEq.mjEQ_WELD, name1="right_wrist_yaw_link",
                                   name2=b, objtype=mujoco.mjtObj.mjOBJ_BODY, active=False)
+                # left hand: closes the drawer while the right one holds the item
+                spec.add_equality(name=f"grasp_left_{b}", type=mujoco.mjtEq.mjEQ_WELD, name1="left_wrist_yaw_link",
+                                  name2=b, objtype=mujoco.mjtObj.mjOBJ_BODY, active=False)
+                for hb in LEFT_HAND_BODIES:
+                    spec.add_exclude(bodyname1=hb, bodyname2=b)
         for t in targets:
             for hb in RIGHT_HAND_BODIES:
                 spec.add_exclude(bodyname1=hb, bodyname2=t)
@@ -217,10 +222,17 @@ class G1House(HouseEnv):
         mujoco.mj_kinematics(self.model, self.data)
         for name, (kind, where) in self.placement.items():
             self.place_item(name, kind, where)
+        if self.target_container:
+            # Jack puts the bottle 21 cm behind the handle; 10 cm behind the inside of the front
+            # still shows its cap over the front and lets the robot stand clear of the open drawer
+            un, idx = self.target_container[len("drawer_"):].rsplit("_", 1)
+            self.place_item("water_bottle", "drawer", drawer(un, int(idx)), behind=0.10)
         mujoco.mj_forward(self.model, self.data)
         return info
 
-    def place_item(self, name: str, kind: str, where) -> None:
+    def place_item(self, name: str, kind: str, where, behind: float = 0.07) -> None:
+        """Put an item on a surface target, in a drawer (`behind` m behind the inside of its
+        front) or at an (x, y, z). Jack's bottle has its body origin at its base."""
         it = self.items[name]
         m, d = self.model, self.data
         if kind == "surface":
@@ -235,12 +247,14 @@ class G1House(HouseEnv):
             # robot reaches it once the drawer is out
             u = DRAWER_UNITS[dr.unit]
             front_in = u["size"][1] / 2 - 0.02
-            local = np.array([front_in - 0.07, 0.0, 0.0])
+            local = np.array([front_in - behind, 0.0, 0.0])
             x, y, _ = d.xpos[b] + R @ local
             z = floor[2] + m.geom_size[m.geom(f"{dr.body}_floor").id][2] + it.size[2] + 0.002
         else:
             x, y, z = where
-        j = m.joint(f"{name}_free").id
+        if name == "water_bottle":
+            z -= it.size[2]  # origin at the base
+        j = m.joint(f"{name}_free" if name != "water_bottle" else "waterbottle_joint").id
         a = m.jnt_qposadr[j]
         d.qpos[a:a + 7] = [x, y, z, 1, 0, 0, 0]
         d.qvel[m.jnt_dofadr[j]:m.jnt_dofadr[j] + 6] = 0

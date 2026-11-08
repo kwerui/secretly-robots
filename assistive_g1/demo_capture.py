@@ -141,7 +141,8 @@ def capture_sim(out: Path, open_angle: float = 1.75, seconds: float = 3.5, video
 
 
 def capture_sim_drawer(robot, dr, open_m: float = 0.36, seconds: float = 3.0, cam: str = "drawer_cam",
-                       video_frames: list | None = None, close_after: bool = True) -> ArticulationModel:
+                       video_frames: list | None = None, close_after: bool = True,
+                       on_step=None) -> ArticulationModel:
     """The carer opens one of Jack's drawers (house.G1House) while a room camera watches.
 
     Moving marker: Jack's marker on the drawer front. Fixed marker: our anchor on the chest.
@@ -169,6 +170,8 @@ def capture_sim_drawer(robot, dr, open_m: float = 0.36, seconds: float = 3.0, ca
         d.qvel[va] = 0.0
         robot.wbc.step(20)
         mujoco.mj_forward(m, d)
+        if on_step is not None:
+            on_step()  # e.g. update an interactive viewer
         rgb = room.render()
         det = room.detect(rgb)
         if k <= n + 10 and dr.front_marker in det and dr.anchor_marker in det:

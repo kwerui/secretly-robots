@@ -1,5 +1,6 @@
 """The G1 in Jack's house: watch the carer open a drawer once, then fetch from it.
 
+    python house_demo.py --viewer                      # interactive MuJoCo viewer, real time
     MUJOCO_GL=egl python house_demo.py                 # records house_demo.mp4
     MUJOCO_GL=egl python house_demo.py --no-video      # just the numbers (much faster)
     MUJOCO_GL=egl python house_demo.py --with-cup      # then also the cup from the counter
@@ -10,8 +11,9 @@ Scenario (steps 1-4 of the integration; the brain/memory come later):
      carer closes it again.
   2. "I'm thirsty": the water bottle is in that drawer (Jack's `kitchen_drawer` target). The
      robot plans across the house on Jack's occupancy grid, walks to the drawers, opens the
-     drawer the way the carer did, sees the bottle, picks it from above and brings it to the
-     user's tray by the sofa.
+     drawer the way the carer did, sees the bottle, picks it from above, closes the drawer
+     with its LEFT hand (the learned motion run backwards) while the right hand keeps the
+     bottle, and brings it to the user's tray by the sofa.
   3. (--with-cup) "Could I have my cup?": side grasp from the kitchen counter, same delivery.
 """
 
@@ -19,6 +21,10 @@ from __future__ import annotations
 
 import os
 
+from viewer_env import relaunch_for_viewer
+
+relaunch_for_viewer()  # --viewer from anaconda: restart with the system libstdc++ (GLX fix)
+# Offscreen rendering (robot camera, video) through EGL; the --viewer window still needs GLX.
 os.environ.setdefault("MUJOCO_GL", "egl")
 
 import argparse
@@ -72,6 +78,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, default=Path("house_demo.mp4"))
     ap.add_argument("--no-video", action="store_true")
+    ap.add_argument("--viewer", action="store_true", help="interactive MuJoCo viewer (needs GLX), no video")
+    ap.add_argument("--speed", type=float, default=1.0, help="with --viewer: playback speed (1 = real time)")
     ap.add_argument("--fps", type=float, default=10)
     ap.add_argument("--size", type=int, nargs=2, default=[800, 450])
     ap.add_argument("--seed", type=int, default=0)
@@ -82,8 +90,32 @@ def main():
     t0 = time.time()
     env = G1House(seed=args.seed)
     info = env.reset(args.layout, "kitchen_drawer", seed=args.seed)
-    rec = None if args.no_video else LightRecorder(args.out, fps=args.fps, size=tuple(args.size))
-    robot = AssistiveRobot(world=env, on_frame=rec)
+    viewer = None
+    if args.viewer:
+        import mujoco
+        import mujoco.viewer
+        viewer = mujoco.viewer.launch_passive(env.model, env.data)
+        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+        viewer.cam.trackbodyid = env.model.body("pelvis").id
+        viewer.cam.distance, viewer.cam.elevation = 3.5, -30
+        clock = {"t0": None}
+
+        def sync(_robot=None):
+            """Show the current state, paced to (speed x) real time."""
+            if not viewer.is_running():
+                raise KeyboardInterrupt
+            now, sim = time.time(), env.data.time
+            if clock["t0"] is None:
+                clock["t0"] = (now, sim)
+            ahead = (sim - clock["t0"][1]) / args.speed - (now - clock["t0"][0])
+            if ahead > 0:
+                time.sleep(ahead)
+            viewer.sync()
+        rec = None
+    else:
+        sync = None
+        rec = None if args.no_video else LightRecorder(args.out, fps=args.fps, size=tuple(args.size))
+    robot = AssistiveRobot(world=env, on_frame=sync if viewer is not None else rec)
     say_log = []
 
     def say(msg):
@@ -98,7 +130,8 @@ def main():
     if True:
         say("Carer: opening the top kitchen drawer once (drawer camera watching)")
         frames = [] if rec is not None else None
-        model = capture_sim_drawer(robot, KITCHEN_TOP, video_frames=frames)
+        model = capture_sim_drawer(robot, KITCHEN_TOP, video_frames=frames,
+                                   on_step=sync if viewer is not None else None)
         model.save("drawer_model.json")
         say(f"Learned: {model.kind}, opens {model.amount * 100:.0f} cm, fit residual {model.residual_m * 1000:.1f} mm")
         if rec is not None:
@@ -116,7 +149,8 @@ def main():
         results["go_drawers"] = r
         seen = robot.look()
         say(f"Seen: {sorted(seen['items']) or 'no items'}; no bottle in sight, drawer closed - opening it")
-        r = robot.open_articulated(model, KITCHEN_TOP.anchor_marker, f"grasp_{KITCHEN_TOP.body}")
+        r = robot.open_articulated(model, KITCHEN_TOP.anchor_marker, f"grasp_{KITCHEN_TOP.body}",
+                                   part_markers=(KITCHEN_TOP.front_marker,))
         results["open"] = {**r, "drawer_now_m": round(env.drawer_open_m(KITCHEN_TOP), 3)}
         say(f"Opened the drawer {env.drawer_open_m(KITCHEN_TOP) * 100:.0f} cm")
         seen = robot.look()
@@ -126,9 +160,15 @@ def main():
             r = robot.pick("water_bottle", from_above=True)
             results["pick_bottle"] = r
             if r["ok"]:
+                say("Closing the drawer with the other hand")
+                results["close"] = {**robot.close_opened(), "drawer_now_m": round(env.drawer_open_m(KITCHEN_TOP), 3),
+                                    "holding_ok": robot.holding_ok()}
                 say("Bringing it over")
                 results["go_person"] = robot.go_to("person")
+                results["bottle_before_handover"] = np.round(env.data.body("waterbottle").xpos, 3).tolist()
                 results["hand_over"] = robot.hand_over()
+                robot.wait(1.0)
+                results["bottle_after_handover"] = np.round(env.data.body("waterbottle").xpos, 3).tolist()
                 say("Here you go")
             else:
                 say(f"Pick failed: {r.get('error')}")
@@ -139,6 +179,7 @@ def main():
     if args.with_cup:
         say("'Could I have my cup?' - walking to the kitchen counter")
         results["go_counter"] = robot.go_to("kitchen_counter")
+        results["bottle_after_leaving"] = np.round(env.data.body("waterbottle").xpos, 3).tolist()
         seen = robot.look()
         results["look_counter"] = sorted(seen["items"])
         r = robot.pick("cup")
@@ -153,6 +194,11 @@ def main():
 
     if rec is not None:
         rec.close()
+    if viewer is not None:
+        print("Done - close the viewer window to exit.")
+        while viewer.is_running():
+            time.sleep(0.1)
+        viewer.close()
     d = env.data
     for item, body in env.item_body.items():
         p = d.body(body).xpos

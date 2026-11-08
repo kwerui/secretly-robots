@@ -56,9 +56,11 @@ ITEMS = {
 RIGHT_HAND_BODIES = ["right_wrist_yaw_link"] + [f"right_hand_{f}_link" for f in
                                                 ("thumb_0", "thumb_1", "thumb_2", "index_0", "index_1",
                                                  "middle_0", "middle_1")]
+LEFT_HAND_BODIES = [n.replace("right", "left") for n in RIGHT_HAND_BODIES]
 
 DOOR_MARKER = 46  # on the cupboard door front
 ANCHOR_MARKER = 47  # on the cupboard body, fixed
+DOOR_INNER_MARKER = 48  # on the inside of the door: shows how far it is open once swung round
 DOOR_MARKER_SIZE = 0.06
 
 STATIONS = {
@@ -253,6 +255,8 @@ def build_scene(placement: dict[str, tuple[str, float, float]] | None = None) ->
         _box(door, (0.008, 0.02, 0.008), (hx, 0.02, h / 2 + dz), (0.2, 0.2, 0.2, 1), contype=0, conaffinity=0)
     door.add_site(name="door_handle_site", pos=[hx, 0.04, h / 2])
     _sticker(door, spec, DOOR_MARKER, DOOR_MARKER_SIZE, (w - 0.02, 0.0105, h / 2 + 0.06), q_front)
+    _sticker(door, spec, DOOR_INNER_MARKER, DOOR_MARKER_SIZE, (w + 0.02, -0.0105, h / 2 + 0.06),
+             _quat_facing(np.array([0, -1.0, 0])))
 
     # Items (free bodies) with a marker on top
     surfaces = {"table": TABLE["top"], "shelf": SHELF["top"], "cupboard": z0 + 0.0, "counter": z0, "floor": 0.0,
@@ -269,10 +273,15 @@ def build_scene(placement: dict[str, tuple[str, float, float]] | None = None) ->
                           name2=name, objtype=mujoco.mjtObj.mjOBJ_BODY, active=False)
     spec.add_equality(name="grasp_door", type=mujoco.mjtEq.mjEQ_WELD, name1="right_wrist_yaw_link",
                       name2="cupboard_door", objtype=mujoco.mjtObj.mjOBJ_BODY, active=False)
+    # Left hand closes the door while the right one holds what was taken out
+    spec.add_equality(name="grasp_left_door", type=mujoco.mjtEq.mjEQ_WELD, name1="left_wrist_yaw_link",
+                      name2="cupboard_door", objtype=mujoco.mjtObj.mjOBJ_BODY, active=False)
     # The grasping hand may overlap what it grasps (rigid hand): exclude hand vs items and door.
     for target in list(placement) + ["cupboard_door"]:
         for hb in RIGHT_HAND_BODIES:
             spec.add_exclude(bodyname1=hb, bodyname2=target)
+    for hb in LEFT_HAND_BODIES:
+        spec.add_exclude(bodyname1=hb, bodyname2="cupboard_door")
 
     model = spec.compile()
     data = mujoco.MjData(model)

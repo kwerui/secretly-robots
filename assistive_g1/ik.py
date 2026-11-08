@@ -1,8 +1,8 @@
-"""Damped-least-squares IK for one G1 arm (7 joints) at the current body pose.
+"""Damped-least-squares IK for one G1 arm (7 joints) on the live MuJoCo model.
 
-Solves on a scratch MjData so the live simulation is untouched. Because the torso sways
-slightly under the balance policy, we re-solve every control tick (closed loop) rather
-than playing back a fixed joint trajectory.
+Solves on a scratch MjData copy of the current state, so the base/legs/waist are taken
+as they are right now and only the arm's joints move. Re-solving every control tick
+(closed loop) absorbs the small sway of the balancing lower body.
 
 Targets: palm position (world) plus optional axis alignments, e.g.
     fingers (site x-axis) -> approach direction
@@ -19,8 +19,6 @@ The hand itself may touch the item/door it is grasping (same exclusions as the p
 
 from __future__ import annotations
 
-from typing import Iterable
-
 import mujoco
 import numpy as np
 
@@ -35,7 +33,8 @@ ARM_JOINTS = {
 
 class ArmIK:
     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData, side: str = "right",
-                 extra_graspable: Iterable[str] = ()):
+                 graspable: tuple[str, ...] = ("cupboard_door",)):
+        """graspable: articulated bodies the hand may touch besides free items (door, drawers)."""
         self.model, self.data = model, data
         self.side = side
         self.scratch = mujoco.MjData(model)
@@ -46,7 +45,6 @@ class ArmIK:
         self.lo = model.jnt_range[jids, 0] + 0.02
         self.hi = model.jnt_range[jids, 1] - 0.02
         self.home = ARM_HOME[:7] if side == "left" else ARM_HOME[7:]
-
         # Bodies of this arm (shoulder down to the fingers), for collision checks
         first = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{side}_shoulder_pitch_link")
         self.arm_bodies = {b for b in range(model.nbody) if self._is_descendant(b, first)}
@@ -64,11 +62,10 @@ class ArmIK:
                                    and names[model.geom_bodyid[g]] not in skip_links])
         hand = set(RIGHT_HAND_BODIES) if side == "right" else {n.replace("right", "left") for n in RIGHT_HAND_BODIES}
         self.hand_geoms = {g for g in self.arm_geoms if names[model.geom_bodyid[g]] in hand}
-        # bodies the hand is allowed to touch (things it grasps): items (free bodies) and doors/drawers
-        extra_set = {"cupboard_door", *extra_graspable}
+        # bodies the hand is allowed to touch (things it grasps): items (free bodies) and the door
         self.graspable_bodies = {b for b in range(model.nbody)
                                  if model.body_jntnum[b] and model.jnt_type[model.body_jntadr[b]] == 0
-                                 and names[b] != "pelvis"} | {b for b in range(model.nbody) if names[b] in extra_set}
+                                 and names[b] != "pelvis"} | {b for b in range(model.nbody) if names[b] in graspable}
         self.obstacle_geoms = np.array([g for g in range(model.ngeom) if collidable(g)
                                         and model.geom_bodyid[g] not in self.arm_bodies])
         self.safe_dist = 0.03  # m, keep arm links this far from obstacles
@@ -83,7 +80,7 @@ class ArmIK:
         return False
 
     def collisions(self, q: np.ndarray, margin: float = 0.01) -> list[tuple[str, str]]:
-        """Contacts between this arm and anything else if the arm were at q (current body pose)."""
+        """Contacts between this arm and anything else if the arm were at q (current base pose)."""
         s = self.scratch
         s.qpos[:] = self.data.qpos
         s.qpos[self.qadr] = q

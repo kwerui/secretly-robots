@@ -13,11 +13,12 @@ import cv2
 import mujoco
 import numpy as np
 
-from scene import ITEMS, MARKER_DICT, DOOR_MARKER, ANCHOR_MARKER, DOOR_MARKER_SIZE
+from scene import ITEMS, MARKER_DICT, DOOR_MARKER, ANCHOR_MARKER, DOOR_INNER_MARKER, DOOR_MARKER_SIZE
 
 MARKER_SIZES = {it.marker_id: it.marker_size for it in ITEMS.values()}
 MARKER_SIZES[DOOR_MARKER] = DOOR_MARKER_SIZE
 MARKER_SIZES[ANCHOR_MARKER] = DOOR_MARKER_SIZE
+MARKER_SIZES[DOOR_INNER_MARKER] = DOOR_MARKER_SIZE
 ID_TO_ITEM = {it.marker_id: name for name, it in ITEMS.items()}
 
 # OpenCV camera frame (x right, y down, z forward) -> MuJoCo camera frame (x right, y up, z back)
@@ -34,15 +35,17 @@ class MarkerPose:
 
 class HeadCamera:
     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData, cam: str = "head_cam",
-                 width: int = 1280, height: int = 720,
-                 extra_sizes: dict[int, float] | None = None,
+                 width: int = 960, height: int = 720, extra_sizes: dict[int, float] | None = None,
                  labels: dict[int, str] | None = None):
+        """extra_sizes: black-square edge (m) of markers the world adds (e.g. the house's drawer
+        fronts and furniture anchors); labels: names for annotate()."""
         # (the video recorder reuses this renderer for its inset)
         self.model, self.data = model, data
+        self.sizes = {**MARKER_SIZES, **(extra_sizes or {})}
+        self.labels = {**ID_TO_ITEM, DOOR_MARKER: "door", ANCHOR_MARKER: "anchor", DOOR_INNER_MARKER: "door_inside",
+                       **(labels or {})}
         self.cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, cam)
         self.width, self.height = width, height
-        self.sizes = {**MARKER_SIZES, **(extra_sizes or {})}
-        self.labels = {DOOR_MARKER: "door", ANCHOR_MARKER: "anchor", **ID_TO_ITEM, **(labels or {})}
         self.renderer = mujoco.Renderer(model, height, width)
         fovy = np.deg2rad(model.cam_fovy[self.cam_id])
         f = (height / 2) / np.tan(fovy / 2)
