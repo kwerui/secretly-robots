@@ -115,7 +115,7 @@ The window is at http://127.0.0.1:8765 and opens by itself. Each run is also log
 
 ### The G1 voice demo (the full sequence)
 
-The Unitree G1 stands in the house, balancing on its GR00T policy. The person on the sofa speaks; the robot hears, interprets, asks if it needs to, and goes into **fetch mode**. Everything the robot does runs on the laptop: no network, no API key.
+The Unitree G1 stands in the house, balancing on its GR00T policy. The person on the sofa speaks; the robot hears, interprets, asks if it needs to, and goes into **fetch mode**. The default voice demo runs locally on the laptop without network access or an API key. Optional cloud-based AI features are separate.
 
 **One-time setup** (from the repo root, using the sim's virtualenv):
 
@@ -271,7 +271,7 @@ The adapter uses `gemini-4-argon` and the official `google-genai` structured JSO
 | JSONL decision and feedback logging | ✅ Implemented |
 | Deterministic Python planner | ✅ Working offline fallback |
 | Gemma 4 local inference through Ollama | ✅ Live-tested (`gemma4:e4b`, ~0.3 s per answer once loaded); optional, rules fallback |
-| Voice: person speaks (Gemini TTS clips), robot hears, Whisper STT, interprets, asks, fetch mode | ✅ Onboard; headless tests drive the real G1, clips and Whisper (`assistive_g1/voice_demo.py`) |
+| Voice: person speaks (Gemini TTS clips), robot hears, Whisper STT, interprets, asks, fetch mode | ✅ Onboard; headless tests exercise the simulated G1 model in MuJoCo, clips and Whisper (`assistive_g1/voice_demo.py`) |
 | Gemini 4 Argon cloud option | ✅ Implemented and successfully live-tested; still optional and locally validated |
 | G1 head-camera perception, locomotion, manipulation and delivery | ✅ Integrated in MuJoCo; benchmarked with the limitations reported above |
 | Full-task drawer close + delivery reliability | 🟡 1/3 in the latest relocation benchmark; drawer closing failed in two otherwise delivered episodes |
