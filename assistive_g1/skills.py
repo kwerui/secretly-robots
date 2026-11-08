@@ -63,6 +63,13 @@ CALIB_POSTURES = [(0.74, 0.0), (0.74, 0.15), (0.74, 0.3), (0.70, 0.45), (0.68, 0
 # After a reach falls short by up to this much, step the feet by the miss and try once more (m)
 STEP_CORRECT_MAX = 0.15
 REACH_COMFORT = 0.45  # m, forward pelvis-to-target distance beyond which a stance is penalised
+# Perceived navigation (costmap.py): the clearance map comes from the robot's 3D LiDAR and depth
+# camera (prior: walls + fixed furniture), and go_to re-plans when a new obstacle cuts the route.
+# G1_NAV=static plans once on the simulator's true geometry (the old behaviour).
+NAV_LIVE = os.environ.get("G1_NAV", "live") != "static"
+MAX_REPLANS = 12  # per go_to
+REPLAN_MARGIN = 0.08  # m, a route is re-planned when its clearance drops this far below what it was planned with
+REPLAN = "replan"  # _drive_to's return value when its stop_if fired
 
 
 def wrap(a: float) -> float:
@@ -110,10 +117,24 @@ class AssistiveRobot:
         self.estimator = None
         if (LOCALIZE if localize is None else localize) and world is not None:
             self._attach_estimator(world)
+        # Perceived clearance map (costmap.py), in the house only
+        self.costmap = None
+        self.nav_log: list[dict] = []
+        self.nav_path: list | None = None
+        if world is not None and NAV_LIVE:
+            from costmap import HeadLidar, make_costmap
+            self.costmap = make_costmap(world)
+            self.lidar3d = HeadLidar(self.model, self.data)
+            world.costmap = self.costmap
+            self._map_ticks = 0
+            self._driving = False
+            self._lidar_held = None
         self.wait(1.0)
         self._posture_cache: dict = {}
         if STANCE_SEARCH:
             self._calibrate_postures()
+        if self.costmap is not None:
+            self._map_depth()  # first look at what is in front before the first plan
 
     def _attach_estimator(self, world) -> None:
         """From here on the robot knows where it is only from its own sensors: the walking
@@ -130,8 +151,44 @@ class AssistiveRobot:
         self.wbc.step(int(round(CONTROL_DT / SIM_DT)))
         if self.estimator is not None:
             self.estimator.tick(CONTROL_DT)
+        if self.costmap is not None:
+            self._sense_map()
         if self.on_frame is not None:
             self.on_frame(self)
+
+    # ------------------------------------------------------------------ mapping
+    def _believed_pose(self) -> tuple[np.ndarray, np.ndarray]:
+        """Pelvis (position, rotation) the robot believes: the estimator's, or the truth."""
+        R = np.zeros(9)
+        mujoco.mju_quat2Mat(R, self.wbc.base_quat)
+        return self.wbc.base_pos.copy(), R.reshape(3, 3)
+
+    def _believed_camera(self) -> tuple[np.ndarray, np.ndarray]:
+        if self.estimator is not None:
+            return self.estimator.camera_pose()
+        return (self.data.cam_xpos[self.cam.cam_id].copy(), self.data.cam_xmat[self.cam.cam_id].reshape(3, 3).copy())
+
+    def _sense_map(self) -> None:
+        """Feed the clearance map: a 3D LiDAR scan every LIDAR_EVERY ticks, and while walking a
+        depth image every DEPTH_EVERY ticks (look() adds one at every look)."""
+        from costmap import DEPTH_EVERY, LIDAR_EVERY
+        self._map_ticks += 1
+        held = self.item_body[self.holding] if self.holding else None
+        if held != self._lidar_held:  # a carried item isn't an obstacle
+            self.lidar3d.set_held_body(held)
+            if self.estimator is not None:
+                self.estimator.lidar.set_held_body(held)
+            self._lidar_held = held
+        if self._map_ticks % LIDAR_EVERY == 0:
+            pos, R = self._believed_pose()
+            self.costmap.update_lidar(self.lidar3d, pos, R)
+        if self._driving and self._map_ticks % DEPTH_EVERY == 0:
+            self._map_depth()
+
+    def _map_depth(self) -> None:
+        depth = self.cam.render_depth()
+        cam_pos, cam_R = self._believed_camera()
+        self.costmap.update_depth(depth, self.cam.K, cam_pos, cam_R, self.wbc.base_pos[:2])
 
     def wait(self, seconds: float) -> None:
         for _ in range(int(seconds / CONTROL_DT)):
@@ -162,26 +219,34 @@ class AssistiveRobot:
 
     # ------------------------------------------------------------------ navigation
     def _drive_to(self, x: float, y: float, yaw: float | None, tol: float = 0.04, timeout: float = 25.0,
-                  pass_through: bool = False) -> bool:
+                  pass_through: bool = False, stop_if: Callable[[], bool] | None = None) -> bool | str:
         """Walk to (x, y[, yaw]) with the smooth PD navigator (nav.py).
 
         pass_through: a waypoint. Return as soon as we're within `tol`, keeping the current
         velocity (no stop), so the next leg continues smoothly.
+        stop_if: checked every tick; when it returns True the leg is abandoned at the current
+        velocity (no stop) and REPLAN is returned, so go_to can re-route without a halt.
         """
         self.nav.p.pos_tol = tol
         self.nav.arrived = False  # keep self.nav.cmd: continue from the current velocity
-        for _ in range(int(timeout / CONTROL_DT)):
-            p = self.wbc.base_pos
-            if pass_through and np.hypot(x - p[0], y - p[1]) < tol:
-                return True
-            cmd = self.nav.step((p[0], p[1], self.wbc.base_yaw), self.wbc.base_vel_body, (x, y, yaw), CONTROL_DT)
-            self.wbc.set_velocity(*cmd)
-            self._tick()
-            if self.wbc.fallen():
-                self.wbc.set_velocity(0, 0, 0)
-                return False
-            if self.nav.stopped:
-                break
+        self._driving = True
+        try:
+            for _ in range(int(timeout / CONTROL_DT)):
+                p = self.wbc.base_pos
+                if pass_through and np.hypot(x - p[0], y - p[1]) < tol:
+                    return True
+                cmd = self.nav.step((p[0], p[1], self.wbc.base_yaw), self.wbc.base_vel_body, (x, y, yaw), CONTROL_DT)
+                self.wbc.set_velocity(*cmd)
+                self._tick()
+                if self.wbc.fallen():
+                    self.wbc.set_velocity(0, 0, 0)
+                    return False
+                if stop_if is not None and stop_if():
+                    return REPLAN
+                if self.nav.stopped:
+                    break
+        finally:
+            self._driving = False
         arrived = self.nav.stopped
         self.nav.reset()
         self.wbc.set_velocity(0, 0, 0)
@@ -190,6 +255,64 @@ class AssistiveRobot:
             p = self.wbc.base_pos
             arrived = np.hypot(x - p[0], y - p[1]) < 2 * tol
         return arrived
+
+    def _walk_path(self, path: list, goal_xy, station: str) -> dict:
+        """Walk the waypoints of `path` (its last point is the station, approached by the caller).
+
+        With the perceived map: after every map update the rest of the route is checked against
+        the live clearance map (at the radius it was planned with); if a new obstacle has cut it,
+        a new route is planned from where the robot is and walking continues without stopping.
+        """
+        replans, cut_at = 0, []
+        last_replan = -10 ** 9
+        self.nav_path = list(path)  # the route being walked (for video insets / debugging)
+        i = 1
+        while i < len(path) - 1:
+            wx, wy = path[i]
+            stop_if = None
+            if self.costmap is not None:
+                seen = {"v": self.costmap.version}
+                # Hysteresis: planned with r_plan of clearance, re-planned only when something
+                # comes within REPLAN_MARGIN less than that (a half-seen chair "grows" with every
+                # scan; a route that merely grazes its inflation is not cut).
+                r_plan = max(self.world.last_plan_radius - REPLAN_MARGIN, self.world.ROBOT_R_MIN)
+                since = self.world.plan_clearance  # only obstacles that are new since the plan count
+
+                def stop_if(i=i, seen=seen, r_plan=r_plan, path=path, since=since):
+                    if self.costmap.version == seen["v"] or self._map_ticks - last_replan < 25:
+                        return False  # no new map, or a route re-planned less than 0.5 s ago
+                    seen["v"] = self.costmap.version
+                    # the route ahead: from a little in front of the robot (it weaves +-0.2 m
+                    # about the waypoints; its own cell near a wall is not a new obstacle)
+                    here = np.asarray(self.wbc.base_pos[:2])
+                    to = np.asarray(path[i]) - here
+                    d = float(np.linalg.norm(to))
+                    start = here + to / d * min(0.30, 0.5 * d) if d > 1e-6 else here
+                    return self.costmap.path_blocked([tuple(start)] + list(path[i:]), r_plan, since=since) >= 0
+            res = self._drive_to(wx, wy, None, tol=0.20, pass_through=True, stop_if=stop_if)
+            if self.wbc.fallen():
+                return {"ok": False, "error": "fell over", "replans": replans}
+            if res == REPLAN:
+                here = self.wbc.base_pos[:2].copy()
+                replans += 1
+                last_replan = self._map_ticks
+                cut_at.append(here.round(2).tolist())
+                new = self.world.plan_path(here, goal_xy)
+                if DEBUG:
+                    print(f"[nav] route cut at {here.round(2)}; replan {replans}: {new and [tuple(np.round(p, 2)) for p in new]}")
+                self.nav_log.append({"t": round(self.data.time, 2), "at": here.round(3).tolist(), "replan": replans,
+                                     "path": None if new is None else [list(np.round(p, 3)) for p in new]})
+                if new is None or replans > MAX_REPLANS:
+                    self.nav.reset()
+                    self.wbc.set_velocity(0, 0, 0)
+                    self.wait(0.8)
+                    return {"ok": False, "error": f"route to the {station} is blocked", "replans": replans}
+                path = new
+                self.nav_path = list(path)
+                i = 1
+                continue
+            i += 1
+        return {"ok": True, "replans": replans, "cut_at": cut_at, "path": [list(np.round(p, 3)) for p in path]}
 
     def go_to(self, station: str) -> dict:
         """Walk to a named station (self.stations).
@@ -202,24 +325,27 @@ class AssistiveRobot:
             return {"ok": False, "error": f"unknown station {station}", "stations": list(self.stations)}
         s = self.stations[station]
         p = self.wbc.base_pos
+        walk = {}
         if self.world is not None:
             if station != self.station:
                 self._step_back(0.25)  # off the furniture first: stations sit inside the grid's inflation
             path = self.world.plan_path(self.wbc.base_pos[:2], (s.x, s.y))
             if path is None:
                 return {"ok": False, "error": f"no path to the {station}"}
-            for wx, wy in path[1:-1]:
-                self._drive_to(wx, wy, None, tol=0.20, pass_through=True)
-                if self.wbc.fallen():
-                    return {"ok": False, "error": "fell over"}
+            walk = self._walk_path(path, (s.x, s.y), station)
+            if not walk["ok"]:
+                return {**walk, "station": station, "pose": self.wbc.base_pos.round(2).tolist()}
         elif np.hypot(p[0] - HUB[0], p[1] - HUB[1]) > 0.3 and station != self.station:
             self._drive_to(*HUB, None, tol=0.25, pass_through=True)
             if self.wbc.fallen():
                 return {"ok": False, "error": "fell over"}
-        ok = self._drive_to(s.x, s.y, s.yaw)
+        ok = bool(self._drive_to(s.x, s.y, s.yaw))
+        self.nav_path = None
         if ok:
             self.station = station
         out = {"ok": ok, "station": station, "pose": self.wbc.base_pos.round(2).tolist()}
+        if "replans" in walk:
+            out["replans"] = walk["replans"]
         if not ok:
             out["error"] = f"couldn't reach the {station}"
         return out
@@ -229,6 +355,8 @@ class AssistiveRobot:
         """Detect markers in the head camera. Returns item names -> world position."""
         det = self.cam.detect()
         self.last_seen = det
+        if self.costmap is not None:  # every look also updates the clearance map (RGB-D)
+            self._map_depth()
         items = {self.marker_to_item[m]: p.position.round(3).tolist() for m, p in det.items() if m in self.marker_to_item}
         extra = {}
         if DOOR_MARKER in det:
