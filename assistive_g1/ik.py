@@ -19,11 +19,28 @@ The hand itself may touch the item/door it is grasping (same exclusions as the p
 
 from __future__ import annotations
 
+import os
+
 import mujoco
 import numpy as np
 
 from g1_wbc import BODY_JOINTS, ARM_HOME
 from scene import RIGHT_HAND_BODIES
+
+# Null-space steering away from joint limits. Off: even gently (0.15 rad zone, gain 0.15) it moved
+# the solver off the solutions the drawer and counter picks need (cup pick failed by 0.2-0.3 m).
+# The jerks are handled by rate-limiting the joint targets (skills.MAX_ARM_RATE) instead, and the
+# hold/tuck poses are chosen by joint margin (skills._best_hold_pose).
+LIMIT_ZONE = 0.15
+LIMIT_GAIN = 0.0
+
+# Elbow down. ELBOW_REF: the elbow may come up to this far below the shoulder (m) before it is
+# penalised (home pose: ~0.25 m below). ELBOW_GAIN: default null-space pull of the elbow down
+# inside the solver (G1_ELBOW_GAIN overrides). Tested: it makes reaching/grasping worse but
+# carrying better, so skills.py passes elbow_gain=HOLD_ELBOW_GAIN only while holding an item.
+# Solution *selection* in skills.py always penalises a raised elbow (elbow_cost()).
+ELBOW_REF = -0.10
+ELBOW_GAIN = float(os.environ.get("G1_ELBOW_GAIN", "0.0"))
 
 ARM_JOINTS = {
     "left": BODY_JOINTS[15:22],
@@ -39,6 +56,9 @@ class ArmIK:
         self.side = side
         self.scratch = mujoco.MjData(model)
         self.site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"{side}_palm")
+        self.elbow = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{side}_elbow_link")
+        self.shoulder = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{side}_shoulder_pitch_link")
+        self._jace = np.zeros((3, model.nv))
         jids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, j) for j in ARM_JOINTS[side]]
         self.qadr = np.array([model.jnt_qposadr[j] for j in jids])
         self.vadr = np.array([model.jnt_dofadr[j] for j in jids])
@@ -138,6 +158,22 @@ class ArmIK:
         mujoco.mj_kinematics(self.model, s)
         return self._collision_rows(s, self._candidate_pairs(s))[2]
 
+    def elbow_lift(self, q: np.ndarray) -> float:
+        """How high the elbow is relative to the shoulder (m) if the arm were at q; negative = below."""
+        s = self.scratch
+        s.qpos[:] = self.data.qpos
+        s.qpos[self.qadr] = q
+        mujoco.mj_kinematics(self.model, s)
+        return float(s.xpos[self.elbow, 2] - s.xpos[self.shoulder, 2])
+
+    def elbow_cost(self, *qs: np.ndarray) -> float:
+        """Penalty for a raised elbow (above ELBOW_REF relative to the shoulder), worst of qs."""
+        return max(max(0.0, self.elbow_lift(q) - ELBOW_REF) for q in qs)
+
+    def limit_margin(self, q: np.ndarray) -> float:
+        """Smallest distance (rad) of any joint of q to its limit."""
+        return float(np.minimum(q - self.lo, self.hi - q).min())
+
     def palm_pose(self, data: mujoco.MjData | None = None) -> tuple[np.ndarray, np.ndarray]:
         d = data or self.data
         return d.site_xpos[self.site].copy(), d.site_xmat[self.site].reshape(3, 3).copy()
@@ -152,6 +188,7 @@ class ArmIK:
         posture_weight: float = 0.02,
         tol: float = 0.004,
         avoid: bool = True,
+        elbow_gain: float | None = None,
     ) -> tuple[np.ndarray, float]:
         """Return (7 arm joint angles, final position error in metres).
 
@@ -199,5 +236,16 @@ class ArmIK:
             # Null-space pull towards a comfortable posture
             N = np.eye(7) - np.linalg.pinv(J, rcond=1e-3) @ J
             dq += N @ (posture_weight * (self.home - q))
+            # ...and away from joint limits: within LIMIT_ZONE of a limit the solver tends to flip
+            # to a very different solution next tick (wrist/shoulder-yaw), which is what made the
+            # arm jerk
+            push = np.clip(LIMIT_ZONE - (q - self.lo), 0, None) - np.clip(LIMIT_ZONE - (self.hi - q), 0, None)
+            dq += N @ (LIMIT_GAIN * push)
+            eg = ELBOW_GAIN if elbow_gain is None else elbow_gain
+            if eg > 0:  # pull a raised elbow down, without disturbing the hand task
+                lift = s.xpos[self.elbow, 2] - s.xpos[self.shoulder, 2] - ELBOW_REF
+                if lift > 0:
+                    mujoco.mj_jacBody(self.model, s, self._jace, None, self.elbow)
+                    dq += N @ (-eg * lift * self._jace[2, self.vadr])
             q = np.clip(q + np.clip(dq, -0.25, 0.25), self.lo, self.hi)
         return q, err_pos
