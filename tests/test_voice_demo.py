@@ -72,6 +72,7 @@ def test_cancel_then_direct_request_goes_straight_to_fetch_mode(demo):
     say(d, "Can you get me something to drink?")
     assert run_until(d, lambda: d.mode == "fetch")
     assert d.robot_voice.said.count("ask_water") == asked_before  # no question for a direct request
+    assert d.robot_voice.said[-1] == "will_fetch_water"  # but it does say it's on it
 
 
 def test_no_answer_returns_to_listening(demo):

@@ -6,6 +6,8 @@
   "lines": {
     "ask_water": "Would you like some water?",
     "will_fetch_water": "Okay, I'll get you some water.",
+    "will_fetch_cup": "Okay, I'll get your cup.",
+    "will_fetch_book": "Okay, I'll get your book.",
     "declined": "Okay. Just let me know if you need anything."
   }
 }

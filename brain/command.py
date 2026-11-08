@@ -145,6 +145,7 @@ class CommandListener:
                                          reason=reason or "not a request", intent_ms=intent_ms))
             state = self._set(replace(self.state, status="understood", task=task,
                                       parser_source=source, intent_ms=intent_ms))
+            self._acknowledge(task)
             self._start(task, transcript, f"voice_{source}")
             return state
 
@@ -192,9 +193,15 @@ class CommandListener:
         state = self._set(CommandState("understood", both, task=task, parser_source="confirmed",
                                        stt_ms=stt_ms, intent_ms=intent_ms, question=asked.question,
                                        timestamp=now))
-        self._speak("will_fetch_water")
+        self._acknowledge(task)
         self._start(task, both, "voice_confirmed")
         return state
+
+    def _acknowledge(self, task: FetchTask) -> str:
+        """Say out loud that the robot is taking the request on ("Okay, I'll get you some water.")."""
+        from .robot_voice import ACKNOWLEDGE
+        key = ACKNOWLEDGE.get(task.item_id)
+        return self._speak(key) if key else ""
 
     def _speak(self, key: str) -> str:
         return self.say(key) if self.say is not None else ""

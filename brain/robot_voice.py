@@ -24,12 +24,18 @@ VOICE_DIR = ROOT / "assets" / "robot_voice"
 LINES: dict[str, str] = {
     "ask_water": "Would you like some water?",
     "will_fetch_water": "Okay, I'll get you some water.",
+    "will_fetch_cup": "Okay, I'll get your cup.",
+    "will_fetch_book": "Okay, I'll get your book.",
     "declined": "Okay. Just let me know if you need anything.",
 }
 
 TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
 TTS_VOICE = os.getenv("ROBOT_TTS_VOICE", "Kore")  # distinct from the person's voice
 STYLE = "Say this as a calm, friendly home-care helper robot, clearly and gently"
+
+
+# What the robot says when it takes on a fetch, by item.
+ACKNOWLEDGE = {"water_bottle": "will_fetch_water", "cup": "will_fetch_cup", "book": "will_fetch_book"}
 
 
 def clip_path(key: str) -> Path:

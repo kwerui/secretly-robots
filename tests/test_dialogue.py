@@ -108,13 +108,13 @@ def test_new_request_while_waiting_is_handled_normally():
     lis.heard("My mouth is so dry.")
     s = lis.heard("I need water.")
     assert s.status == "understood" and s.parser_source == "rules"
-    assert said == ["ask_water"] and len(brain.tasks) == 1
+    assert said == ["ask_water", "will_fetch_water"] and len(brain.tasks) == 1
 
 
 def test_direct_request_acts_without_asking():
     lis, said, brain = make()
     assert lis.heard("Can you get me something to drink?").status == "understood"
-    assert said == [] and len(brain.tasks) == 1
+    assert said == ["will_fetch_water"] and len(brain.tasks) == 1  # acknowledged, not asked
 
 
 # ---------------------------------------------------------------- pipeline + window events
@@ -237,12 +237,13 @@ def test_gemma_handles_free_form_hint_and_answer():
 
 
 def test_gemma_request_and_other():
-    lis, gemma, _, brain = make_with_gemma({
+    lis, gemma, said, brain = make_with_gemma({
         "pop over and grab my book would you": ("request", "book"),
         "my knee is aching today": ("other", "unknown"),
     })
     s = lis.heard("pop over and grab my book would you")
     assert s.status == "understood" and s.task == FetchTask("book") and s.parser_source == "gemma"
+    assert said == ["will_fetch_book"]
     s = lis.heard("my knee is aching today")
     assert s.status == "rejected" and "gemma" in s.reason
     assert len(brain.tasks) == 1
