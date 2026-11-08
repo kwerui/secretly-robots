@@ -72,7 +72,10 @@ class ArmIK:
         self._palm_buf = mujoco.MjData(model)
         # () -> (base position, base quaternion wxyz) the robot believes; None = simulator truth
         self.root_pose = None
-        root = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "floating_base_joint")
+        # (position, quaternion wxyz) overriding the base for planning only: a hypothetical stance
+        self.virtual_root = None
+        self.virtual_legs = None  # (qpos indices, values) of the legs/waist for that stance
+        root =mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "floating_base_joint")
         self.root_q = model.jnt_qposadr[root]
         self.site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"{side}_palm")
         self.elbow = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{side}_elbow_link")
@@ -203,7 +206,14 @@ class ArmIK:
         """Current joint state into the scratch buffer, with the base where the robot *believes*
         it is (root_pose, from the state estimator) instead of the simulator's root pose."""
         s.qpos[:] = self.data.qpos
-        if self.root_pose is not None:
+        if self.virtual_root is not None:  # "what if I stood there" (stance search, skills.py)
+            pos, quat = self.virtual_root
+            s.qpos[self.root_q:self.root_q + 3] = pos
+            s.qpos[self.root_q + 3:self.root_q + 7] = quat
+            if self.virtual_legs is not None:  # and in a posture measured earlier (legs + waist)
+                idx, vals = self.virtual_legs
+                s.qpos[idx] = vals
+        elif self.root_pose is not None:
             pos, quat = self.root_pose()
             s.qpos[self.root_q:self.root_q + 3] = pos
             s.qpos[self.root_q + 3:self.root_q + 7] = quat
