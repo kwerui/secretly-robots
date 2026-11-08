@@ -2,6 +2,18 @@
 
 Phase 1 evaluates the existing tidy-house bottle-fetch demo. It does not change locomotion, IK, manipulation, perception, or `sim/`.
 
+## Latest relocation benchmark (three recorded episodes)
+
+This is the result to use in the pitch. It is a **simulation benchmark**, not a real-world success claim.
+
+| Metric | Result | What it means |
+| --- | --- | --- |
+| Verified physical delivery | **3/3** | The requested item passed the simulator's independent post-settling tray check. |
+| Full-task success | **1/3** | Full success requires the delivery check **and** a closed drawer; episodes 1–2 failed at drawer closing. |
+| Memory adaptation | **Episode 3** | After reloading the location memory, the robot searched the counter first rather than assuming the previous location. |
+
+The delivery result must not be presented as three complete successes. The drawer-closing failures are useful evidence of a specific remaining manipulation reliability gap, and the benchmark does not prove real-world robustness, safety, or generalisation.
+
 Run one offline baseline from the repository root:
 
 ```bash

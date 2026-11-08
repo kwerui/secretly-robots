@@ -33,7 +33,8 @@ request ──► brain.Brain.start_task ──► FetchTask(item, "sofa")
 - `holding_item`, `delivered_item`: from the robot's own grasp/hand-over results.
 - `person_too_close`: Jack's dynamic-person state (dynamic mode only).
 - `sensors_ok`: false if the robot has fallen.
-- The robot's base pose still comes from the simulator (no localisation yet).
+- The robot's base pose is estimated from simulated IMU, leg odometry, LiDAR and RGB-D;
+  simulator truth is retained only for evaluation/setup, not as the navigation input.
 
 ## Changes to `brain/` (small, both marked "G1 integration, 8 Nov" in the code)
 1. **`brain/safety.py`, `open_drawer` check.** It used to require `robot_area == "cupboard"`. Jack's house has several containers, so now the robot must be at an area where the item was seen inside a container.
