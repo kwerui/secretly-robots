@@ -345,6 +345,14 @@ class RobotBridge:
                 if ok:
                     seen = self._look_here()
                     container_opened = True
+                    if item not in seen and self.robot.open_state is not None:
+                        # nothing for us in there: shut it again before moving on (a drawer
+                        # left open is a trip hazard for the person)
+                        c = self.robot.close_opened()
+                        self.say(f"    closing the empty {self.containers[station].kind}: "
+                                 f"{'ok' if c.get('ok') else 'FAILED ' + str(c.get('error', ''))}")
+                        if c.get("ok"):
+                            self.open_station = None
                 else:
                     inaccessible = self.last_execution.setdefault("inaccessible_or_unobserved_stations", [])
                     if station not in inaccessible:
@@ -449,6 +457,7 @@ class RobotBridge:
         if self.robot.open_state is not None:  # tidy up: close it with the other hand
             self.last_execution["drawer_close_attempted"] = True
             c = self.robot.close_opened()
+            self.say(f"    closing the drawer: {'ok' if c.get('ok') else 'FAILED ' + str(c.get('error', ''))}")
             self.last_execution["drawer_close_succeeded"] = bool(c.get("ok"))
             if c.get("ok"):
                 self.open_station = None
