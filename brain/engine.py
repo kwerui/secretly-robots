@@ -44,10 +44,18 @@ class Brain:
                 raise
             self.task = self.fallback_parser.parse(user_request)
             self._log("cloud_intent_rejected", {"reason": str(exc)})
+        return self.set_task(self.task, user_request)
+
+    def set_task(self, task: FetchTask, user_request: str = "", source: str | None = None) -> FetchTask:
+        """Start an already-interpreted task (e.g. from the onboard voice listener)."""
+        self.task = task
         self.failures.clear()
         self._last_cloud_observation = None
-        self._log("task_started", {"request": user_request, "task": asdict(self.task)})
-        return self.task
+        payload = {"request": user_request, "task": asdict(task)}
+        if source:
+            payload["source"] = source
+        self._log("task_started", payload)
+        return task
 
     def next_action(self, obs: Observation) -> Decision:
         if self.task is None:

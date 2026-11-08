@@ -97,6 +97,8 @@ sim/.venv/bin/mjpython -m scripts.voice_robot              # sim viewer + window
 sim/.venv/bin/python -m scripts.voice_robot --mic          # talk to it through the laptop mic instead
 ```
 
+**Hints get a question first.** A request that names the drink ("I need water", "Can you get me something to drink?") sets the fetch command straight away. A hint that doesn't ("My mouth is so dry", "I'm parched", "I am thirsty") makes the robot ask *"Would you like some water?"* in its own Gemini voice (clips in `assets/robot_voice/`, made once with `python -m brain.robot_voice --generate`, played locally). The command state is `confirming` until the person answers: yes starts the fetch, no or 10 s of silence ends as `declined`. In the sim, press **Y** or **N** to answer; on the mic, just say it. While the robot talks, the mic ignores what it hears so it doesn't answer itself.
+
 The window is at http://127.0.0.1:8765 and opens by itself. Each run is also logged to `logs/voice_events.jsonl`; replay one with `python -m brain.voice_window logs/voice_events.jsonl`.
 
 ## How the brain makes decisions

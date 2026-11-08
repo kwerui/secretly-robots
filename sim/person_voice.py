@@ -46,6 +46,13 @@ PHRASES: tuple[str, ...] = (
     "I'd love a glass of water.",
 )
 
+# Replies to the robot's "Would you like some water?" (keys Y and N in the viewer).
+ANSWERS: dict[str, str] = {
+    "yes": "Yes, please.",
+    "no": "No, thank you.",
+}
+ALL_LINES: tuple[str, ...] = PHRASES + tuple(ANSWERS.values())
+
 TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
 # "Gacrux" is one of Gemini's prebuilt voices, described as mature.
 TTS_VOICE = os.getenv("GEMINI_TTS_VOICE", "Gacrux")
@@ -135,7 +142,7 @@ def generate_clips(force: bool = False, model: str = TTS_MODEL, voice: str = TTS
         client = genai.Client(api_key=key, http_options={"api_version": "v1beta"})
 
     made = []
-    for phrase in PHRASES:
+    for phrase in ALL_LINES:
         path = clip_path(phrase)
         if path.exists() and not force:
             continue
@@ -150,7 +157,7 @@ def generate_clips(force: bool = False, model: str = TTS_MODEL, voice: str = TTS
         "model": model,
         "voice": voice,
         "style": STYLE,
-        "clips": {p: clip_path(p).name for p in PHRASES},
+        "clips": {p: clip_path(p).name for p in ALL_LINES},
     }, indent=2) + "\n")
     return made
 

@@ -56,3 +56,24 @@ class Demonstration:
     destination: str
     completed_successfully: bool
     description: str = ""
+
+CommandStatus = Literal["idle", "heard", "confirming", "understood", "declined", "rejected"]
+ParserSource = Literal["rules", "gemma", "confirmed"]
+
+@dataclass(frozen=True)
+class CommandState:
+    """What the robot currently understands it has been asked to do.
+
+    Produced onboard from heard speech. Setting it starts a task in the brain;
+    it does NOT move the robot or claim anything was fetched.
+    """
+    status: CommandStatus = "idle"
+    transcript: str = ""
+    task: FetchTask | None = None
+    parser_source: ParserSource | None = None
+    question: str = ""  # what the robot asked while status is "confirming"
+    expires_at: float | None = None  # when an unanswered question lapses
+    reason: str = ""
+    stt_ms: float | None = None
+    intent_ms: float | None = None
+    timestamp: float = 0.0

@@ -42,6 +42,7 @@ Viewer options and modes:
 | T     | next target position (surfaces + drawer targets)         |
 | O     | new random angles for the unlocked doors                 |
 | V     | person on the sofa asks for water (plays a voice clip)   |
+| Y / N | person answers the robot: "Yes, please." / "No, thank you." |
 
 ## Person's voice (Gemini text-to-speech)
 

@@ -45,7 +45,7 @@ def test_generate_clips_makes_missing_only(voice_dir):
     pytest.importorskip("google.genai")
     fake = FakeTTS()
     made = V.generate_clips(client=fake)
-    assert len(made) == len(V.PHRASES) == len(fake.calls)
+    assert len(made) == len(V.ALL_LINES) == len(fake.calls)
     part = fake.calls[0][1][0]["parts"][0]
     assert part["text"] in V.PHRASES and part["speech_metadata"]["style"] == V.STYLE
     assert fake.calls[0][2]["speech_config"]["voice_config"]["voice"] == V.TTS_VOICE

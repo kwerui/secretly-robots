@@ -137,7 +137,11 @@ main{max-width:760px;margin:0 auto;padding:16px}
 .meta b{color:var(--ink);font-weight:600}
 .cmd{margin-top:10px;padding:7px 10px;border-radius:7px;font-size:13.5px;display:inline-block}
 .cmd.understood{background:var(--okbg);color:var(--ok)}.cmd.rejected{background:var(--badbg);color:var(--bad)}
-.cmd.heard{background:var(--waitbg);color:var(--wait)}
+.cmd.heard,.cmd.confirming{background:var(--waitbg);color:var(--wait)}
+.cmd.declined{background:var(--line);color:var(--muted)}
+.card.robot{border-style:dashed;margin-left:32px}
+.who{font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 4px}
+.card.robot .text{font-size:19px;color:var(--accent)}
 footer{color:var(--muted);font-size:12px;text-align:center;padding:8px 16px 24px}
 </style></head><body>
 <header><h1>Robot hearing</h1><div class="status"><span class="dot" id="dot"></span><span id="status">connecting…</span></div></header>
@@ -149,6 +153,7 @@ const $=s=>document.querySelector(s), list=$("#list");
 const fmt=(v,d=2)=>v==null?"–":Number(v).toFixed(d);
 function card(t){
   const c=document.createElement("div"); c.className="card new";
+  const w=document.createElement("p"); w.className="who"; w.textContent="Robot heard"; c.appendChild(w);
   const p=document.createElement("p"); p.className="text"+(t.text?"":" none");
   p.textContent=t.text?`“${t.text}”`:"(not speech)"; c.appendChild(p);
   const m=document.createElement("div"); m.className="meta";
@@ -162,12 +167,17 @@ function card(t){
 function cmdText(e){
   if(e.status==="understood"){const t=e.task||{};return `Command: fetch ${t.item_id} → ${t.destination}  ·  ${e.parser_source}, ${fmt(e.intent_ms,0)} ms`}
   if(e.status==="rejected") return `Not a command: ${e.reason||"not understood"}`;
+  if(e.status==="confirming") return `Hint understood → asked “${e.question}” · waiting for an answer`;
+  if(e.status==="declined") return `No fetch: ${e.reason}`;
   return `Command: ${e.status}`;
 }
 function apply(e){
   if(e.kind==="status"){$("#status").textContent=e.message; $("#dot").className="dot"+(e.listening?" live":""); return}
   if(e.kind==="transcript"){$("#empty")?.remove(); const c=card(e); byStart[e.start_s]=c; list.prepend(c); return}
-  if(e.kind==="command"){const c=byStart[e.start_s]||list.firstElementChild; if(!c||c.id==="empty") return;
+  if(e.kind==="robot_said"){$("#empty")?.remove(); const c=document.createElement("div"); c.className="card robot new";
+    const w=document.createElement("p"); w.className="who"; w.textContent="Robot said (Gemini voice, played onboard)";
+    const p=document.createElement("p"); p.className="text"; p.textContent=`“${e.text}”`; c.append(w,p); list.prepend(c); return}
+  if(e.kind==="command"){const c=byStart[e.start_s]||list.querySelector(".card:not(.robot)"); if(!c||c.id==="empty") return;
     let d=c.querySelector(".cmd"); if(!d){d=document.createElement("div"); c.appendChild(d)}
     d.className="cmd "+e.status; d.textContent=cmdText(e)}
 }

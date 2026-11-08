@@ -11,6 +11,8 @@
     "My mouth is so dry.": "my_mouth_is_so_dry.wav",
     "I'm parched.": "i_m_parched.wav",
     "Can you get me something to drink?": "can_you_get_me_something_to_drink.wav",
-    "I'd love a glass of water.": "i_d_love_a_glass_of_water.wav"
+    "I'd love a glass of water.": "i_d_love_a_glass_of_water.wav",
+    "Yes, please.": "yes_please.wav",
+    "No, thank you.": "no_thank_you.wav"
   }
 }

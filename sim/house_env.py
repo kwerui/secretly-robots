@@ -40,12 +40,12 @@ try:
     from .aruco import ARUCO_DIR, ARUCO_REGISTRY, ensure_aruco_assets, HAS_OPENCV
     from .dynamic_agent import DynamicAgentController, TrajectoryWaypoint
     from .textures import TEXTURES_DIR, ensure_texture_assets
-    from .person_voice import PersonVoice, clip_seconds
+    from .person_voice import ANSWERS, PersonVoice, clip_seconds
 except ImportError:
     from aruco import ARUCO_DIR, ARUCO_REGISTRY, ensure_aruco_assets, HAS_OPENCV
     from dynamic_agent import DynamicAgentController, TrajectoryWaypoint
     from textures import TEXTURES_DIR, ensure_texture_assets
-    from person_voice import PersonVoice, clip_seconds
+    from person_voice import ANSWERS, PersonVoice, clip_seconds
 
 HERE = Path(__file__).resolve().parent
 ASSETS_DIR = HERE / "assets"
@@ -1748,10 +1748,14 @@ def cmd_view(env: HouseEnv, layout=None, target=None, seed=None, mode=Mode.STATI
         elif key == ord("3"):
             state["pending"] = ("mode", Mode.DYNAMIC)
         elif key == ord("V"):
-            state["pending"] = ("speak",)
+            state["pending"] = ("speak", None)
+        elif key == ord("Y"):
+            state["pending"] = ("speak", ANSWERS["yes"])
+        elif key == ord("N"):
+            state["pending"] = ("speak", ANSWERS["no"])
 
     print("keys: SPACE random reset | L layout | T target (surfaces + drawers) | O doors | 1/2/3 modes")
-    print(f"      V: person on the sofa asks for water ({len(voice.available())} voice clips)")
+    print(f"      V: person on the sofa asks for water ({len(voice.available())} voice clips) | Y/N: person answers yes/no")
     print("      1: Static House | 2: Shuffled Furniture & Drawers | 3: Dynamic Walking Person")
     print("push a door or pull a drawer: double-click it, then Ctrl + right-drag")
 
@@ -1777,7 +1781,7 @@ def cmd_view(env: HouseEnv, layout=None, target=None, seed=None, mode=Mode.STATI
                         state["mode"] = p[1]
                         env.reset(mode=state["mode"])
                     if p[0] == "speak":
-                        utt = voice.speak(sim_time=env.data.time)
+                        utt = voice.speak(sim_time=env.data.time, phrase=p[1])
                         if utt:
                             env.info["last_utterance"] = {"speaker": utt.speaker, "phrase": utt.phrase,
                                                           "wav": str(utt.wav), "sim_time": round(utt.sim_time, 3)}
