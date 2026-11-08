@@ -47,6 +47,7 @@ from skills import AssistiveRobot  # noqa: E402
 
 SOFA = "sofa"
 SEEN_CONFIDENCE = 0.95  # ArUco detection from the head camera (6-9 mm error): confident
+STATION_MATCH_M = 1.0  # a sighting further than this from every station's surface is not learned
 
 
 @dataclass
@@ -129,14 +130,54 @@ class RobotBridge:
             "cannot be seen until it is opened" + ranked + "."
         )
 
-    def _look_here(self) -> set[str]:
+    def _station_refs(self) -> dict[str, np.ndarray]:
+        """Where each station's things are (the surface or drawer unit it faces, from the floor
+        plan), so a sighting is learned at the station it belongs to, not the one the robot is at."""
+        stations = getattr(self.robot, "stations", None)
+        if not stations:
+            return {}
+        world = getattr(self.robot, "world", None)
+        try:
+            from sim import house_env as H
+        except ImportError:
+            H = None
+        refs = {}
+        for name, s in stations.items():
+            if name in ("home", "person"):
+                continue
+            if H is not None and world is not None and name in H.SURFACE_TARGETS:
+                refs[name] = np.asarray(world.surface_xyz(name)[:2], float)
+            elif H is not None and name in H.DRAWER_UNITS:
+                refs[name] = np.asarray(H.DRAWER_UNITS[name]["pos"], float)
+            else:  # 0.6 m in front of the station pose
+                refs[name] = np.array([s.x + 0.6 * np.cos(s.yaw), s.y + 0.6 * np.sin(s.yaw)])
+        return refs
+
+    def _station_of(self, pos, here: str) -> str | None:
+        """Station a sighting at world `pos` belongs to (None: near no station). Without a
+        position (or without station geometry) it is the station the robot is at."""
+        refs = self._station_refs()
+        if pos is None or not refs:
+            return here
+        xy = np.asarray(pos, float)[:2]
+        name, d = min(((n, float(np.linalg.norm(xy - r))) for n, r in refs.items()), key=lambda t: t[1])
+        return name if d <= STATION_MATCH_M else None
+
+    def _look_here(self, closer: str | bool = False) -> set[str]:
         """Look with the head camera at the current station; update sightings and memory.
+        Returns the items seen AT this station (things seen elsewhere, e.g. on the counter next
+        to the drawers, are learned at their own station).
 
         This is the only path that adds live location-history evidence.  A sighting says
         where an item was seen, not that a carer placed it there.
+        closer: the multi-view look (robot.look_closer: re-approach, lean in at two pitches);
+        an item name makes it stop early only once that item is seen.
         """
         st = self.robot.station
-        look = self.robot.look()
+        if closer:
+            look = self.robot.look_closer(want=closer if isinstance(closer, str) else None)
+        else:
+            look = self.robot.look()
         if st == "kitchen_counter" and self.counter_camera_debug_dir is not None and not self._counter_camera_captured:
             self._capture_counter_camera_diagnostic(look)
         self._last_look_adequate = bool(look.get("ok", True))
@@ -146,18 +187,26 @@ class RobotBridge:
             "marker_ids": list(look.get("marker_ids", ())),
             "absence_confirmed": self._last_absence_confirmed,
         })
-        seen = set(look.get("items", ())) if self._last_look_adequate else set()
+        raw = look.get("items", ()) if self._last_look_adequate else ()
+        positions = raw if isinstance(raw, dict) else {}
         container_open = st in self.containers and self.open_station == st and self.robot.open_state is not None
         container = self.containers[st].kind if container_open else None
-        for item in seen:
+        seen = set()
+        for item in raw:
+            where = self._station_of(positions.get(item), st)
+            if where == st:
+                seen.add(item)
+            if where is None:
+                continue
             if item != self.robot.holding and item != self.delivered:
                 self.last_execution.setdefault("positive_camera_observations", []).append({
-                    "item": item, "station": st,
+                    "item": item, "station": where,
                 })
-                self.sightings[item] = ObjectSighting(item, self.area(st), container, SEEN_CONFIDENCE)
-                if self.memory.observe_sighting(item, st):
+                self.sightings[item] = ObjectSighting(item, self.area(where), container if where == st else None,
+                                                      SEEN_CONFIDENCE)
+                if self.memory.observe_sighting(item, where):
                     self.last_execution.setdefault("memory_updates", []).append({
-                        "item": item, "station": st, "evidence_source": "head_camera_sighting",
+                        "item": item, "station": where, "evidence_source": "head_camera_sighting",
                     })
         can_confirm_absence = self._last_absence_confirmed and (st not in self.containers or container_open)
         for item, s in list(self.sightings.items()):
@@ -300,6 +349,14 @@ class RobotBridge:
                     inaccessible = self.last_execution.setdefault("inaccessible_or_unobserved_stations", [])
                     if station not in inaccessible:
                         inaccessible.append(station)
+            # A full look rules the station out for this task: at a surface, the multi-view
+            # look_closer (one frame alone is not enough); in a container, the look into the
+            # drawer this robot has just opened.
+            if item not in seen and container_opened:
+                if station in self.containers:
+                    self._last_absence_confirmed = True
+                elif hasattr(self.robot, "look_closer"):
+                    seen = self._look_here(closer=item)
             self.searched.add(station)
             absence_confirmed = bool(self._last_absence_confirmed and container_opened)
             accepted_negative = self.memory.observe_search(

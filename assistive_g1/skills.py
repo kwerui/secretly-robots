@@ -371,23 +371,29 @@ class AssistiveRobot:
                 "marker_ids": sorted(int(marker_id) for marker_id in det),
                 "absence_confirmed": False, **extra}
 
-    def look_closer(self) -> dict:
+    def look_closer(self, want: str | None = None) -> dict:
         """Re-approach the current station, then lean in and look again.
 
         Used when an expected item isn't seen (e.g. after opening the cupboard the robot has
         backed off, or the item sits deep under a shelf). Detections from all views are merged.
+        want: stop early only once this item is seen (None: once anything is seen). When all
+        three views were taken, the station counts as fully looked at (absence_confirmed).
         """
         s = self.stations.get(self.station)
         if s is not None:
             self._drive_to(s.x, s.y, s.yaw, tol=0.03, timeout=10.0)
         merged = self.look()
+        views = 1
         for pitch in (0.25, 0.45):
-            if merged["items"]:
+            if (want in merged["items"]) if want else merged["items"]:
                 break
             self._set_posture(0.74, pitch)
             seen = self.look()
             merged["items"].update(seen["items"])
+            merged["marker_ids"] = sorted(set(merged["marker_ids"]) | set(seen["marker_ids"]))
+            views += 1
         self._set_posture(0.74, 0.0)
+        merged["absence_confirmed"] = views == 3
         return merged
 
     def save_view(self, path) -> None:
