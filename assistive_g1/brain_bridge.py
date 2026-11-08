@@ -26,6 +26,7 @@ the user's station which the brain calls "sofa".
 
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,7 @@ if str(HERE.parent) not in sys.path:
     sys.path.insert(0, str(HERE.parent))  # repo root, so `brain` and `sim` import
 
 import numpy as np  # noqa: E402
+import cv2  # noqa: E402
 
 from brain.contracts import ActionFeedback, Decision, ObjectSighting, Observation  # noqa: E402
 
@@ -60,13 +62,16 @@ class Container:
 
 class RobotBridge:
     def __init__(self, robot: AssistiveRobot, memory: LocationMemory, containers: dict[str, Container],
-                 say: Callable[[str], None] = print, search_first: tuple[str, ...] = ()):
+                 say: Callable[[str], None] = print, search_first: tuple[str, ...] = (),
+                 counter_camera_debug_dir: Path | None = None):
         self.robot, self.memory, self.containers, self.say = robot, memory, containers, say
         self.sightings: dict[str, ObjectSighting] = {}  # item -> where the head camera last saw it
         self.delivered: str | None = None
         self.open_station: str | None = None  # station whose container this robot has open
         self.searched: set[str] = set()  # stations already searched for the current task
         self.search_first = search_first
+        self.counter_camera_debug_dir = counter_camera_debug_dir
+        self._counter_camera_captured = False
         # Evaluation metadata; it is not exposed through latest_observation() and therefore
         # cannot become an input to the AI brain.
         self.last_execution: dict[str, object] = {}
@@ -84,6 +89,7 @@ class RobotBridge:
         self.searched.clear()
         self.memory.new_episode()
         self.task_item = item
+        self._counter_camera_captured = False
 
     # ------------------------------------------------------------------ PerceptionBridge
     def latest_observation(self) -> Observation:
@@ -131,6 +137,8 @@ class RobotBridge:
         """
         st = self.robot.station
         look = self.robot.look()
+        if st == "kitchen_counter" and self.counter_camera_debug_dir is not None and not self._counter_camera_captured:
+            self._capture_counter_camera_diagnostic(look)
         self._last_look_adequate = bool(look.get("ok", True))
         self._last_absence_confirmed = bool(look.get("absence_confirmed", self._last_look_adequate))
         self.last_execution.setdefault("camera_diagnostics", []).append({
@@ -156,6 +164,64 @@ class RobotBridge:
             if can_confirm_absence and s.area == self.area(st) and item not in seen:
                 del self.sightings[item]
         return seen
+
+    def _capture_counter_camera_diagnostic(self, look: dict) -> None:
+        """Save the already-rendered counter frame plus diagnostic-only simulator metadata.
+
+        This runs after ``robot.look()`` and never feeds its ground truth into perception,
+        memory, or ``latest_observation()``.
+        """
+        r = self.robot
+        output_dir = self.counter_camera_debug_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+        capture_index = len(list(output_dir.glob("counter-camera-*.json"))) + 1
+        stem = f"counter-camera-{capture_index:02d}"
+        image_path = output_dir / f"{stem}.png"
+        raw_image_path = output_dir / f"{stem}-raw.png"
+        metadata_path = output_dir / f"{stem}.json"
+        r.save_view(image_path)  # annotates the frame already rendered by robot.look(); no new renderer
+        raw_rgb = getattr(r.cam, "last_rgb", None)
+        if raw_rgb is not None:
+            cv2.imwrite(str(raw_image_path), cv2.cvtColor(raw_rgb, cv2.COLOR_RGB2BGR))
+        else:
+            raw_image_path = None
+
+        cam = r.cam
+        if cam.pose_source is not None:
+            camera_position, camera_rotation = cam.pose_source()
+        else:
+            camera_position = r.data.cam_xpos[cam.cam_id]
+            camera_rotation = r.data.cam_xmat[cam.cam_id].reshape(3, 3)
+        world = r.world
+        bottle_body = world.item_body["water_bottle"]
+        expected_marker = None
+        try:
+            marker_id = r.model.geom("waterbottle_top_marker").id
+            expected_marker = {
+                "position_xyz": [round(float(v), 6) for v in r.data.geom_xpos[marker_id]],
+                "rotation_matrix": np.asarray(r.data.geom_xmat[marker_id]).reshape(3, 3).round(6).tolist(),
+            }
+        except KeyError:
+            pass
+        payload = {
+            "diagnostic_only": True,
+            "simulation_timestamp_s": float(r.data.time),
+            "station": "kitchen_counter",
+            "image_path": str(image_path),
+            "raw_image_path": None if raw_image_path is None else str(raw_image_path),
+            "detected_marker_ids": [int(marker_id) for marker_id in look.get("marker_ids", ())],
+            "camera_pose": {
+                "position_xyz": [round(float(v), 6) for v in camera_position],
+                "rotation_matrix": np.asarray(camera_rotation).reshape(3, 3).round(6).tolist(),
+            },
+            "bottle_truth_xyz": [round(float(v), 6) for v in r.data.body(bottle_body).xpos],
+            "expected_bottle_marker": expected_marker,
+        }
+        metadata_path.write_text(json.dumps(payload, indent=2) + "\n")
+        self.last_execution.setdefault("counter_camera_diagnostics", []).append({
+            "image_path": str(image_path), "metadata_path": str(metadata_path),
+        })
+        self._counter_camera_captured = True
 
     # ------------------------------------------------------------------ ControllerBridge
     def execute_high_level(self, decision: Decision) -> ActionFeedback:

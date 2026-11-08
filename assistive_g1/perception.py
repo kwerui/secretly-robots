@@ -23,6 +23,11 @@ ID_TO_ITEM = {it.marker_id: name for name, it in ITEMS.items()}
 
 # OpenCV camera frame (x right, y down, z forward) -> MuJoCo camera frame (x right, y up, z back)
 CV_TO_MJ = np.diag([1.0, -1.0, -1.0])
+# The counter camera can see the bottle's horizontal top marker at a strong angle.  Its
+# contour survives thresholding, but OpenCV's default four-pixel perspective warp is too
+# coarse to decode the foreshortened cells.  This affects only the existing 2x fallback pass.
+FALLBACK_WARP_PIXELS_PER_CELL = 8
+HIGH_DETAIL_WARP_PIXELS_PER_CELL = 8
 
 
 @dataclass
@@ -54,6 +59,18 @@ class HeadCamera:
         params = cv2.aruco.DetectorParameters()
         params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         self.detector = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(MARKER_DICT), params)
+        fallback_params = cv2.aruco.DetectorParameters()
+        fallback_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        fallback_params.perspectiveRemovePixelPerCell = FALLBACK_WARP_PIXELS_PER_CELL
+        self.fallback_detector = cv2.aruco.ArucoDetector(
+            cv2.aruco.getPredefinedDictionary(MARKER_DICT), fallback_params,
+        )
+        detail_params = cv2.aruco.DetectorParameters()
+        detail_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        detail_params.perspectiveRemovePixelPerCell = HIGH_DETAIL_WARP_PIXELS_PER_CELL
+        self.detail_detector = cv2.aruco.ArucoDetector(
+            cv2.aruco.getPredefinedDictionary(MARKER_DICT), detail_params,
+        )
         self.last_rgb: np.ndarray | None = None
         # RGB-D: a depth image from the same camera refines each marker's position (PnP range
         # error grows with distance; depth doesn't care about the marker's apparent size)
@@ -130,9 +147,17 @@ class HeadCamera:
         corners, ids, _ = self.detector.detectMarkers(gray)
         corners, ids = list(corners), ([] if ids is None else [int(i) for i in ids.flatten()])
         if len(set(ids) & set(self.sizes)) < len(self.sizes):
+            # Preserve native pixels for strongly foreshortened markers: upscaling helps
+            # contour extraction, but can blur the few pixels across the marker's short axis.
+            c_detail, i_detail, _ = self.detail_detector.detectMarkers(gray)
+            if i_detail is not None:
+                for c, mid in zip(c_detail, i_detail.flatten()):
+                    if int(mid) not in ids:
+                        corners.append(c)
+                        ids.append(int(mid))
             eq = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
             big = cv2.resize(eq, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-            c2, i2, _ = self.detector.detectMarkers(big)
+            c2, i2, _ = self.fallback_detector.detectMarkers(big)
             if i2 is not None:
                 for c, mid in zip(c2, i2.flatten()):
                     if int(mid) not in ids:

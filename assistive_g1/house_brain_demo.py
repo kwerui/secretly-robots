@@ -83,6 +83,8 @@ def main():
                     help="opt in to head-camera-only location learning; do not seed fictional carer history")
     ap.add_argument("--memory-path", type=Path,
                     help="optional persistent JSON store (requires --live-memory)")
+    ap.add_argument("--debug-counter-camera", type=Path,
+                    help="opt in: save the existing counter head-camera frame and diagnostic-only truth JSON")
     args = ap.parse_args()
     if args.memory_path is not None and not args.live_memory:
         ap.error("--memory-path requires --live-memory so saved data is never mixed with seeded demo history")
@@ -142,7 +144,8 @@ def main():
         memory = learned_memory()
         print("Location memory: seeded synthetic demo history (not live learning mode)")
     bridge = RobotBridge(robot, memory, containers, say=say,
-                         search_first=("kitchen_drawers",) if args.drawer_first else ())
+                         search_first=("kitchen_drawers",) if args.drawer_first else (),
+                         counter_camera_debug_dir=args.debug_counter_camera)
 
     use_gemini = not args.offline
     if use_gemini:
