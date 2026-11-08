@@ -1,0 +1,11 @@
+{
+  "generator": "Gemini text-to-speech",
+  "model": "gemini-3.8-flash-tts",
+  "voice": "Kore",
+  "style": "Say this as a calm, friendly home-care helper robot, clearly and gently",
+  "lines": {
+    "ask_water": "Would you like some water?",
+    "will_fetch_water": "Okay, I'll get you some water.",
+    "declined": "Okay. Just let me know if you need anything."
+  }
+}

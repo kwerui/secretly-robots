@@ -1,0 +1,2 @@
+# Robot hearing from the laptop microphone. The sim audio source needs only numpy.
+sounddevice>=0.5

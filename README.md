@@ -86,6 +86,21 @@ drawer; `drawer_open` is therefore always `False`. Replace or supplement it
 with a real sensor bridge only when the perception team supplies
 confidence-calibrated detections.
 
+## Voice: the person asks, the robot listens (onboard)
+
+Press **V** in the sim and the person on the sofa asks for water (clips made with Gemini text-to-speech, see `sim/README.md`). The robot hears it from its head camera position, transcribes it with Whisper on the laptop's CPU, and turns the text into a command state. A live window shows each transcript, how long speech-to-text took and the command it produced. Nothing in the robot's listening path uses the network.
+
+```bash
+sim/.venv/bin/pip install -r requirements-hearing.txt -r requirements-stt.txt
+sim/.venv/bin/python -m brain.speech_to_text --download    # once, ~145 MB into models/ (gitignored)
+sim/.venv/bin/mjpython -m scripts.voice_robot              # sim viewer + window; press V
+sim/.venv/bin/python -m scripts.voice_robot --mic          # talk to it through the laptop mic instead
+```
+
+**Hints get a question first.** A request that names the drink ("I need water", "Can you get me something to drink?") sets the fetch command straight away. A hint that doesn't ("My mouth is so dry", "I'm parched", "I am thirsty") makes the robot ask *"Would you like some water?"* in its own Gemini voice (clips in `assets/robot_voice/`, made once with `python -m brain.robot_voice --generate`, played locally). The command state is `confirming` until the person answers: yes starts the fetch, no or 10 s of silence ends as `declined`. In the sim, press **Y** or **N** to answer; on the mic, just say it. While the robot talks, the mic ignores what it hears so it doesn't answer itself.
+
+The window is at http://127.0.0.1:8765 and opens by itself. Each run is also logged to `logs/voice_events.jsonl`; replay one with `python -m brain.voice_window logs/voice_events.jsonl`.
+
 ## How the brain makes decisions
 
 ```python
@@ -174,6 +189,10 @@ brain/
   integration.py      # interface teammates implement for actual MuJoCo
   mujoco_observation.py # HouseEnv ground truth -> brain Observation adapter
   teach_once.py       # small symbolic goal memory; not motor imitation
+  hearing.py          # robot's ears, onboard: sim/mic audio -> speech segments (python -m scripts.hearing_demo)
+  speech_to_text.py   # onboard Whisper (base.en, CPU): speech segment -> transcript
+  voice_pipeline.py   # heard speech -> transcript -> command state, off the sim thread
+  voice_window.py     # live speech-to-text window at http://127.0.0.1:8765
   gemini_client.py    # official google-genai structured-output boundary
   gemini_optional.py  # checked Gemini task/next-decision adapters
   demo.py             # hand-authored explanatory example
