@@ -1,8 +1,9 @@
-"""Damped-least-squares IK for one G1 arm (7 joints) on the live MuJoCo model.
+"""Damped-least-squares IK for one G1 arm (7 joints) using estimated robot state.
 
-Solves on a scratch MjData copy of the current state, so the base/legs/waist are taken
-as they are right now and only the arm's joints move. Re-solving every control tick
-(closed loop) absorbs the small sway of the balancing lower body.
+Solves on a scratch MjData populated from the localizer's estimated base pose
+`(pos_3d, quat_wxyz)` and the 29 joint encoders (never reading ground-truth base pose
+from `self.data`). Re-solving every control tick (closed loop) absorbs the small sway
+of the balancing lower body.
 
 Targets: palm position (world) plus optional axis alignments, e.g.
     fingers (site x-axis) -> approach direction
@@ -11,13 +12,15 @@ which is enough for side grasps and handle pulls without a full 6D target.
 
 Collision avoidance: every iteration, signed distances (mj_geomDistance) between this arm's
 links (upper arm down to the fingers) and nearby obstacles (torso, pelvis, legs, the other
-arm, furniture, the door, items, floor) are computed. Any pair closer than `safe_dist`
+arm, furniture, the door, floor) are computed. Any pair closer than `safe_dist`
 becomes an extra row "move the arm point away along the separating normal", weighted above
 the hand target, so the arm routes around the body and furniture instead of through them.
 The hand itself may touch the item/door it is grasping (same exclusions as the physics).
 """
 
 from __future__ import annotations
+
+from typing import Callable
 
 import mujoco
 import numpy as np
@@ -43,6 +46,17 @@ class ArmIK:
         self.lo = model.jnt_range[jids, 0] + 0.02
         self.hi = model.jnt_range[jids, 1] - 0.02
         self.home = ARM_HOME[:7] if side == "left" else ARM_HOME[7:]
+
+        root = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "floating_base_joint")
+        self._root_q = model.jnt_qposadr[root] if root >= 0 else 0
+        self._body_qpos_ids = np.array([
+            model.jnt_qposadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, j)]
+            for j in BODY_JOINTS
+        ])
+        self._pose_provider: Callable[[], tuple[np.ndarray, np.ndarray]] | None = None
+        self._joints_provider: Callable[[], np.ndarray] | None = None
+        self.articulated_qpos: dict[int, float] = {}  # e.g. estimated door/drawer joint qpos
+
         # Bodies of this arm (shoulder down to the fingers), for collision checks
         first = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{side}_shoulder_pitch_link")
         self.arm_bodies = {b for b in range(model.nbody) if self._is_descendant(b, first)}
@@ -70,6 +84,32 @@ class ArmIK:
         self.detect_dist = 0.12  # m, broad-phase radius
         self.col_weight = 3.0
 
+    def set_state_provider(
+        self,
+        pose_provider: Callable[[], tuple[np.ndarray, np.ndarray]],
+        joints_provider: Callable[[], np.ndarray],
+    ) -> None:
+        """Wire estimated base pose `(pos_3d, quat_wxyz)` and 29 encoder joints into IK."""
+        self._pose_provider = pose_provider
+        self._joints_provider = joints_provider
+
+    def _sync_scratch(self, s: mujoco.MjData, q_arm: np.ndarray | None = None) -> None:
+        """Populate scratch MjData using estimated robot state (or data.qpos fallback)."""
+        if self._pose_provider is not None and self._joints_provider is not None:
+            s.qpos[:] = self.model.qpos0
+            for qadr, val in self.articulated_qpos.items():
+                s.qpos[qadr] = val
+            pos_3d, quat_wxyz = self._pose_provider()
+            qa = self._root_q
+            s.qpos[qa : qa + 3] = pos_3d
+            s.qpos[qa + 3 : qa + 7] = quat_wxyz
+            s.qpos[self._body_qpos_ids] = self._joints_provider()
+        else:
+            s.qpos[:] = self.data.qpos
+        if q_arm is not None:
+            s.qpos[self.qadr] = q_arm
+        s.qvel[:] = 0.0
+
     def _is_descendant(self, b: int, root: int) -> bool:
         while b > 0:
             if b == root:
@@ -78,10 +118,9 @@ class ArmIK:
         return False
 
     def collisions(self, q: np.ndarray, margin: float = 0.01) -> list[tuple[str, str]]:
-        """Contacts between this arm and anything else if the arm were at q (current base pose)."""
+        """Contacts between this arm and anything else if the arm were at q (current estimated pose)."""
         s = self.scratch
-        s.qpos[:] = self.data.qpos
-        s.qpos[self.qadr] = q
+        self._sync_scratch(s, q)
         mujoco.mj_forward(self.model, s)
         hits = []
         for i in range(s.ncon):
@@ -131,14 +170,19 @@ class ArmIK:
     def min_clearance(self, q: np.ndarray) -> float:
         """Smallest arm-to-obstacle distance (m, negative = penetration) with the arm at q."""
         s = self.scratch
-        s.qpos[:] = self.data.qpos
-        s.qpos[self.qadr] = q
+        self._sync_scratch(s, q)
         mujoco.mj_kinematics(self.model, s)
         return self._collision_rows(s, self._candidate_pairs(s))[2]
 
     def palm_pose(self, data: mujoco.MjData | None = None) -> tuple[np.ndarray, np.ndarray]:
-        d = data or self.data
-        return d.site_xpos[self.site].copy(), d.site_xmat[self.site].reshape(3, 3).copy()
+        if data is not None:
+            return data.site_xpos[self.site].copy(), data.site_xmat[self.site].reshape(3, 3).copy()
+        if self._pose_provider is not None:
+            s = self.scratch
+            self._sync_scratch(s)
+            mujoco.mj_kinematics(self.model, s)
+            return s.site_xpos[self.site].copy(), s.site_xmat[self.site].reshape(3, 3).copy()
+        return self.data.site_xpos[self.site].copy(), self.data.site_xmat[self.site].reshape(3, 3).copy()
 
     def solve(
         self,
@@ -156,8 +200,7 @@ class ArmIK:
         axes: list of (site axis index 0/1/2, desired world direction, weight).
         """
         s = self.scratch
-        s.qpos[:] = self.data.qpos
-        s.qvel[:] = 0
+        self._sync_scratch(s)
         q = s.qpos[self.qadr].copy() if q_init is None else np.array(q_init, dtype=float)
         axes = axes or []
         err_pos = np.inf

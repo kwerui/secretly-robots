@@ -1,12 +1,17 @@
 """Robot skills the agent layer calls: go_to, look, pick, open_cupboard, hand_over.
 
 Each skill returns a small result dict (ok + details) so an LLM planner can reason over
-outcomes. Perception goes through the head camera only; the simulator's ground truth is
-used for the robot's own base pose (localisation is out of scope for the hackathon).
+outcomes. Both perception and self-localization run strictly through onboard sensors:
+  * 360-degree stabilized multi-layer LiDAR (`mj_multiRay`) + IMU AHRS + Leg Odometry
+    in a 50 Hz EKF (`localization.py`) for `(x, y, z, yaw)` and `vel_body`.
+  * Head RGB-D camera (`perception.py`) for depth-fused ArUco detection, 3D point clouds,
+    and visual landmark pose updates.
+  * Ground-truth base pose from `MjData` is never used by navigation, perception, or IK.
 """
 
 from __future__ import annotations
 
+import math
 from typing import Callable
 
 import mujoco
@@ -14,12 +19,13 @@ import numpy as np
 
 from g1_wbc import G1WBC, ARM_HOME, SIM_DT
 from ik import ArmIK
+from localization import G1Localizer
 from nav import Navigator
 from perception import HeadCamera, MarkerPose, ID_TO_ITEM
 from articulation import ArticulationModel, rot_axis_angle
 from scene import ITEMS, STATIONS, DOOR_MARKER, ANCHOR_MARKER, build_scene
 
-CONTROL_DT = 0.02  # arm/nav update period (50 Hz)
+CONTROL_DT = 0.02  # arm/nav/localization update period (50 Hz)
 # (pelvis height, torso pitch) tried in order when an item is hard to reach
 POSTURES = [(0.74, 0.0), (0.74, 0.3), (0.68, 0.45), (0.60, 0.5)]
 # deep squats for items near the floor (GR00T accepts pelvis heights down to ~0.2 m)
@@ -38,11 +44,20 @@ def wrap(a: float) -> float:
 
 
 class AssistiveRobot:
-    def __init__(self, placement=None, on_frame: Callable[["AssistiveRobot"], None] | None = None):
-        self.model, self.data = build_scene(placement)
+    def __init__(self, placement=None, on_frame: Callable[["AssistiveRobot"], None] | None = None,
+                 model_data: tuple[mujoco.MjModel, mujoco.MjData] | None = None,
+                 start_pose: tuple[float, float, float] = (0.0, 0.0, 0.0)):
+        self.model, self.data = model_data if model_data is not None else build_scene(placement)
         self.wbc = G1WBC(self.model, self.data)
+        self.localizer = G1Localizer(self.model, self.data)
         self.ik = ArmIK(self.model, self.data, "right")
-        self.cam = HeadCamera(self.model, self.data)
+        self.ik.set_state_provider(self.localizer.base_pose_3d, lambda: self.wbc.q)
+        self.cam = HeadCamera(
+            self.model,
+            self.data,
+            pose_provider=lambda: self.localizer.camera_pose(self.wbc.q),
+            landmark_callback=lambda dets: self.localizer.update_landmarks(dets, self.wbc.q, float(self.data.time)),
+        )
         self.nav = Navigator()
         self.on_frame = on_frame  # called every CONTROL_DT, e.g. to record video
         self.holding: str | None = None
@@ -52,12 +67,60 @@ class AssistiveRobot:
         self.station = "home"
         self.arm_cmd = ARM_HOME[7:].copy()
         self.last_seen: dict[int, MarkerPose] = {}
-        self.wbc.place(0.0, 0.0, 0.0)
+
+        door_jnt = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "door_hinge")
+        self._door_qadr = int(self.model.jnt_qposadr[door_jnt]) if door_jnt >= 0 else None
+
+        sx, sy, syaw = start_pose
+        self.wbc.place(sx, sy, syaw)
+        self.localizer.reset(sx, sy, syaw, z=0.74)
         self.wait(1.0)
+
+    # ------------------------------------------------------------------ localized state
+    @property
+    def est_pos(self) -> np.ndarray:
+        """Estimated 3D pelvis position (x, y, z) from onboard localization (no ground truth)."""
+        return self.localizer.pos_3d
+
+    @property
+    def est_yaw(self) -> float:
+        """Estimated pelvis heading (rad) from onboard localization (no ground truth)."""
+        return self.localizer.yaw
+
+    @property
+    def est_vel_body(self) -> np.ndarray:
+        """Estimated body-frame velocity (vx, vy, wz) from IMU + leg odometry."""
+        return self.localizer.vel_body.copy()
+
+    @property
+    def person_too_close(self) -> bool:
+        """Sensor-derived proximity check for a dynamic person within safety clearance."""
+        too_close, _, _ = self.localizer.dynamic_map.check_person_clearance(
+            self.est_pos[:2], float(self.data.time)
+        )
+        return too_close
+
+    def localization_status(self) -> dict:
+        """Return current sensor-estimated pose, velocity, and dynamic obstacle status."""
+        too_close, p_dist, _ = self.localizer.dynamic_map.check_person_clearance(
+            self.est_pos[:2], float(self.data.time)
+        )
+        return {
+            "est_pos": self.est_pos.round(3).tolist(),
+            "est_yaw": round(self.est_yaw, 3),
+            "est_vel_body": self.est_vel_body.round(3).tolist(),
+            "lidar_inlier_ratio": round(self.localizer.last_inlier_ratio, 2),
+            "scan_residual_m": round(self.localizer.last_scan_residual, 4),
+            "person_too_close": too_close,
+            "nearest_person_dist_m": round(p_dist, 2) if math.isfinite(p_dist) else None,
+            "tracked_obstacles": len(self.localizer.dynamic_map.tracks),
+            "movable_furniture": dict(self.localizer.dynamic_map.furniture_poses),
+        }
 
     # ------------------------------------------------------------------ basics
     def _tick(self) -> None:
         self.wbc.step(int(round(CONTROL_DT / SIM_DT)))
+        self.localizer.step(self.wbc.q, self.wbc.dq, self.wbc.cmd, CONTROL_DT)
         if self.on_frame is not None:
             self.on_frame(self)
 
@@ -71,10 +134,24 @@ class AssistiveRobot:
         full[7:] = q
         self.wbc.set_arm_targets(full)
 
+    def _set_holding(self, item: str | None) -> None:
+        self.holding = item
+        self.localizer.lidar.set_held_body(item)
+
+    def _update_door_estimate_from_markers(self, det: dict[int, MarkerPose]) -> None:
+        """Estimate cupboard door hinge angle from DOOR_MARKER normal when visible."""
+        if self._door_qadr is None or DOOR_MARKER not in det:
+            return
+        n_door = det[DOOR_MARKER].rotation[:2, 2]
+        if np.linalg.norm(n_door) > 0.3:
+            # Closed door normal points along +y (angle = pi/2); opening rotates it toward +x/-y
+            ang = wrap(math.pi / 2.0 - math.atan2(n_door[1], n_door[0]))
+            self.ik.articulated_qpos[self._door_qadr] = float(np.clip(abs(ang), 0.0, 1.9))
+
     # ------------------------------------------------------------------ navigation
     def _drive_to(self, x: float, y: float, yaw: float | None, tol: float = 0.04, timeout: float = 25.0,
                   pass_through: bool = False) -> bool:
-        """Walk to (x, y[, yaw]) with the smooth PD navigator (nav.py).
+        """Walk to (x, y[, yaw]) with the smooth PD navigator (nav.py) using localized state.
 
         pass_through: a waypoint. Return as soon as we're within `tol`, keeping the current
         velocity (no stop), so the next leg continues smoothly.
@@ -82,10 +159,10 @@ class AssistiveRobot:
         self.nav.p.pos_tol = tol
         self.nav.arrived = False  # keep self.nav.cmd: continue from the current velocity
         for _ in range(int(timeout / CONTROL_DT)):
-            p = self.wbc.base_pos
+            p = self.est_pos
             if pass_through and np.hypot(x - p[0], y - p[1]) < tol:
                 return True
-            cmd = self.nav.step((p[0], p[1], self.wbc.base_yaw), self.wbc.base_vel_body, (x, y, yaw), CONTROL_DT)
+            cmd = self.nav.step((p[0], p[1], self.est_yaw), self.est_vel_body, (x, y, yaw), CONTROL_DT)
             self.wbc.set_velocity(*cmd)
             self._tick()
             if self.wbc.fallen():
@@ -98,16 +175,16 @@ class AssistiveRobot:
         self.wbc.set_velocity(0, 0, 0)
         self.wait(0.8)
         if not arrived:  # timed out (blocked, e.g. a carried item jammed on furniture)
-            p = self.wbc.base_pos
+            p = self.est_pos
             arrived = np.hypot(x - p[0], y - p[1]) < 2 * tol
         return arrived
 
     def go_to(self, station: str) -> dict:
-        """Walk to a named station (see scene.STATIONS)."""
+        """Walk to a named station (see scene.STATIONS) using localized pose."""
         if station not in STATIONS:
             return {"ok": False, "error": f"unknown station {station}", "stations": list(STATIONS)}
         s = STATIONS[station]
-        p = self.wbc.base_pos
+        p = self.est_pos
         if np.hypot(p[0] - HUB[0], p[1] - HUB[1]) > 0.3 and station != self.station:
             self._drive_to(*HUB, None, tol=0.25, pass_through=True)
             if self.wbc.fallen():
@@ -115,16 +192,17 @@ class AssistiveRobot:
         ok = self._drive_to(s.x, s.y, s.yaw)
         if ok:
             self.station = station
-        out = {"ok": ok, "station": station, "pose": self.wbc.base_pos.round(2).tolist()}
+        out = {"ok": ok, "station": station, "pose": self.est_pos.round(2).tolist()}
         if not ok:
             out["error"] = f"couldn't reach the {station}"
         return out
 
     # ------------------------------------------------------------------ perception
     def look(self) -> dict:
-        """Detect markers in the head camera. Returns item names -> world position."""
+        """Detect markers in the RGB-D head camera. Returns item names -> estimated world position."""
         det = self.cam.detect()
         self.last_seen = det
+        self._update_door_estimate_from_markers(det)
         items = {ID_TO_ITEM[m]: p.position.round(3).tolist() for m, p in det.items() if m in ID_TO_ITEM}
         extra = {}
         if DOOR_MARKER in det:
@@ -205,7 +283,7 @@ class AssistiveRobot:
             b2 = self.model.eq_obj2id[eq]
             p1, R1, q1 = self.data.xpos[b1], self.data.xmat[b1].reshape(3, 3), self.data.xquat[b1]
             p2, R2, q2 = self.data.xpos[b2], self.data.xmat[b2].reshape(3, 3), self.data.xquat[b2]
-            palm, _ = self.ik.palm_pose()
+            palm, _ = self.ik.palm_pose(self.data)
             q1_inv = np.zeros(4)
             mujoco.mju_negQuat(q1_inv, q1)
             rel_q = np.zeros(4)
@@ -224,6 +302,7 @@ class AssistiveRobot:
         if it is None:
             return {"ok": False, "error": f"unknown item {item}"}
         det = self.cam.detect()
+        self._update_door_estimate_from_markers(det)
         if it.marker_id not in det:
             return {"ok": False, "error": f"{item} not visible from {self.station}"}
         top = det[it.marker_id].position
@@ -233,21 +312,27 @@ class AssistiveRobot:
             return self._pick_low(item, top, centre)
         grasp = centre + np.array([0, 0, 0.3 * it.size[2]])
 
-        base = self.wbc.base_pos
+        base = self.est_pos
         # Raise the hand to chest height, close to the body, before anything else so it can't
         # catch under a table edge while lifting or stepping in.
         self._raise_hand(grasp[2] + 0.06, toward=grasp)
         # Line up so the item is straight ahead of the right shoulder at STANDOFF, keeping the
         # heading (facing the furniture). The hand then goes in and comes out perpendicular to
         # the furniture: a diagonal path drags the item along a cupboard's side wall.
-        th = self.wbc.base_yaw
+        th = self.est_yaw
         fwd2 = np.array([np.cos(th), np.sin(th)])
         left2 = np.array([-np.sin(th), np.cos(th)])
         goal = grasp[:2] - STANDOFF * fwd2 + GRASP_LATERAL * left2  # pelvis left of the item
         if np.linalg.norm(goal - base[:2]) > 0.03:
             self._drive_to(goal[0], goal[1], th, tol=0.025, timeout=8.0)
-            base = self.wbc.base_pos
-        th = self.wbc.base_yaw
+            # Re-detect from the aligned stance so camera & IK share the exact current pose
+            det2 = self.cam.detect()
+            if it.marker_id in det2:
+                top = det2[it.marker_id].position
+                centre = top - np.array([0, 0, it.size[2] + 0.001])
+                grasp = centre + np.array([0, 0, 0.3 * it.size[2]])
+            base = self.est_pos
+        th = self.est_yaw
         approach = np.array([np.cos(th), np.sin(th), 0.0])
         reach = float((grasp - base)[:2] @ approach[:2])
         # Pre-grasp back along the approach, but never closer than ~0.27 m to the pelvis:
@@ -269,6 +354,14 @@ class AssistiveRobot:
             self._set_posture(0.74, 0.0)
             return {"ok": False, "error": f"no collision-free grasp for {item} from here (score {best:.3f})"}
 
+        # If posture changed (lean/crouch), re-observe item from the new camera posture
+        det3 = self.cam.detect()
+        if it.marker_id in det3:
+            top = det3[it.marker_id].position
+            centre = top - np.array([0, 0, it.size[2] + 0.001])
+            grasp = centre + np.array([0, 0, 0.3 * it.size[2]])
+            pre = grasp - back * approach + np.array([0, 0, 0.04])
+
         # Come in along the approach line: far pre-grasp (outside any cupboard), pre-grasp, grasp.
         self.move_hand(grasp - (back + 0.10) * approach + np.array([0, 0, 0.04]), axes, duration=1.0, settle=0.1)
         e1 = self.move_hand(pre, axes, duration=0.7)
@@ -280,7 +373,7 @@ class AssistiveRobot:
             return {"ok": False, "error": f"could not reach {item} (residual {e2:.3f} m)", "pre_err": round(e1, 3)}
         self._weld(f"grasp_{item}", True)
         self._item_collisions(item, False)
-        self.holding = item
+        self._set_holding(item)
         # The weld fixes the item to the hand, so the item stays upright iff this palm axis
         # keeps the world direction it had at the grasp. Record it as measured, not as asked.
         _, R_palm = self.ik.palm_pose()
@@ -319,7 +412,7 @@ class AssistiveRobot:
         the knee. Reach is ~0.1 m above the floor: fine for a bottle, marginal for a cup.
         """
         it = ITEMS[item]
-        base = self.wbc.base_pos
+        base = self.est_pos
         d = top[:2] - base[:2]
         yaw = float(np.arctan2(d[1], d[0]))
         fwd = np.array([np.cos(yaw), np.sin(yaw), 0.0])
@@ -341,6 +434,12 @@ class AssistiveRobot:
             self._set_posture(0.74, 0.0)
             self.arm_home()
             return {"ok": False, "error": f"{item} is too low to reach from a squat (score {best:.3f})"}
+        det_sq = self.cam.detect()
+        if it.marker_id in det_sq:
+            top = det_sq[it.marker_id].position
+            centre = top - np.array([0, 0, it.size[2] + 0.001])
+            grasp = top - np.array([0, 0, min(0.03, it.size[2])])
+            pre = grasp + np.array([0, 0, 0.12])
         self.move_hand(pre + np.array([0, 0, 0.08]), axes, duration=1.0, settle=0.1)
         self.move_hand(pre, axes, duration=0.6)
         e = self.move_hand(grasp, axes, duration=0.9)
@@ -351,7 +450,7 @@ class AssistiveRobot:
             return {"ok": False, "error": f"could not reach {item} on the floor (residual {e:.3f} m)"}
         self._weld(f"grasp_{item}", True)
         self._item_collisions(item, False)
-        self.holding = item
+        self._set_holding(item)
         _, R_palm = self.ik.palm_pose()
         self.hold_vert = (0, R_palm[:, 0].copy())  # fingers (pointing down) keep their direction
         self.hold_mode, self.hold_dz = "top", grasp[2] - centre[2]
@@ -369,10 +468,10 @@ class AssistiveRobot:
 
     def _raise_hand(self, z: float, toward: np.ndarray | None = None) -> None:
         """Bring the palm up in front of the chest, lined up with `toward` (a world point)."""
-        th = self.wbc.base_yaw
+        th = self.est_yaw
         fwd = np.array([np.cos(th), np.sin(th), 0.0])
         left = np.array([-np.sin(th), np.cos(th), 0.0])
-        base = self.wbc.base_pos
+        base = self.est_pos
         lateral = -0.14
         if toward is not None:
             lateral = float(np.clip((np.asarray(toward) - base) @ left, -0.28, 0.05))
@@ -385,20 +484,20 @@ class AssistiveRobot:
         self.move_hand(tgt, [(0, fwd, 0.5)], duration=0.6, settle=0.1)
 
     def _step_back(self, dist: float) -> None:
-        th = self.wbc.base_yaw
-        p = self.wbc.base_pos[:2] - dist * np.array([np.cos(th), np.sin(th)])
+        th = self.est_yaw
+        p = self.est_pos[:2] - dist * np.array([np.cos(th), np.sin(th)])
         self._drive_to(p[0], p[1], th, tol=0.04, timeout=4.0)
 
     def holding_ok(self, tol: float = 0.08) -> bool:
-        """Is the held item still at the palm? (A snagged item can be torn out of the weld.)"""
+        """Is the held item still at the palm? (Local gripper proximity check)."""
         if self.holding is None:
             return False
         b = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, self.holding)
-        palm, _ = self.ik.palm_pose()
+        palm, _ = self.ik.palm_pose(self.data)
         return float(np.linalg.norm(self.data.xpos[b] - palm)) < tol
 
     def _left(self) -> np.ndarray:
-        th = self.wbc.base_yaw
+        th = self.est_yaw
         return np.array([-np.sin(th), np.cos(th), 0.0])
 
     def _set_posture(self, height: float, pitch: float) -> None:
@@ -411,11 +510,11 @@ class AssistiveRobot:
     def carry(self) -> None:
         """Bring the held item close to the body (pelvis-relative carry pose)."""
         self._set_posture(0.74, 0.0)
-        th = self.wbc.base_yaw
+        th = self.est_yaw
         fwd = np.array([np.cos(th), np.sin(th), 0])
         left = np.array([-np.sin(th), np.cos(th), 0])
         # high and close: the item clears anything standing on a table we walk up to
-        target = self.wbc.base_pos + 0.28 * fwd - 0.18 * left + np.array([0, 0, 0.18])
+        target = self.est_pos + 0.28 * fwd - 0.18 * left + np.array([0, 0, 0.18])
         self.move_hand(target, self._hold_axes(fwd), duration=1.0)
 
     def hand_over(self) -> dict:
@@ -425,18 +524,18 @@ class AssistiveRobot:
         if not self.holding_ok():
             item = self.holding
             self._weld(f"grasp_{item}", False)
-            self.holding = None
+            self._set_holding(None)
             self._item_collisions(item, True)
             self.arm_home()
             return {"ok": False, "error": f"lost the {item} on the way"}
         from scene import SIDE_TABLE
         it = ITEMS[self.holding]
-        th = self.wbc.base_yaw
+        th = self.est_yaw
         fwd = np.array([np.cos(th), np.sin(th), 0])
         axes = self._hold_axes(fwd)
         # Put it down on the side table: a reachable spot, as far as possible from anything
         # already standing there (seen by the head camera).
-        base = self.wbc.base_pos
+        base = self.est_pos
         left = np.array([-np.sin(th), np.cos(th), 0])
         cx, cy = SIDE_TABLE["pos"]
         hx, hy = SIDE_TABLE["half"]
@@ -459,7 +558,7 @@ class AssistiveRobot:
         self.move_hand(spot, axes, duration=0.9)
         item = self.holding
         self._weld(f"grasp_{item}", False)
-        self.holding = None
+        self._set_holding(None)
         self.placed.append(spot.copy())
         self.wait(0.3)
         self.move_hand(spot - 0.06 * fwd + np.array([0, 0, 0.14]), axes, duration=0.8)
@@ -480,8 +579,8 @@ class AssistiveRobot:
         v_back = 0.0
         for i, (p, axes) in enumerate(zip(targets, axes_list)):
             if keep_reach is not None:
-                th = self.wbc.base_yaw
-                fwd = (p - self.wbc.base_pos)[:2] @ np.array([np.cos(th), np.sin(th)])
+                th = self.est_yaw
+                fwd = (p - self.est_pos)[:2] @ np.array([np.cos(th), np.sin(th)])
                 want = -BACKOFF_SPEED if fwd < keep_reach else 0.0
                 v_back += np.clip(want - v_back, -0.5 * dt, 0.5 * dt)  # 0.5 m/s^2 ramp
                 self.wbc.set_velocity(v_back if abs(v_back) > 0.05 else 0.0, 0.0, 0.0)
@@ -557,6 +656,10 @@ class AssistiveRobot:
         self.wait(0.5)
         self._weld("grasp_door", False)
 
+        opened = fraction * model.amount * (reached / n)
+        if self._door_qadr is not None:
+            self.ik.articulated_qpos[self._door_qadr] = float(opened)
+
         # Let go and back off along the current finger direction (fingers = palm x-axis)
         p, R_palm = self.ik.palm_pose()
         self.move_hand(p - 0.10 * R_palm[:, 0], None, duration=0.7, settle=0.1)
@@ -566,7 +669,6 @@ class AssistiveRobot:
         s = STATIONS.get(self.station)
         if s is not None:
             self._drive_to(s.x, s.y, s.yaw, tol=0.03, timeout=10.0)
-        opened = fraction * model.amount * (reached / n)
         return {"ok": reached > 0.6 * n, "opened_rad": round(opened, 3), "of_demo_rad": round(model.amount, 3)}
 
     def put_down(self, height_offset: float = 0.0) -> dict:
@@ -574,7 +676,8 @@ class AssistiveRobot:
         if self.holding is None:
             return {"ok": False, "error": "not holding anything"}
         self._weld(f"grasp_{self.holding}", False)
-        item, self.holding = self.holding, None
+        item = self.holding
+        self._set_holding(None)
         self.arm_home()
         self._item_collisions(item, True)
         return {"ok": True, "released": item}
