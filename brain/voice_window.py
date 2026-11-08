@@ -34,6 +34,8 @@ def _jsonable(v):
         return [_jsonable(x) for x in v]
     if isinstance(v, (str, int, float, bool)) or v is None:
         return v
+    if hasattr(v, "item") and hasattr(v, "dtype"):  # numpy scalars (np.bool_, np.float64, ...)
+        return v.item()
     if hasattr(v, "__dataclass_fields__"):
         from dataclasses import asdict
         return _jsonable(asdict(v))
