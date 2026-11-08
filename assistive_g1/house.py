@@ -9,7 +9,9 @@ cameras are exactly his, and we only add:
   * our ArUco items (cup, pill box) and a top marker on his water bottle,
   * a fixed anchor marker on each chest of drawers (his drawer fronts already carry markers
     20-29, which become the moving "part" marker of the articulation demo),
-  * grasp welds (items, drawer fronts) and hand/grasped-object exclusions,
+  * position-only grasp welds for the drawer fronts (the handle grip) and the matching
+    hand/drawer exclusions; items are NOT welded or excluded: the Dex3 fingers (hand.py, added
+    by add_robot_extras) pinch them physically,
   * a room camera that watches the kitchen drawers for the carer demonstration.
 
 Physics: the G1's own Euler integrator, not the house's implicitfast (the GR00T policies
@@ -37,8 +39,9 @@ from sim import house_env as H  # noqa: E402
 from sim.house_env import HouseEnv, DRAWER_UNITS, FURNITURE, ROBOT_START  # noqa: E402
 
 from g1_wbc import ASSET_DIR  # noqa: E402
+from hand import item_contact_params  # noqa: E402
 from scene import (ITEMS, Item, Station, RIGHT_HAND_BODIES, DOOR_MARKER_SIZE, add_robot_extras,  # noqa: E402
-                   _sticker, _box, _look_at_xyaxes, _quat_facing)
+                   grasp_solver_options, _sticker, _box, _look_at_xyaxes, _quat_facing)
 
 G1_XML = ASSET_DIR / "g1" / "g1.xml"
 
@@ -128,6 +131,14 @@ class G1House(HouseEnv):
         super().__init__(robot_xml=str(G1_XML), seed=seed)
         m = self.model
         m.opt.integrator = mujoco.mjtIntegrator.mjINT_EULER
+        grasp_solver_options(m.opt)  # elliptic cones, impratio, Newton: the pinch holds by friction
+        # Grasp contacts on Jack's bottle (his file is untouched: set on the compiled model) and
+        # on our items (set at build time in _attach_robot).
+        for g in range(m.ngeom):
+            if m.body(m.geom_bodyid[g]).name == "waterbottle" and (m.geom_contype[g] or m.geom_conaffinity[g]):
+                m.geom_condim[g] = 4
+                m.geom_friction[g] = [1.2, 0.02, 0.001]
+                m.geom_solref[g] = [0.01, 1.0]
         m.vis.global_.offwidth = max(m.vis.global_.offwidth, 1280)
         m.vis.global_.offheight = max(m.vis.global_.offheight, 720)
         # Collision bits: house geoms 1/1 -> 3/3, so a held item (2/2) still hits furniture but
@@ -166,8 +177,9 @@ class G1House(HouseEnv):
             it = ITEMS[name]
             body = world.add_body(name=name, pos=[0, 0, -3.0 - 0.3 * len(name)])
             body.add_freejoint(name=f"{name}_free")
-            body.add_geom(name=f"{name}_geom", type=mujoco.mjtGeom.mjGEOM_BOX, size=list(it.size),
-                          rgba=list(it.rgba), mass=0.15, contype=3, conaffinity=3, friction=[1.0, 0.01, 0.001])
+            g = body.add_geom(name=f"{name}_geom", type=mujoco.mjtGeom.mjGEOM_BOX, size=list(it.size),
+                              rgba=list(it.rgba), mass=0.15, contype=3, conaffinity=3)
+            item_contact_params(g)
             _sticker(body, spec, it.marker_id, it.marker_size, (0, 0, it.size[2] + 0.001))
 
         # Anchor marker on each chest: on a small stand on the top, near the front-right corner,
@@ -186,11 +198,9 @@ class G1House(HouseEnv):
                            rgba=[0.95, 0.95, 0.95, 1], contype=0, conaffinity=0)
             _sticker(chest, spec, mid, ANCHOR_SIZE, pos, q_tilt, name=f"chest_{unit}_anchor")
 
-        # Grasp welds (inactive until a skill switches them on) and hand exclusions
-        targets = list(ITEM_BODY.values())
-        for name in targets:
-            spec.add_equality(name=f"grasp_{name}", type=mujoco.mjtEq.mjEQ_WELD, name1="right_wrist_yaw_link",
-                              name2=name, objtype=mujoco.mjtObj.mjOBJ_BODY, active=False)
+        # Handle-grip welds for the drawer fronts (inactive until open_articulated switches one
+        # on) and the matching hand/drawer exclusions. Items get neither: the fingers hold them.
+        targets = []
         for un, u in DRAWER_UNITS.items():
             for i in range(u["n"]):
                 b = f"drawer_{un}_{i}"

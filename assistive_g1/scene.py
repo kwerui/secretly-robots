@@ -6,9 +6,11 @@ the origin facing +x.
 
 Collisions: everything collides with everything (robot, furniture, door, items), except
   * torso vs the two shoulder links that sit against its hull at the joint, and
-  * the grasping (right) hand vs items and the door: the hand is a rigid block, so the palm
-    has to be allowed inside what it grasps. The forearm and the rest of the arm still collide.
-Grasping is a weld constraint switched on when the palm reaches the item (see skills.py).
+  * the grasping (right) hand vs the cupboard door (the door grip is still a position-only
+    weld on the bar handle, see skills.open_cupboard).
+Items are grasped physically: the right Dex3 hand has its finger joints enabled (hand.py) and
+pinches the item between thumb and finger pads. There is no hand-item exclusion and no weld in
+the item path. The (inactive) grasp_* welds are kept only for the legacy/fallback mode.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import mujoco
 import numpy as np
 
 from g1_wbc import ASSET_DIR
+from hand import add_dex3_fingers, item_contact_params
 
 MARKER_DICT = cv2.aruco.DICT_4X4_50
 MARKER_DIR = ASSET_DIR / "markers"
@@ -170,12 +173,27 @@ def add_robot_extras(spec: mujoco.MjSpec) -> None:
     # Palm site used as the grasp point (fingers extend along +x of the wrist yaw link).
     for side in ("left", "right"):
         spec.body(f"{side}_wrist_yaw_link").add_site(name=f"{side}_palm", pos=[0.10, 0.0, 0.0], size=[0.012])
+    # The real Dex3 fingers (joints + actuators + pad contacts + the grasp site), see hand.py.
+    add_dex3_fingers(spec, "right")
+
+
+def grasp_solver_options(opt) -> None:
+    """Grasp-friendly contact solver, on an MjSpec.option or a compiled MjOption (MuJoCo docs,
+    "Preventing slip"): elliptic cones with a high friction-to-normal impedance ratio, Newton
+    solver. noslip stays off: it would mask slip instead of modelling it."""
+    opt.cone = mujoco.mjtCone.mjCONE_ELLIPTIC
+    opt.impratio = 10.0
+    opt.solver = mujoco.mjtSolver.mjSOL_NEWTON
+    opt.iterations = 100
+    opt.ls_iterations = 50
 
 
 def build_scene(placement: dict[str, tuple[str, float, float]] | None = None) -> tuple[mujoco.MjModel, mujoco.MjData]:
     placement = placement or DEFAULT_PLACEMENT
     spec = mujoco.MjSpec.from_file(str(ASSET_DIR / "g1" / "g1.xml"))
     spec.option.timestep = 0.002
+    grasp_solver_options(spec.option)
+    spec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST  # for the stiff finger PD
     spec.visual.global_.offwidth = 1280
     spec.visual.global_.offheight = 720
     world = spec.worldbody
@@ -241,8 +259,10 @@ def build_scene(placement: dict[str, tuple[str, float, float]] | None = None) ->
     # right, so a right-handed pull never crosses the body and the open door ends up beside
     # the robot's right shoulder, clear of the opening.
     door = cup_body.add_body(name="cupboard_door", pos=[-w, dpt + 0.012, 0])
+    # A real cabinet hinge has enough friction to stay where it is left; with 0.05 N*m the open
+    # leaf drifted shut whenever the robot's elbow brushed it on the way in.
     door.add_joint(name="door_hinge", type=mujoco.mjtJoint.mjJNT_HINGE, axis=[0, 0, 1],
-                   range=[0, 1.9], damping=0.3, frictionloss=0.05)
+                   range=[0, 1.9], damping=0.3, frictionloss=0.5)
     # panel clears the counter by 5 mm so it swings freely
     _box(door, (w - 0.003, 0.01, h / 2 - 0.008), (w, 0, h / 2), (0.6, 0.45, 0.3, 1), name="door_panel")
     hx = 2 * w - 0.05
@@ -261,18 +281,19 @@ def build_scene(placement: dict[str, tuple[str, float, float]] | None = None) ->
         it = ITEMS[name]
         body = world.add_body(name=name, pos=[x, y, surfaces[surface] + it.size[2] + 0.002])
         body.add_freejoint(name=f"{name}_free")
-        body.add_geom(name=f"{name}_geom", type=mujoco.mjtGeom.mjGEOM_BOX, size=list(it.size), rgba=list(it.rgba),
-                      mass=0.15, contype=3, conaffinity=3, friction=[1.0, 0.01, 0.001])
+        g = body.add_geom(name=f"{name}_geom", type=mujoco.mjtGeom.mjGEOM_BOX, size=list(it.size), rgba=list(it.rgba),
+                          mass=0.15, contype=3, conaffinity=3)
+        item_contact_params(g)
         _sticker(body, spec, it.marker_id, it.marker_size, (0, 0, it.size[2] + 0.001))
         # Weld used for grasping (inactive until the hand closes on the item)
         spec.add_equality(name=f"grasp_{name}", type=mujoco.mjtEq.mjEQ_WELD, name1="right_wrist_yaw_link",
                           name2=name, objtype=mujoco.mjtObj.mjOBJ_BODY, active=False)
     spec.add_equality(name="grasp_door", type=mujoco.mjtEq.mjEQ_WELD, name1="right_wrist_yaw_link",
                       name2="cupboard_door", objtype=mujoco.mjtObj.mjOBJ_BODY, active=False)
-    # The grasping hand may overlap what it grasps (rigid hand): exclude hand vs items and door.
-    for target in list(placement) + ["cupboard_door"]:
-        for hb in RIGHT_HAND_BODIES:
-            spec.add_exclude(bodyname1=hb, bodyname2=target)
+    # The door is still gripped with a position-only weld, so the hand may overlap the handle.
+    # Items are NOT excluded: the fingers must touch them to hold them.
+    for hb in RIGHT_HAND_BODIES:
+        spec.add_exclude(bodyname1=hb, bodyname2="cupboard_door")
 
     model = spec.compile()
     data = mujoco.MjData(model)

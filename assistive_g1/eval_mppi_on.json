@@ -1,0 +1,418 @@
+[
+ {
+  "seed": 0,
+  "placement": {
+   "water_bottle": [
+    1.728,
+    -0.134
+   ],
+   "cup": [
+    -0.028,
+    -2.14
+   ],
+   "pill_box": [
+    0.139,
+    2.025
+   ]
+  },
+  "tasks": {
+   "water_bottle": {
+    "fetched": true,
+    "stage_failed": null,
+    "error": null,
+    "upright": 1.0,
+    "on_side_table": true,
+    "delivered_upright": true
+   },
+   "cup": {
+    "fetched": true,
+    "stage_failed": null,
+    "error": null,
+    "upright": 1.0,
+    "on_side_table": true,
+    "delivered_upright": true
+   }
+  },
+  "grasp_log": [
+   {
+    "item": "water_bottle",
+    "ok": true,
+    "pads": 11,
+    "thumb": true,
+    "fingers": 8,
+    "normal_force_N": 30.5,
+    "opposing": true,
+    "finger_q": [
+     0.01,
+     0.56,
+     -1.06,
+     1.0,
+     0.87,
+     0.87,
+     0.84
+    ],
+    "item_in_hand_before": [
+     0.107,
+     0.075,
+     -0.031
+    ],
+    "lift_err_m": 0.01,
+    "pads_after_lift": 11,
+    "normal_force_after_lift_N": 31.3,
+    "item_in_hand_after": [
+     0.094,
+     0.073,
+     -0.033
+    ],
+    "slip_mm": 0.5
+   },
+   {
+    "item": "cup",
+    "ok": true,
+    "pads": 7,
+    "thumb": true,
+    "fingers": 4,
+    "normal_force_N": 42.1,
+    "opposing": true,
+    "finger_q": [
+     0.01,
+     0.46,
+     -1.07,
+     0.81,
+     0.8,
+     1.1,
+     0.9
+    ],
+    "item_in_hand_before": [
+     0.097,
+     0.076,
+     -0.022
+    ],
+    "lift_err_m": 0.008,
+    "pads_after_lift": 8,
+    "normal_force_after_lift_N": 44.8,
+    "item_in_hand_after": [
+     0.101,
+     0.071,
+     -0.036
+    ],
+    "slip_mm": 0.5
+   }
+  ],
+  "motion": {
+   "ticks": 7807,
+   "joint_acc_rms": 136.87702503989533,
+   "joint_acc_peak": 9970.694922094415,
+   "joint_jerk_rms": 12100.740675740173,
+   "site_speed_max_mps": 4.424698484020012,
+   "site_acc_rms_mps2": 2.8503435039691163,
+   "site_acc_peak_mps2": 138.445549399661
+  },
+  "mppi_plans": 281,
+  "wall_s": 33.7
+ },
+ {
+  "seed": 1,
+  "placement": {
+   "water_bottle": [
+    1.721,
+    -0.093
+   ],
+   "cup": [
+    -0.021,
+    -2.1
+   ],
+   "pill_box": [
+    0.109,
+    1.995
+   ]
+  },
+  "tasks": {
+   "water_bottle": {
+    "fetched": false,
+    "stage_failed": "pick",
+    "error": "could not reach water_bottle (residual 0.418 m)",
+    "upright": 1.0,
+    "on_side_table": false,
+    "delivered_upright": false
+   },
+   "cup": {
+    "fetched": true,
+    "stage_failed": null,
+    "error": null,
+    "upright": 1.0,
+    "on_side_table": true,
+    "delivered_upright": true
+   }
+  },
+  "grasp_log": [
+   {
+    "item": "cup",
+    "ok": true,
+    "pads": 7,
+    "thumb": true,
+    "fingers": 4,
+    "normal_force_N": 32.8,
+    "opposing": true,
+    "finger_q": [
+     0.01,
+     0.51,
+     -1.06,
+     0.83,
+     0.84,
+     1.1,
+     0.9
+    ],
+    "item_in_hand_before": [
+     0.102,
+     0.079,
+     -0.019
+    ],
+    "lift_err_m": 0.01,
+    "pads_after_lift": 6,
+    "normal_force_after_lift_N": 33.2,
+    "item_in_hand_after": [
+     0.101,
+     0.07,
+     -0.034
+    ],
+    "slip_mm": 1.6
+   }
+  ],
+  "motion": {
+   "ticks": 6369,
+   "joint_acc_rms": 144.63084828120944,
+   "joint_acc_peak": 7500.0,
+   "joint_jerk_rms": 12731.295763026916,
+   "site_speed_max_mps": 4.979668668998459,
+   "site_acc_rms_mps2": 2.9225106651159987,
+   "site_acc_peak_mps2": 76.47730524977263
+  },
+  "mppi_plans": 148,
+  "wall_s": 28.1
+ },
+ {
+  "seed": 2,
+  "placement": {
+   "water_bottle": [
+    1.706,
+    -0.132
+   ],
+   "cup": [
+    0.019,
+    -2.14
+   ],
+   "pill_box": [
+    0.126,
+    2.014
+   ]
+  },
+  "tasks": {
+   "water_bottle": {
+    "fetched": true,
+    "stage_failed": null,
+    "error": null,
+    "upright": 1.0,
+    "on_side_table": true,
+    "delivered_upright": true
+   },
+   "cup": {
+    "fetched": true,
+    "stage_failed": null,
+    "error": null,
+    "upright": 1.0,
+    "on_side_table": true,
+    "delivered_upright": true
+   }
+  },
+  "grasp_log": [
+   {
+    "item": "water_bottle",
+    "ok": true,
+    "pads": 11,
+    "thumb": true,
+    "fingers": 8,
+    "normal_force_N": 32.4,
+    "opposing": true,
+    "finger_q": [
+     0.02,
+     0.51,
+     -1.07,
+     0.98,
+     0.85,
+     0.88,
+     0.84
+    ],
+    "item_in_hand_before": [
+     0.108,
+     0.075,
+     -0.031
+    ],
+    "lift_err_m": 0.01,
+    "pads_after_lift": 11,
+    "normal_force_after_lift_N": 32.8,
+    "item_in_hand_after": [
+     0.096,
+     0.076,
+     -0.035
+    ],
+    "slip_mm": 0.4
+   },
+   {
+    "item": "cup",
+    "ok": true,
+    "pads": 7,
+    "thumb": true,
+    "fingers": 4,
+    "normal_force_N": 31.9,
+    "opposing": true,
+    "finger_q": [
+     0.01,
+     0.53,
+     -1.05,
+     0.83,
+     0.85,
+     1.1,
+     0.9
+    ],
+    "item_in_hand_before": [
+     0.104,
+     0.078,
+     -0.022
+    ],
+    "lift_err_m": 0.01,
+    "pads_after_lift": 7,
+    "normal_force_after_lift_N": 32.7,
+    "item_in_hand_after": [
+     0.101,
+     0.07,
+     -0.032
+    ],
+    "slip_mm": 1.5
+   }
+  ],
+  "motion": {
+   "ticks": 7724,
+   "joint_acc_rms": 106.32007350471076,
+   "joint_acc_peak": 3972.428350512353,
+   "joint_jerk_rms": 10149.901728405419,
+   "site_speed_max_mps": 1.1641098282663074,
+   "site_acc_rms_mps2": 1.516813478702837,
+   "site_acc_peak_mps2": 31.804517726797965
+  },
+  "mppi_plans": 269,
+  "wall_s": 31.0
+ },
+ {
+  "seed": 3,
+  "placement": {
+   "water_bottle": [
+    1.695,
+    -0.136
+   ],
+   "cup": [
+    0.018,
+    -2.115
+   ],
+   "pill_box": [
+    0.096,
+    1.996
+   ]
+  },
+  "tasks": {
+   "water_bottle": {
+    "fetched": true,
+    "stage_failed": null,
+    "error": null,
+    "upright": 1.0,
+    "on_side_table": true,
+    "delivered_upright": true
+   },
+   "cup": {
+    "fetched": true,
+    "stage_failed": null,
+    "error": null,
+    "upright": 1.0,
+    "on_side_table": true,
+    "delivered_upright": true
+   }
+  },
+  "grasp_log": [
+   {
+    "item": "water_bottle",
+    "ok": true,
+    "pads": 11,
+    "thumb": true,
+    "fingers": 8,
+    "normal_force_N": 32.4,
+    "opposing": true,
+    "finger_q": [
+     0.02,
+     0.51,
+     -1.07,
+     0.98,
+     0.85,
+     0.87,
+     0.83
+    ],
+    "item_in_hand_before": [
+     0.107,
+     0.075,
+     -0.03
+    ],
+    "lift_err_m": 0.01,
+    "pads_after_lift": 11,
+    "normal_force_after_lift_N": 32.7,
+    "item_in_hand_after": [
+     0.096,
+     0.076,
+     -0.034
+    ],
+    "slip_mm": 0.4
+   },
+   {
+    "item": "cup",
+    "ok": true,
+    "pads": 9,
+    "thumb": true,
+    "fingers": 6,
+    "normal_force_N": 69.8,
+    "opposing": true,
+    "finger_q": [
+     0.01,
+     0.43,
+     -1.06,
+     0.82,
+     0.74,
+     1.1,
+     0.9
+    ],
+    "item_in_hand_before": [
+     0.1,
+     0.076,
+     -0.02
+    ],
+    "lift_err_m": 0.011,
+    "pads_after_lift": 9,
+    "normal_force_after_lift_N": 49.1,
+    "item_in_hand_after": [
+     0.105,
+     0.072,
+     -0.033
+    ],
+    "slip_mm": 0.3
+   }
+  ],
+  "motion": {
+   "ticks": 7849,
+   "joint_acc_rms": 118.69324113593005,
+   "joint_acc_peak": 9727.260120532605,
+   "joint_jerk_rms": 10200.964242437643,
+   "site_speed_max_mps": 3.4415227892388094,
+   "site_acc_rms_mps2": 2.6960470665247116,
+   "site_acc_peak_mps2": 94.86441441996384
+  },
+  "mppi_plans": 280,
+  "wall_s": 33.7
+ }
+]

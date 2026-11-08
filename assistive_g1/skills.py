@@ -7,13 +7,16 @@ used for the robot's own base pose (localisation is out of scope for the hackath
 
 from __future__ import annotations
 
+import os
 from typing import Callable
 
 import mujoco
 import numpy as np
 
 from g1_wbc import G1WBC, ARM_HOME, SIM_DT
+from hand import Gripper, Q_RELEASE
 from ik import ArmIK
+from mppi import ArmMPPI, MotionLog
 from nav import Navigator
 from perception import HeadCamera, MarkerPose, ID_TO_ITEM
 from articulation import ArticulationModel, rot_axis_angle
@@ -63,13 +66,27 @@ class AssistiveRobot:
 
         self.id_to_item = {it.marker_id: name for name, it in self.items.items()}
         self.wbc = G1WBC(self.model, self.data)
+        self.grip = Gripper(self.model, self.data, "right")
+        # Two IK views of the same arm: the palm site (door handle, generic moves) and the grasp
+        # site between thumb and finger pads (everything that touches an item).
         self.ik = ArmIK(self.model, self.data, "right", extra_graspable=extra_graspable)
+        self.ik_item = ArmIK(self.model, self.data, "right", extra_graspable=extra_graspable, site="right_grasp")
+        # Sampling-based MPC for the transport motions (ARM_MPPI=0 falls back to IK tracking
+        # of a Cartesian smoothstep everywhere, for A/B comparison).
+        self.use_mppi = os.environ.get("ARM_MPPI", "1") != "0"
+        self.mppi = ArmMPPI(self.ik_item)
+        self.mppi_palm = ArmMPPI(self.ik)
+        self.motion = MotionLog(CONTROL_DT)  # arm command history -> smoothness metrics
         self.cam = HeadCamera(self.model, self.data, extra_sizes=extra_sizes, labels=labels)
         self.nav = Navigator()
         self.on_frame = on_frame  # called every CONTROL_DT, e.g. to record video
         self.holding: str | None = None
         self.hold_vert = (2, np.array([0, 0, 1.0]))  # palm axis kept fixed while holding
-        self.hold_mode, self.hold_dz = "side", 0.0  # grasp type and palm height above item centre
+        self.hold_mode, self.hold_dz = "side", 0.0  # grasp type and grasp-site height above item centre
+        self.hold_rel = np.zeros(3)  # item centre in the hand frame at the moment of the grasp
+        self.hold_item_axis = np.array([0, 0, 1.0])  # hand-frame direction that is the item's "up" ("pitched" holds)
+        self.planned_q = (ARM_HOME[7:].copy(), ARM_HOME[7:].copy())  # (pre-grasp, grasp) joints from _choose
+        self.grasp_log: list[dict] = []  # per-grasp contact evidence (forces, pads) for the pitch
         self.placed: list[np.ndarray] = []  # where this robot has set things down (side table)
         self.station = "home"
         self.arm_cmd = ARM_HOME[7:].copy()
@@ -81,6 +98,7 @@ class AssistiveRobot:
     # ------------------------------------------------------------------ basics
     def _tick(self) -> None:
         self.wbc.step(int(round(CONTROL_DT / SIM_DT)))
+        self.motion.add(self.arm_cmd, self.data.site_xpos[self.ik_item.site])
         if self.on_frame is not None:
             self.on_frame(self)
 
@@ -143,7 +161,14 @@ class AssistiveRobot:
                 self._drive_to(*HUB, None, tol=0.25, pass_through=True)
                 if self.wbc.fallen():
                     return {"ok": False, "error": "fell over"}
-        ok = self._drive_to(s.x, s.y, s.yaw)
+        # Walk more gently with something in the hand: the gait sway is what works a pinch loose.
+        v0, w0 = self.nav.p.v_max, self.nav.p.w_max
+        if self.holding is not None:
+            self.nav.p.v_max, self.nav.p.w_max = min(v0, 0.30), min(w0, 0.7)
+        try:
+            ok = self._drive_to(s.x, s.y, s.yaw)
+        finally:
+            self.nav.p.v_max, self.nav.p.w_max = v0, w0
         if ok:
             self.station = station
         out = {"ok": ok, "station": station, "pose": self.wbc.base_pos.round(2).tolist()}
@@ -196,19 +221,66 @@ class AssistiveRobot:
         cv2.imwrite(str(path), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
 
     # ------------------------------------------------------------------ arm
-    def move_hand(self, target: np.ndarray, axes=None, duration: float = 1.0, settle: float = 0.3) -> float:
-        """Interpolate the palm to `target` (world) and track it with IK. Returns final error (m)."""
-        start, _ = self.ik.palm_pose()
+    def move_hand(self, target: np.ndarray, axes=None, duration: float = 1.0, settle: float = 0.3,
+                  ik: ArmIK | None = None, smooth: bool = False, posture_weight: float = 0.02) -> float:
+        """Move the control site to `target` (world). Returns the final position error (m).
+
+        ik: which site to control, self.ik (palm) by default or self.ik_item (grasp point).
+        smooth: transport motion -> MPPI (receding-horizon, collision-aware, smooth joint
+            profiles), with `duration` as a time budget, followed by a short IK settle.
+            Otherwise (precise approach, placement) the site follows a Cartesian smoothstep
+            tracked by the damped-least-squares IK every tick.
+        """
+        ik = ik or self.ik
+        target = np.asarray(target, float)
+        if smooth and self.use_mppi:
+            # Moving reference along the straight line (smoothstep timing, as before); MPPI
+            # tracks it over its horizon, so the pace is the same as the IK version and the
+            # planner's freedom goes into smoothness and clearance.
+            mp = self.mppi if ik is self.ik_item else self.mppi_palm
+            mp.reset()
+            # while transporting, items (and the door) are obstacles for the whole hand too
+            ik.hand_may_touch_graspables = False
+            start, _ = ik.palm_pose()
+            n = max(1, int(duration / CONTROL_DT))
+
+            def ref_at(step: int) -> np.ndarray:
+                a = min(1.0, step / n)
+                a = a * a * (3 - 2 * a)
+                return (1 - a) * start + a * target
+
+            n_max = n + int(0.4 * duration / CONTROL_DT)
+            q_ik = self.arm_cmd.copy()
+            for k in range(n_max):
+                ref = np.array([ref_at(k + 1 + h) for h in range(mp.p.H)])
+                # one-step IK towards the next reference point = the nominal the sampler is
+                # centred on; MPPI then trades tracking against smoothness and clearance
+                q_ik, _ = ik.solve(ref[0], axes, q_init=q_ik, iters=10)
+                u_nom = (q_ik - self.arm_cmd) / CONTROL_DT
+                q = mp.plan(self.arm_cmd, ref, axes, u_nom=u_nom)
+                self._set_right_arm(q)
+                self._tick()
+                if k >= n and np.linalg.norm(ik.palm_pose()[0] - target) < 0.015:
+                    break
+            q = self.arm_cmd.copy()
+            for _ in range(int(settle / CONTROL_DT)):
+                q, _ = ik.solve(target, axes, q_init=q, iters=15)
+                self._set_right_arm(q)
+                self._tick()
+            ik.hand_may_touch_graspables = True
+            p, _ = ik.palm_pose()
+            return float(np.linalg.norm(p - target))
+        start, _ = ik.palm_pose()
         n = max(1, int(duration / CONTROL_DT))
         q = self.arm_cmd.copy()
         for k in range(1, n + int(settle / CONTROL_DT) + 1):
             a = min(1.0, k / n)
             a = a * a * (3 - 2 * a)  # smoothstep
-            goal = (1 - a) * start + a * np.asarray(target)
-            q, _ = self.ik.solve(goal, axes, q_init=q, iters=15)
+            goal = (1 - a) * start + a * target
+            q, _ = ik.solve(goal, axes, q_init=q, iters=15, posture_weight=posture_weight)
             self._set_right_arm(q)
             self._tick()
-        p, _ = self.ik.palm_pose()
+        p, _ = ik.palm_pose()
         return float(np.linalg.norm(p - target))
 
     def arm_home(self, duration: float = 1.0) -> None:
@@ -219,18 +291,15 @@ class AssistiveRobot:
             self._set_right_arm((1 - a) * q0 + a * ARM_HOME[7:])
             self._tick()
 
-    def _item_collisions(self, item: str, with_robot: bool) -> None:
-        """Held items collide with furniture and other items but not with the robot (the arm
-        overlaps what it holds); robot contact is restored once the arm has retracted."""
-        bname = self.item_body.get(item, item)
-        b = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, bname)
-        if b < 0:
-            return
-        for g in range(self.model.body_geomadr[b], self.model.body_geomadr[b] + self.model.body_geomnum[b]):
-            if self.model.geom_contype[g] == 0 and self.model.geom_conaffinity[g] == 0:
-                continue
-            self.model.geom_contype[g] = 3 if with_robot else 2
-            self.model.geom_conaffinity[g] = 3 if with_robot else 2
+    def _body(self, item: str) -> str:
+        """MuJoCo body name of an item (the house uses Jack's body names, e.g. "waterbottle")."""
+        return self.item_body.get(item, item)
+
+    def _set_held(self, item: str | None) -> None:
+        """Tell both IK views which body rides in the hand (ignored as an obstacle while held)."""
+        b = None if item is None else mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, self._body(item))
+        self.ik.held_body = b
+        self.ik_item.held_body = b
 
     def _weld(self, name: str, on: bool, torquescale: float = 1.0) -> None:
         """Switch a grasp weld on/off without anything jumping.
@@ -260,7 +329,14 @@ class AssistiveRobot:
 
     # ------------------------------------------------------------------ manipulation
     def pick(self, item: str, from_above: bool = False) -> dict:
-        """Grasp an item seen by the head camera at the current station (side or from_above)."""
+        """Grasp an item seen by the head camera at the current station (side or from_above).
+
+        Physical grasp: the open hand (thumb swung back, fingers forward) is brought in along the
+        robot's heading so the item sits between thumb and finger pads, the fingers close under
+        position control until the hardware torque limit, the contacts are checked (thumb AND a
+        finger, opposing, with a minimum normal force), then the item is lifted and the hold is
+        verified before the arm retracts. No constraint is used: the item is held by friction.
+        """
         it = self.items.get(item)
         if it is None:
             return {"ok": False, "error": f"unknown item {item}"}
@@ -274,144 +350,265 @@ class AssistiveRobot:
             return self._pick_low(item, top, centre)
         if from_above:
             return self._pick_from_above(item, top, centre)
-        grasp = centre + np.array([0, 0, 0.3 * it.size[2]])
+        # Grasp point = where the pinch centre should be: a little above the item's centre so the
+        # fingers (which hang ~4.5 cm below the pinch axis) stay clear of the surface.
+        grasp = centre + np.array([0, 0, max(0.3 * it.size[2], 0.045 - it.size[2] + 0.012)])
+        grasp[2] = min(grasp[2], top[2] - 0.015)
 
+        self.grip.open()
         base = self.wbc.base_pos
         # Raise the hand to chest height, close to the body, before anything else so it can't
         # catch under a table edge while lifting or stepping in.
         self._raise_hand(grasp[2] + 0.06, toward=grasp)
-        # Line up so the item is straight ahead of the right shoulder at STANDOFF, keeping the
-        # heading (facing the furniture). The hand then goes in and comes out perpendicular to
-        # the furniture: a diagonal path drags the item along a cupboard's side wall.
-        th = self.wbc.base_yaw
+        # Line up so the item is straight ahead of the right shoulder at STANDOFF, facing the
+        # furniture squarely (the station's heading, not whatever heading the last walk ended
+        # with: after opening the cupboard the robot can be 10-15 deg skewed, and a diagonal
+        # entry into the cupboard is out of the arm's reach / drags the item along a side wall).
+        # If the stance is blocked (typically by the open cupboard door beside the right leg) or
+        # the grasp is not reachable from it, try again standing a little further left.
+        th = self.stations[self.station].yaw if self.station in self.stations else self.wbc.base_yaw
         fwd2 = np.array([np.cos(th), np.sin(th)])
         left2 = np.array([-np.sin(th), np.cos(th)])
-        goal = grasp[:2] - STANDOFF * fwd2 + GRASP_LATERAL * left2  # pelvis left of the item
-        if np.linalg.norm(goal - base[:2]) > 0.03:
-            self._drive_to(goal[0], goal[1], th, tol=0.025, timeout=8.0)
-            base = self.wbc.base_pos
-        th = self.wbc.base_yaw
-        approach = np.array([np.cos(th), np.sin(th), 0.0])
-        reach = float((grasp - base)[:2] @ approach[:2])
-        # Pre-grasp back along the approach, but never closer than ~0.27 m to the pelvis:
-        # nearer than that the arm would have to fold into the torso.
-        back = float(np.clip(reach - 0.27, 0.06, 0.14))
-        pre = grasp - back * approach + np.array([0, 0, 0.04])
-
-        # Choose a posture (lean/crouch via the GR00T torso and height commands) and a wrist
-        # roll that reach both poses without touching furniture or the torso.
         up = np.array([0, 0, 1.0])
-        candidates = [
-            [(0, approach, 0.6), (2, up, 0.4)],
-            [(0, approach, 0.6), (1, up, 0.4)],
-            [(0, approach, 0.6), (1, -up, 0.4)],
-            [(0, approach, 0.6), (2, -up, 0.4)],
-        ]
-        axes, best = self._choose(pre, grasp, candidates, POSTURES)
+        axes, best = None, np.inf
+        for attempt, lateral in enumerate((GRASP_LATERAL, GRASP_LATERAL + 0.07, GRASP_LATERAL - 0.05)):
+            goal = grasp[:2] - STANDOFF * fwd2 + lateral * left2  # pelvis left of the item
+            if attempt and self.station in self.stations:  # unstick: back to the station first
+                st = self.stations[self.station]
+                self._drive_to(st.x, st.y, st.yaw, tol=0.04, timeout=6.0)
+            if np.linalg.norm(goal - base[:2]) > 0.03 or abs(wrap(self.wbc.base_yaw - th)) > 0.06:
+                self._drive_to(goal[0], goal[1], th, tol=0.025, timeout=8.0)
+                base = self.wbc.base_pos
+            th_now = self.wbc.base_yaw
+            approach = np.array([np.cos(th_now), np.sin(th_now), 0.0])
+            reach = float((grasp - base)[:2] @ approach[:2])
+            # Pre-grasp back along the approach, but never closer than ~0.27 m to the pelvis:
+            # nearer than that the arm would have to fold into the torso.
+            back = float(np.clip(reach - 0.27, 0.06, 0.14))
+            pre = grasp - back * approach + np.array([0, 0, 0.03])
+            # Fingers along the approach, pinch axis horizontal: hand z up (thumb on the body side
+            # of the item) or down (thumb on the outside), whichever the arm reaches without
+            # touching furniture or the torso.
+            candidates = [
+                [(0, approach, 0.6), (2, up, 0.4)],
+                [(0, approach, 0.6), (2, -up, 0.4)],
+            ]
+            axes, best = self._choose(pre, grasp, candidates, POSTURES, ik=self.ik_item)
+            if best <= 0.05:
+                break
         if best > 0.05:
             self._set_posture(0.74, 0.0)
             return {"ok": False, "error": f"no collision-free grasp for {item} from here (score {best:.3f})"}
 
         # Come in along the approach line: far pre-grasp (outside any cupboard), pre-grasp, grasp.
-        self.move_hand(grasp - (back + 0.10) * approach + np.array([0, 0, 0.04]), axes, duration=1.0, settle=0.1)
-        e1 = self.move_hand(pre, axes, duration=0.7)
-        e2 = self.move_hand(grasp, axes, duration=0.9)
+        self.move_hand(grasp - (back + 0.10) * approach + np.array([0, 0, 0.03]), axes, duration=1.0, settle=0.1,
+                       ik=self.ik_item)
+        e1 = self.move_hand(pre, axes, duration=0.7, ik=self.ik_item)
+        e2 = self.move_hand(grasp, axes, duration=0.9, settle=0.4, ik=self.ik_item)
         if e2 > 0.04:
-            self.move_hand(pre, axes, duration=0.8)
+            self.move_hand(pre, axes, duration=0.8, ik=self.ik_item)
             self.arm_home()
             self._set_posture(0.74, 0.0)
             return {"ok": False, "error": f"could not reach {item} (residual {e2:.3f} m)", "pre_err": round(e1, 3)}
-        bname = self.item_body[item]
-        self._weld(f"grasp_{bname}", True)
-        self._item_collisions(item, False)
-        self.holding = item
-        # The weld fixes the item to the hand, so the item stays upright iff this palm axis
-        # keeps the world direction it had at the grasp. Record it as measured, not as asked.
-        _, R_palm = self.ik.palm_pose()
-        idx = axes[1][0] if len(axes) > 1 else 2
-        self.hold_vert = (idx, R_palm[:, idx].copy())
+        res = self._close_and_lift(item, axes, lift=np.array([0, 0, 0.05]), ik=self.ik_item)
+        if not res["ok"]:
+            self.move_hand(pre, axes, duration=0.8, ik=self.ik_item)
+            self.arm_home()
+            self._set_posture(0.74, 0.0)
+            return {**res, "pre_err": round(e1, 3)}
+        # The item is held by friction; it stays upright iff this hand axis keeps the world
+        # direction it had at the grasp. Record it as measured, not as asked.
+        _, R_hand = self.ik_item.palm_pose()
+        idx = axes[1][0]
+        self.hold_vert = (idx, R_hand[:, idx].copy())
         self.hold_mode, self.hold_dz = "side", grasp[2] - centre[2]
-        self.move_hand(grasp + np.array([0, 0, 0.04]), axes, duration=0.6, settle=0.0)
-        self.move_hand(grasp - (back + 0.10) * approach + np.array([0, 0, 0.05]), axes, duration=0.9, settle=0.0)
+        self.move_hand(grasp - (back + 0.10) * approach + np.array([0, 0, 0.06]), self._hold_axes(approach),
+                       duration=1.0, settle=0.0, ik=self.ik_item)
         # Step back with the arm frozen: pulls the item straight out of a cupboard / off the
         # table before the carry motion swings it sideways (it would snag on the frame).
         self._step_back(STEP_BACK)
+        if not self.holding_ok():
+            return self._lost(item, "slipped out while stepping back")
         self.carry()
-        return {"ok": True, "item": item, "grasp_error_m": round(e2, 4)}
+        return {"ok": True, "item": item, "grasp_error_m": round(e2, 4), **res["grasp"]}
+
+    def _close_and_lift(self, item: str, axes, lift: np.ndarray, ik: ArmIK, min_force: float = 4.0,
+                        close_time: float = 0.6, settle_time: float = 0.4) -> dict:
+        """Close the fingers on `item` where the hand is, verify the pinch, lift and re-verify."""
+        q_hold = self.arm_cmd.copy()
+        b = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, self._body(item))
+        R_hand = self.data.xmat[self.grip.palm_body].reshape(3, 3)
+        item_in_hand = (R_hand.T @ (self.data.xpos[b] - self.data.xpos[self.grip.palm_body])).round(3).tolist()
+        n = int(close_time / CONTROL_DT)
+        for k in range(1, n + 1):
+            self.grip.blend(k / n)
+            self._set_right_arm(q_hold)
+            self._tick()
+        for _ in range(int(settle_time / CONTROL_DT)):
+            self._set_right_arm(q_hold)
+            self._tick()
+        c = self.grip.contacts(self._body(item))
+        evidence = {"pads": c.n_pads, "thumb": c.thumb, "fingers": c.fingers, "normal_force_N": round(c.normal_force, 1),
+                    "opposing": c.opposing, "finger_q": self.grip.q.round(2).tolist(), "item_in_hand_before": item_in_hand}
+        if not c.opposing or c.normal_force < min_force:
+            self.grip.open()
+            self.wait(0.3)
+            self.grasp_log.append({"item": item, "ok": False, **evidence})
+            return {"ok": False, "error": f"fingers closed but no stable pinch on {item}", "grasp": evidence}
+        self.holding = item
+        self._set_held(item)
+        self.hold_rel = self._item_in_hand(item)  # reference for slip detection
+        p, _ = ik.palm_pose()
+        e = self.move_hand(p + lift, axes, duration=0.7, settle=0.3, ik=ik)
+        c2 = self.grip.contacts(self._body(item))
+        evidence.update({"lift_err_m": round(e, 3), "pads_after_lift": c2.n_pads,
+                         "normal_force_after_lift_N": round(c2.normal_force, 1),
+                         "item_in_hand_after": self._item_in_hand(item).round(3).tolist(),
+                         "slip_mm": round(1000 * self.slip(), 1)})
+        if not self.holding_ok(0.03) or not c2.opposing:
+            self.grasp_log.append({"item": item, "ok": False, **evidence})
+            return self._lost(item, "slipped during the lift", evidence)
+        self.grasp_log.append({"item": item, "ok": True, **evidence})
+        return {"ok": True, "grasp": evidence}
+
+    def _lost(self, item: str, why: str, evidence: dict | None = None) -> dict:
+        self.grip.open()
+        self.holding = None
+        self._set_held(None)
+        self.wait(0.3)
+        out = {"ok": False, "error": f"lost the {item}: {why}"}
+        if evidence:
+            out["grasp"] = evidence
+        return out
 
     def _pick_from_above(self, item: str, top: np.ndarray, centre: np.ndarray) -> dict:
-        """Top-down grasp from above (e.g. picking an item standing inside an open drawer)."""
+        """Pinch an item standing inside an open drawer (or on a surface the side approach can't
+        reach), coming from above.
+
+        Physical version: the fingers point down and forward at ~45 deg (straight down, the
+        fingertips reach 11 cm past the pinch and hit the drawer floor; pitched, 8 cm), the pinch
+        axis stays horizontal, and the pinch sits a few cm above the item's centre so the item is
+        held near the palm (a pinch near the fingertips squeezes a tall item out along the
+        fingers, see the floor pick). Hold verification as in the side grasp.
+        """
         it = self.items[item]
-        grasp = top - np.array([0, 0, min(0.025, 0.4 * it.size[2])])
         base = self.wbc.base_pos
+        self.grip.open()
         self._raise_hand(top[2] + 0.14, toward=top)
-        th = self.wbc.base_yaw
+        th = self.stations[self.station].yaw if self.station in self.stations else self.wbc.base_yaw
         fwd2 = np.array([np.cos(th), np.sin(th)])
         left2 = np.array([-np.sin(th), np.cos(th)])
-        goal = grasp[:2] - STANDOFF * fwd2 + GRASP_LATERAL * left2
-        if np.linalg.norm(goal - base[:2]) > 0.03:
+        # Stand a little further back than for a side grasp: the arm comes down from above.
+        goal = centre[:2] - (STANDOFF + 0.05) * fwd2 + GRASP_LATERAL * left2
+        if np.linalg.norm(goal - base[:2]) > 0.03 or abs(wrap(self.wbc.base_yaw - th)) > 0.06:
             self._drive_to(goal[0], goal[1], th, tol=0.025, timeout=8.0)
             det2 = self.cam.detect()
             if it.marker_id in det2:
                 top = det2[it.marker_id].position
                 centre = top - np.array([0, 0, it.size[2] + 0.001])
-                grasp = top - np.array([0, 0, min(0.025, 0.4 * it.size[2])])
         th = self.wbc.base_yaw
-        approach = np.array([np.cos(th), np.sin(th), 0.0])
+        fwd = np.array([np.cos(th), np.sin(th), 0.0])
+        left = np.array([-np.sin(th), np.cos(th), 0.0])
         up = np.array([0, 0, 1.0])
+        grasp = centre + np.array([0, 0, min(0.04, 0.4 * it.size[2])])
+        grasp[2] = min(grasp[2], top[2] - 0.03)
         pre = grasp + np.array([0, 0, 0.14])
-        candidates = [
-            [(0, approach, 0.6), (2, up, 0.4)],
-            [(0, approach, 0.6), (1, up, 0.4)],
-            [(0, approach, 0.6), (1, -up, 0.4)],
-            [(0, approach, 0.6), (2, -up, 0.4)],
-            [(0, -up, 0.6), (1, approach, 0.3)],
-            [(0, -up, 0.6), (2, approach, 0.3)],
-        ]
-        axes, best = self._choose(pre, grasp, candidates, POSTURES)
+
+        def pitched(deg):  # finger direction: down, tilted forward by `deg` (0 = straight down)
+            a = np.deg2rad(deg)
+            return -up * np.cos(a) + fwd * np.sin(a)
+
+        # Steep first: inside a drawer the forearm must clear the drawer front, which a flatter
+        # hand cannot (the planner's IK finds a pose, the descent then stalls on the front).
+        candidates = [[(0, pitched(20), 0.7), (1, -left, 0.7)], [(0, pitched(20), 0.7), (1, left, 0.7)],
+                      [(0, pitched(20), 0.7), (1, fwd, 0.7)], [(0, pitched(35), 0.7), (1, -left, 0.7)],
+                      [(0, pitched(35), 0.7), (1, left, 0.7)], [(0, pitched(50), 0.7), (1, -left, 0.7)],
+                      [(0, pitched(50), 0.7), (1, fwd, 0.7)]]
+        axes, best = self._choose(pre, grasp, candidates, POSTURES, ik=self.ik_item)
         if best > 0.05:
             self._set_posture(0.74, 0.0)
             self.arm_home()
             return {"ok": False, "error": f"no collision-free top grasp for {item} (score {best:.3f})"}
 
-        self.move_hand(pre + np.array([0, 0, 0.05]), axes, duration=1.0, settle=0.1)
-        e1 = self.move_hand(pre, axes, duration=0.6)
-        e2 = self.move_hand(grasp, axes, duration=0.9)
-        if e2 > 0.04:
-            self.move_hand(pre, axes, duration=0.7)
+        self.move_hand(pre + np.array([0, 0, 0.05]), axes, duration=1.0, settle=0.1, ik=self.ik_item)
+        e1 = self.move_hand(pre, axes, duration=0.6, ik=self.ik_item)
+        # The descent runs between the drawer front and the item with the collision rows active,
+        # which costs orientation: hold the pinch axis and finger direction hard on the way down
+        # and settle longer, then check the pinch axis really is horizontal before closing (a
+        # rolled hand pinches the item off-centre and the hold does not survive the walk).
+        firm = [(i, v, 1.2) for i, v, _ in axes]
+        home0 = self.ik_item.home
+        self.ik_item.home = self.planned_q[1]  # null space -> the configuration the planner verified
+        try:
+            e2 = self.move_hand(grasp, firm, duration=1.2, settle=0.6, ik=self.ik_item, posture_weight=0.15)
+        finally:
+            self.ik_item.home = home0
+        _, R_now = self.ik_item.palm_pose()
+        roll = float(abs(R_now[2, 1]))  # vertical component of the pinch axis
+        if roll > 0.2 or e2 > 0.025:
+            # The tracked descent settled in a rolled configuration; the planner's own solution
+            # for this point is collision-free and level, so finish with a short joint-space move
+            # to it (re-solved from the planned joints, with the current body pose).
+            q_goal, e_goal = self.ik_item.solve(grasp, firm, q_init=self.planned_q[1], iters=200)
+            if os.environ.get("ASSISTIVE_DEBUG"):
+                print(f"   from-above finish: e_goal {e_goal:.3f} hits {self.ik_item.collisions(q_goal)} "
+                      f"axis_err {self.ik_item.axis_error(q_goal, firm):.2f} planned axis_err {self.ik_item.axis_error(self.planned_q[1], firm):.2f}")
+            if e_goal < 0.02 and not self.ik_item.collisions(q_goal):
+                q0 = self.arm_cmd.copy()
+                n = int(0.6 / CONTROL_DT)
+                for k in range(1, n + 1):
+                    self._set_right_arm((1 - k / n) * q0 + (k / n) * q_goal)
+                    self._tick()
+                e2 = self.move_hand(grasp, firm, duration=0.3, settle=0.3, ik=self.ik_item, posture_weight=0.15)
+                _, R_now = self.ik_item.palm_pose()
+                roll = float(abs(R_now[2, 1]))
+        # (a pinch axis up to ~35 deg off horizontal still forms a usable pinch on a tall item;
+        # beyond that the item ends up between the fingertips and falls out on the walk)
+        if e2 > 0.04 or roll > 0.6:
+            self.move_hand(pre, axes, duration=0.7, ik=self.ik_item)
             self.arm_home()
             self._set_posture(0.74, 0.0)
-            return {"ok": False, "error": f"could not reach {item} from above (residual {e2:.3f} m)", "pre_err": round(e1, 3)}
-        bname = self.item_body[item]
-        self._weld(f"grasp_{bname}", True)
-        self._item_collisions(item, False)
-        self.holding = item
-        _, R_palm = self.ik.palm_pose()
-        if np.allclose(axes[0][1], -up):
-            self.hold_vert = (0, R_palm[:, 0].copy())
-            self.hold_mode = "top"
-        else:
-            idx = axes[1][0] if len(axes) > 1 else 2
-            self.hold_vert = (idx, R_palm[:, idx].copy())
-            self.hold_mode = "side"
-        self.hold_dz = float(grasp[2] - centre[2])
-        self.move_hand(grasp + np.array([0, 0, 0.18]), axes, duration=0.9, settle=0.0)
+            why = f"residual {e2:.3f} m" if e2 > 0.04 else f"pinch axis {np.degrees(np.arcsin(roll)):.0f} deg off horizontal"
+            return {"ok": False, "error": f"could not reach {item} from above ({why})", "pre_err": round(e1, 3)}
+        res = self._close_and_lift(item, axes, lift=np.array([0, 0, 0.06]), ik=self.ik_item)
+        if not res["ok"]:
+            self.move_hand(pre, axes, duration=0.7, ik=self.ik_item)
+            self.arm_home()
+            self._set_posture(0.74, 0.0)
+            return {**res, "pre_err": round(e1, 3)}
+        # Keep the ITEM's own axis vertical while carrying and placing (a pitched pinch has no
+        # principal hand axis to lock, so the IK gets the direction itself). The item can pivot
+        # about the pinch axis during the lift, so its axis is read from its pose in the hand now
+        # and refreshed before the carry and before placing.
+        self.hold_mode, self.hold_dz = "pitched", float(grasp[2] - centre[2])
+        self._refresh_hold_axis()
+        # Up and out of the drawer with the hand orientation frozen as grasped (levelling the
+        # item while still between the drawer walls knocks it out of the pinch); the carry pose
+        # after the step back is where the item is brought upright.
+        self.move_hand(grasp + np.array([0, 0, 0.20]), firm, duration=1.0, settle=0.1, ik=self.ik_item)
         self._step_back(STEP_BACK)
+        if not self.holding_ok():
+            return self._lost(item, "slipped out while stepping back")
         self.carry()
-        return {"ok": True, "item": item, "grasp_error_m": round(e2, 4), "from": "above"}
+        return {"ok": True, "item": item, "grasp_error_m": round(e2, 4), "from": "above", **res["grasp"]}
 
-    def _choose(self, pre, grasp, candidates, postures):
+    def _choose(self, pre, grasp, candidates, postures, ik: ArmIK | None = None):
         """Try postures in order; return the hand-axis candidate with the best collision-free IK."""
+        ik = ik or self.ik
         axes, best = None, None
         for height, pitch in postures:
             self._set_posture(height, pitch)
             for cand in candidates:
-                q_pre, e_pre = self.ik.solve(pre, cand, q_init=self.arm_cmd, iters=200)
-                q_g, e_g = self.ik.solve(grasp, cand, q_init=q_pre, iters=200)
-                hits = self.ik.collisions(q_pre) + self.ik.collisions(q_g)
-                score = e_pre + e_g + 0.1 * len(hits)
+                q_pre, e_pre = ik.solve(pre, cand, q_init=self.arm_cmd, iters=200)
+                q_g, e_g = ik.solve(grasp, cand, q_init=q_pre, iters=200)
+                hits = ik.collisions(q_pre) + ik.collisions(q_g)
+                # orientation residual at the grasp (the axis targets are soft in the IK; a plan
+                # that only reaches the point with the hand rolled is not a plan for a pinch)
+                o_err = ik.axis_error(q_g, cand)
+                score = e_pre + e_g + 0.1 * len(hits) + 0.08 * o_err
                 if best is None or score < best:
                     axes, best = cand, score
+                    self.planned_q = (q_pre.copy(), q_g.copy())  # the arm configuration the plan assumes
             if best <= 0.03:
                 break
         return axes, best
@@ -432,41 +629,80 @@ class AssistiveRobot:
         goal = top[:2] - 0.20 * fwd[:2] + 0.25 * left[:2]
         self._raise_hand(base[2] + 0.05)
         self._drive_to(goal[0], goal[1], yaw, tol=0.025, timeout=12.0)
-        # re-detect from the new stance (closer = more accurate)
-        det = self.cam.detect()
-        if it.marker_id in det:
-            top = det[it.marker_id].position
-            centre = top - np.array([0, 0, it.size[2] + 0.001])
-        grasp = top - np.array([0, 0, min(0.03, it.size[2])])  # palm just below the top
+        # Re-detect from the new stance (closer = more accurate; the first fix from 1.3 m away is
+        # 3-4 cm off, more than the pinch tolerates). The item is now almost under the camera, so
+        # lean forward until it comes into view.
+        for pitch in (0.6, 0.45, 0.7):
+            self._set_posture(0.74, pitch)
+            det = self.cam.detect()
+            if it.marker_id in det:
+                top = det[it.marker_id].position
+                centre = top - np.array([0, 0, it.size[2] + 0.001])
+                break
+        # Pinch centre a little above the item's centre, with the fingers pointing down AND forward
+        # (~45 deg): the fingertips reach ~11 cm past the pinch, so straight down they would hit the
+        # floor; angled, they clear it, and the pinch still cages the item near the palm, which is
+        # where it stays put under gravity (a pinch near the fingertips lets it slide out).
+        grasp = centre + np.array([0, 0, min(0.03, 0.4 * it.size[2])])
+        grasp[2] = max(grasp[2], 0.12)  # fingertips (~8 cm below the pinch at 45 deg) stay off the floor
         pre = grasp + np.array([0, 0, 0.12])
         up = np.array([0, 0, 1.0])
-        candidates = [[(0, -up, 0.6), (1, fwd, 0.3)], [(0, -up, 0.6), (1, left, 0.3)], [(0, -up, 0.6)]]
-        axes, best = self._choose(pre, grasp, candidates, LOW_POSTURES)
+
+        def pitched(deg):  # finger direction: down, tilted forward by `deg`
+            a = np.deg2rad(deg)
+            return -up * np.cos(a) + fwd * np.sin(a)
+
+        # The pinch axis (hand y) must really be horizontal, or the thumb side dips into the item
+        # on the way down: weight it as strongly as the finger direction.
+        candidates = [[(0, pitched(45), 0.7), (1, -fwd, 0.7)], [(0, pitched(45), 0.7), (1, fwd, 0.7)],
+                      [(0, pitched(35), 0.7), (1, -fwd, 0.7)], [(0, pitched(35), 0.7), (1, left, 0.7)],
+                      [(0, pitched(45), 0.7), (1, left, 0.7)], [(0, pitched(55), 0.7), (1, -fwd, 0.7)]]
+        self.grip.open()
+        axes, best = self._choose(pre, grasp, candidates, LOW_POSTURES, ik=self.ik_item)
         if best > 0.05:
             self._set_posture(0.74, 0.0)
             self.arm_home()
             return {"ok": False, "error": f"{item} is too low to reach from a squat (score {best:.3f})"}
-        self.move_hand(pre + np.array([0, 0, 0.08]), axes, duration=1.0, settle=0.1)
-        self.move_hand(pre, axes, duration=0.6)
-        e = self.move_hand(grasp, axes, duration=0.9)
+        self.move_hand(pre + np.array([0, 0, 0.08]), axes, duration=1.0, settle=0.1, ik=self.ik_item)
+        self.move_hand(pre, axes, duration=0.6, ik=self.ik_item)
+        e = self.move_hand(grasp, axes, duration=0.9, settle=0.4, ik=self.ik_item)
         if e > 0.04:
-            self.move_hand(pre, axes, duration=0.6)
+            self.move_hand(pre, axes, duration=0.6, ik=self.ik_item)
             self._set_posture(0.74, 0.0)
             self.arm_home()
             return {"ok": False, "error": f"could not reach {item} on the floor (residual {e:.3f} m)"}
-        bname = self.item_body[item]
-        self._weld(f"grasp_{bname}", True)
-        self._item_collisions(item, False)
-        self.holding = item
-        _, R_palm = self.ik.palm_pose()
-        self.hold_vert = (0, R_palm[:, 0].copy())  # fingers (pointing down) keep their direction
+        res = self._close_and_lift(item, axes, lift=np.array([0, 0, 0.06]), ik=self.ik_item)
+        if not res["ok"]:
+            self.move_hand(pre, axes, duration=0.6, ik=self.ik_item)
+            self._set_posture(0.74, 0.0)
+            self.arm_home()
+            return res
+        _, R_hand = self.ik_item.palm_pose()
+        self.hold_vert = (0, R_hand[:, 0].copy())  # fingers (pointing down) keep their direction
         self.hold_mode, self.hold_dz = "top", grasp[2] - centre[2]
-        self.move_hand(pre + np.array([0, 0, 0.1]), axes, duration=0.8, settle=0.0)
+        self.move_hand(pre + np.array([0, 0, 0.1]), axes, duration=0.8, settle=0.0, ik=self.ik_item)
         self.carry()
-        return {"ok": True, "item": item, "grasp_error_m": round(e, 4), "from": "floor"}
+        return {"ok": True, "item": item, "grasp_error_m": round(e, 4), "from": "floor", **res["grasp"]}
+
+    def _refresh_hold_axis(self) -> None:
+        """For "pitched" holds: the held item's up-axis expressed in the hand frame, from the
+        item's current pose in the hand (stand-in for a wrist camera / tactile estimate; the
+        simulator's body orientation is used, the way `slip()` uses its position)."""
+        if self.holding is None or self.hold_mode != "pitched":
+            return
+        b = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, self._body(self.holding))
+        R_item = self.data.xmat[b].reshape(3, 3)
+        R_hand = self.data.site_xmat[self.ik_item.site].reshape(3, 3)
+        self.hold_item_axis = R_hand.T @ R_item[:, 2]
 
     def _hold_axes(self, fwd: np.ndarray) -> list:
-        """IK axis targets while holding: keep the item upright (strong); its yaw is free-ish."""
+        """IK axis targets while holding: keep the item upright (strong); its yaw is free-ish.
+
+        "pitched" grasps (from above) keep the whole hand orientation relative to the body
+        instead, since no single hand axis is vertical then.
+        """
+        if self.hold_mode == "pitched":
+            return [(self.hold_item_axis, np.array([0, 0, 1.0]), 1.0), (0, fwd, 0.15)]
         idx, vert = self.hold_vert
         axes = [(idx, vert, 1.0)]
         if self.hold_mode == "side":
@@ -481,28 +717,61 @@ class AssistiveRobot:
         base = self.wbc.base_pos
         lateral = -0.14
         if toward is not None:
-            lateral = float(np.clip((np.asarray(toward) - base) @ left, -0.28, 0.05))
+            # No further right than the shoulder line: with the hand 25 cm out to the right the
+            # robot walks it into the open cupboard door and jams against it.
+            lateral = float(np.clip((np.asarray(toward) - base) @ left, -0.16, 0.05))
         palm, _ = self.ik.palm_pose()
         up = palm.copy()
-        up[2] = max(z, palm[2] + 0.05)
+        # not above chest height: with the wrist higher and close to the body the IK flips into
+        # a shoulder-behind-the-back solution it cannot track out of (seen at the 0.9 m kitchen
+        # counter); the approach moves lift the hand the last few cm where it has room
+        up[2] = min(max(z, palm[2] + 0.05), base[2] + 0.19)
         self.move_hand(up - 0.06 * fwd, None, duration=0.6, settle=0.0)  # straight up, slightly back
-        tgt = base + 0.18 * fwd + lateral * left
+        # The open hand is 22 cm long. With the fingers forward at 18 cm the fingertips reach
+        # 40 cm ahead: fine when the item is further than that, otherwise they would knock it
+        # over before the grasp even starts, so then the fingers point across the body (left),
+        # wrist close to the chest, and the approach turns the hand forward with the wrist yaw.
+        # (Fingers-left also pushes the elbow out to the right, which brushes an open cupboard
+        # door closed, so it is used only when needed.)
+        ahead = float((np.asarray(toward) - base) @ fwd) if toward is not None else 1.0
+        if ahead > 0.42:
+            tgt = base + 0.20 * fwd + lateral * left
+            axes = [(0, fwd, 0.5)]
+        else:
+            tgt = base + 0.14 * fwd + lateral * left
+            axes = [(0, left, 0.5)]
         tgt[2] = up[2]
-        self.move_hand(tgt, [(0, fwd, 0.5)], duration=0.6, settle=0.1)
+        # (IK, not MPPI: this move is within 30 cm of the item and the open hand is 22 cm long;
+        # the deterministic IK path is the one the pinch tolerance was measured with)
+        e = self.move_hand(tgt, axes, duration=0.7, settle=0.1)
+        if e > 0.08:
+            # jammed against the torso: unfold the arm and try once more from home
+            self.arm_home(0.8)
+            self.move_hand(tgt, axes, duration=0.8, settle=0.1)
 
     def _step_back(self, dist: float) -> None:
         th = self.wbc.base_yaw
         p = self.wbc.base_pos[:2] - dist * np.array([np.cos(th), np.sin(th)])
         self._drive_to(p[0], p[1], th, tol=0.04, timeout=4.0)
 
-    def holding_ok(self, tol: float = 0.08) -> bool:
-        """Is the held item still at the palm?"""
+    def _item_in_hand(self, item: str) -> np.ndarray:
+        """Item centre in the hand (wrist-yaw) frame."""
+        b = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, self._body(item))
+        hb = self.grip.palm_body
+        R = self.data.xmat[hb].reshape(3, 3)
+        return R.T @ (self.data.xpos[b] - self.data.xpos[hb])
+
+    def slip(self) -> float:
+        """How far the held item has moved in the hand since the grasp (m)."""
+        if self.holding is None:
+            return float("inf")
+        return float(np.linalg.norm(self._item_in_hand(self.holding) - self.hold_rel))
+
+    def holding_ok(self, tol: float = 0.045) -> bool:
+        """Is the held item still in the pinch? (It is held by friction only, so it can slip out.)"""
         if self.holding is None:
             return False
-        bname = self.item_body.get(self.holding, self.holding)
-        b = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, bname)
-        palm, _ = self.ik.palm_pose()
-        return float(np.linalg.norm(self.data.xpos[b] - palm)) < tol
+        return self.slip() < tol and self.grip.contacts(self._body(self.holding)).n_pads > 0
 
     def _left(self) -> np.ndarray:
         th = self.wbc.base_yaw
@@ -518,12 +787,13 @@ class AssistiveRobot:
     def carry(self) -> None:
         """Bring the held item close to the body (pelvis-relative carry pose)."""
         self._set_posture(0.74, 0.0)
+        self._refresh_hold_axis()
         th = self.wbc.base_yaw
         fwd = np.array([np.cos(th), np.sin(th), 0])
         left = np.array([-np.sin(th), np.cos(th), 0])
         # high and close: the item clears anything standing on a table we walk up to
-        target = self.wbc.base_pos + 0.28 * fwd - 0.18 * left + np.array([0, 0, 0.18])
-        self.move_hand(target, self._hold_axes(fwd), duration=1.0)
+        target = self.wbc.base_pos + 0.30 * fwd - 0.14 * left + np.array([0, 0, 0.18])
+        self.move_hand(target, self._hold_axes(fwd), duration=1.2, ik=self.ik_item, smooth=True)
 
     def hand_over(self) -> dict:
         """At the person: place the held item on the side table / delivery tray."""
@@ -531,15 +801,13 @@ class AssistiveRobot:
             return {"ok": False, "error": "not holding anything"}
         if not self.holding_ok():
             item = self.holding
-            bname = self.item_body.get(item, item)
-            self._weld(f"grasp_{bname}", False)
-            self.holding = None
-            self._item_collisions(item, True)
+            self._lost(item, "on the way")
             self.arm_home()
             return {"ok": False, "error": f"lost the {item} on the way"}
         it = self.items[self.holding]
         th = self.wbc.base_yaw
         fwd = np.array([np.cos(th), np.sin(th), 0])
+        self._refresh_hold_axis()
         axes = self._hold_axes(fwd)
         # Put it down on the delivery surface: a reachable spot, as far as possible from anything
         # already standing there (seen by the head camera).
@@ -550,30 +818,176 @@ class AssistiveRobot:
         # (the carried item can block the camera, so also use where we put things before)
         others = [p.position for m, p in self.cam.detect().items() if m in self.id_to_item and self.id_to_item[m] != self.holding]
         others += self.placed
-        best_spot, best_clear = None, -1.0
-        for f, l in [(0.42, -0.14), (0.40, -0.02), (0.45, -0.24), (0.36, -0.20), (0.38, 0.06)]:
-            cand = base + f * fwd + l * left
-            m = 0.08  # keep clear of the edge (arm tracking error is a few cm)
-            cand[0] = np.clip(cand[0], cx - hx + m, cx + hx - m)
-            cand[1] = np.clip(cand[1], cy - hy + m, cy + hy - m)
-            clear = min([np.hypot(*(cand[:2] - o[:2])) for o in others], default=1.0)
-            if clear > best_clear + 0.02:
-                best_spot, best_clear = cand, clear
+        # Candidate pinch positions on a grid in front of the robot. What must stay clear of the
+        # other items is not the pinch but the hand and forearm behind it. Use the hand's actual
+        # orientation now (the carry pose only weakly fixes its yaw): wrist = pinch - R*site, and
+        # a capsule from 30 cm back along the forearm to 3 cm past the wrist, radius ~5 cm, plus
+        # a 4 cm margin and the other item's radius.
+        _, R_h = self.ik_item.palm_pose()
+        site_off = (R_h @ self.model.site_pos[self.ik_item.site])[:2]
+        wrist_now = self.data.xpos[self.grip.palm_body][:2]
+        elbow_now = self.data.xpos[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "right_elbow_link")][:2]
+        fore = wrist_now - elbow_now
+        fore = fore / max(np.linalg.norm(fore), 1e-6)
+
+        def hand_clearance(cand):
+            w = cand[:2] - site_off
+            a, bseg = w - 0.30 * fore, w + 0.03 * fore
+            best = 1.0
+            for o in others:
+                ab = bseg - a
+                t = float(np.clip((o[:2] - a) @ ab / max(ab @ ab, 1e-9), 0.0, 1.0))
+                best = min(best, float(np.linalg.norm(o[:2] - (a + t * ab))) - 0.05 - 0.04 - 0.035)
+                best = min(best, float(np.linalg.norm(o[:2] - cand[:2])) - it.size[0] - 0.035 - 0.03)  # item vs item
+            return best
+
+        best_spot, best_score, best_clear = None, -np.inf, 0.0
+        for f in (0.30, 0.33, 0.36, 0.39, 0.42):
+            for l in (-0.16, -0.10, -0.04, 0.02, 0.08, 0.14, 0.20):
+                cand = base + f * fwd + l * left
+                m = 0.09  # keep well clear of the edge (arm tracking error is a few cm)
+                cand[0] = np.clip(cand[0], cx - hx + m, cx + hx - m)
+                cand[1] = np.clip(cand[1], cy - hy + m, cy + hy - m)
+                clear = hand_clearance(cand)
+                # Fill the table far-left first: the forearm of every later placement comes in
+                # from the robot's side (near-right), so that corner must stay free the longest.
+                comfort = -np.hypot(f - 0.42, l - 0.10)
+                score = min(clear, 0.06) + 0.3 * comfort  # beyond 6 cm of clearance only comfort counts
+                if score > best_score:
+                    best_spot, best_score, best_clear = cand, score, clear
+        if best_clear < 0.0:
+            # nowhere free enough: put it down anyway, but say so
+            print(f"hand_over: side table is crowded (best clearance {best_clear:.2f} m)")
+        if os.environ.get("ASSISTIVE_DEBUG"):
+            print(f"hand_over: others {[np.round(o[:2], 3).tolist() for o in others]} -> spot {np.round(best_spot[:2], 3).tolist()} clearance {best_clear:.3f}")
         spot = best_spot
-        spot[2] = self.delivery["top"] + it.size[2] + self.hold_dz + 0.006  # palm height when the item rests on the table
-        # Come in from above (clear of anything already on the table), set down, leave upwards.
-        self.move_hand(spot + np.array([0, 0, 0.17]), axes, duration=1.2)
-        self.move_hand(spot, axes, duration=0.9)
-        item, self.holding = self.holding, None
-        bname = self.item_body.get(item, item)
-        self._weld(f"grasp_{bname}", False)
-        self.placed.append(spot.copy())
-        self.wait(0.3)
-        self.move_hand(spot - 0.06 * fwd + np.array([0, 0, 0.14]), axes, duration=0.8)
-        self.move_hand(spot - 0.16 * fwd + np.array([0, 0, 0.14]), None, duration=0.5, settle=0.0)
+        # grasp-site height when the item rests on the table (the item may have slipped a little in
+        # the pinch since the grasp: measure where it actually is now)
+        b = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, self._body(self.holding))
+        site, _ = self.ik_item.palm_pose()
+        dz_now = float(site[2] - self.data.xpos[b][2])
+        spot[2] = self.delivery["top"] + it.size[2] + dz_now
+        # Come in from above (clear of anything already on the table), lower until the item touches
+        # the table, open the fingers gradually, then leave straight up (so the fingers can't knock
+        # it over) and back.
+        # High enough that the held item's bottom clears the tallest thing already on the table
+        # (a 20 cm bottle), then straight down.
+        site, _ = self.ik_item.palm_pose()
+        high = spot + np.array([0, 0, 0.26])
+        self.move_hand(np.array([site[0], site[1], max(site[2], high[2])]), axes, duration=0.7, settle=0.0, ik=self.ik_item,
+                       smooth=True)
+        self.move_hand(high, axes, duration=1.0, ik=self.ik_item, smooth=True)
+        self.move_hand(spot + np.array([0, 0, 0.03]), axes, duration=1.0, settle=0.2, ik=self.ik_item)
+        item = self.holding
+        touched = self._lower_until_contact(item, spot, axes)
+        self._release(hold_arm=True)
+        self._withdraw(axes)
         self.arm_home()
-        self._item_collisions(item, True)
-        return {"ok": True, "handed_over": item, "placed_on": "delivery_tray" if self.world is not None else "side_table"}
+        self.placed.append(self.data.xpos[b].copy())  # where it actually ended up (it can slide a few cm)
+        upright = float(self.data.xmat[b].reshape(3, 3)[2, 2])
+        return {"ok": True, "handed_over": item, "placed_on": "delivery_tray" if self.world is not None else "side_table",
+                "upright": round(upright, 3), "touched_table": touched}
+
+    def _item_touching(self, item: str, min_force: float = 0.3) -> bool:
+        """Is `item` in contact with anything other than the hand (e.g. the table it is set on)?"""
+        m, d = self.model, self.data
+        b = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, self._body(item))
+        f6 = np.zeros(6)
+        for i in range(d.ncon):
+            c = d.contact[i]
+            b1, b2 = m.geom_bodyid[c.geom1], m.geom_bodyid[c.geom2]
+            if b not in (b1, b2):
+                continue
+            other = b2 if b1 == b else b1
+            if other in self.grip.hand_bodies:
+                continue
+            mujoco.mj_contactForce(m, d, i, f6)
+            if abs(f6[0]) > min_force:
+                return True
+        return False
+
+    def _lower_until_contact(self, item: str, spot: np.ndarray, axes, max_drop: float = 0.06,
+                             speed: float = 0.06) -> bool:
+        """Lower the held item slowly until it rests on the surface (contact felt), then stop.
+
+        Returns True if contact was made within `max_drop` below the nominal spot height.
+        """
+        site, _ = self.ik_item.palm_pose()
+        q = self.arm_cmd.copy()
+        z0 = site[2]
+        n = int(max_drop / speed / CONTROL_DT)
+        # The fingers hang below the pinch, so the item touches down while they are still ~2 cm
+        # above the surface: let the IK bring them that close (normally it keeps 3 cm).
+        safe = self.ik_item.safe_dist
+        self.ik_item.safe_dist = 0.004
+        try:
+            for k in range(1, n + 1):
+                goal = spot.copy()
+                goal[2] = z0 - speed * k * CONTROL_DT
+                q, _ = self.ik_item.solve(goal, axes, q_init=q, iters=15)
+                self._set_right_arm(q)
+                self._tick()
+                if self._item_touching(item):
+                    # a few more mm so the item is really seated, not balanced on the pads
+                    for _ in range(5):
+                        self._set_right_arm(q)
+                        self._tick()
+                    return True
+            return False
+        finally:
+            self.ik_item.safe_dist = safe
+
+    def _withdraw(self, axes) -> None:
+        """Take the open hand off a released item without touching it.
+
+        The item stands at +y of the hand, 2-3 cm from the finger sides, and in front of the
+        swung-back thumb. The arm springs up and the base sways a little when the load goes, so
+        first ease the hand towards -y (fingers move away from the item), then back straight out
+        along the fingers (-x), and only then swing the thumb fully back and lift.
+        """
+        site, R_hand = self.ik_item.palm_pose()
+        side = -R_hand[:, 1]
+        side[2] = 0.0
+        side /= max(np.linalg.norm(side), 1e-6)
+        out = -R_hand[:, 0]
+        out[2] = 0.0
+        out /= max(np.linalg.norm(out), 1e-6)
+        self.move_hand(site + 0.035 * side, axes, duration=0.5, settle=0.1, ik=self.ik_item)
+        # Straight up next (the fingers slide up beside the item, the thumb is behind it): going
+        # back at table height would sweep the wrist through anything standing next to it.
+        self.move_hand(site + 0.035 * side + np.array([0, 0, 0.22]), axes, duration=0.9, settle=0.1, ik=self.ik_item,
+                       smooth=True)
+        self.grip.open()
+        self.move_hand(site + 0.035 * side + 0.16 * out + np.array([0, 0, 0.22]), axes, duration=0.7, ik=self.ik_item,
+                       smooth=True)
+
+    def _release(self, hold_arm: bool = True, seconds: float = 0.5) -> None:
+        """Open the fingers gradually (symmetric release: no flick) and forget the item.
+
+        Opens to Q_RELEASE (fingers straight, thumb uncurled but not swung back): the thumb's
+        swing-back arc runs through the item, so the full OPEN pose is only commanded once the
+        hand has backed away.
+        """
+        # While the pinch is on, the finger torques load the (softly PD-controlled) wrist; as
+        # they come off, the arm springs back ~3 cm and the finger roots can clip the item. So
+        # the release is closed-loop: the grasp site is servoed to its current world position
+        # (plus a 2 cm ease towards -y, i.e. the fingers move away from the item) while the
+        # fingers open.
+        site0, R_hand = self.ik_item.palm_pose()
+        side = -R_hand[:, 1]
+        side[2] = 0.0
+        side /= max(np.linalg.norm(side), 1e-6)
+        axes = self._hold_axes(R_hand[:, 0]) if hold_arm else None
+        q = self.arm_cmd.copy()
+        n = int(seconds / CONTROL_DT)
+        for k in range(1, n + 1):
+            self.grip.blend(1.0 - k / n, open_pose=Q_RELEASE)
+            if hold_arm:
+                q, _ = self.ik_item.solve(site0 + 0.02 * side * (k / n), axes, q_init=q, iters=15)
+                self._set_right_arm(q)
+            self._tick()
+        self.holding = None
+        self._set_held(None)
 
     def follow(self, targets: list[np.ndarray], axes_list: list, dt: float = CONTROL_DT, max_err: float = 0.05,
                keep_reach: float | None = None) -> int:
@@ -647,7 +1061,15 @@ class AssistiveRobot:
             self.arm_home()
             return {"ok": False, "error": f"could not reach handle (residual {e:.3f} m)"}
         # Position-only grip on the handle: the door/drawer moves while the wrist keeps a
-        # comfortable orientation (like a loose grip around a bar handle).
+        # comfortable orientation (like a loose grip around a bar handle). The fingers close
+        # around the bar as well, which also keeps the open hand from catching the door edge
+        # when it lets go (hand/door and hand/drawer pairs are collision-excluded, so this is
+        # visual + compactness, not the holding force).
+        q_hold = self.arm_cmd.copy()
+        for k in range(1, 16):
+            self.grip.blend(k / 15)
+            self._set_right_arm(q_hold)
+            self._tick()
         self._weld(weld_name, True, torquescale=0.0)
 
         # Learned arc (revolute) or line (prismatic), mapped to the world
@@ -670,9 +1092,11 @@ class AssistiveRobot:
         self.wait(0.5)
         self._weld(weld_name, False)
 
-        # Let go and back off along the current finger direction (fingers = palm x-axis)
+        # Let go and back off along the current finger direction (fingers = palm x-axis), then
+        # open the hand again once it is clear of the door.
         p, R_palm = self.ik.palm_pose()
-        self.move_hand(p - 0.10 * R_palm[:, 0], None, duration=0.7, settle=0.1)
+        self.move_hand(p - 0.12 * R_palm[:, 0], None, duration=0.7, settle=0.1)
+        self.grip.open()
         self.arm_home()
         if model.kind == "revolute":
             s = self.stations.get(self.station)
@@ -696,9 +1120,8 @@ class AssistiveRobot:
         """Release the held item where the hand is (e.g. back on a surface)."""
         if self.holding is None:
             return {"ok": False, "error": "not holding anything"}
-        item, self.holding = self.holding, None
-        bname = self.item_body.get(item, item)
-        self._weld(f"grasp_{bname}", False)
+        item = self.holding
+        self._release()
+        self._withdraw(None)
         self.arm_home()
-        self._item_collisions(item, True)
         return {"ok": True, "released": item}

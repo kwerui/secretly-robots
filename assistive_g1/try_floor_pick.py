@@ -1,4 +1,8 @@
-"""Bottle on the floor -> deep-squat top-down pick -> side table.
+"""Bottle on the floor -> deep-squat pick -> side table.
+
+KNOWN LIMITATION on the grasp-physical branch: with the real finger pinch this is not reliable
+(the arm cannot get the pinch low enough with the pinch axis horizontal from the squat); the
+skill reports the failure instead of faking it. Kept as the test bed for fixing it.
 
     python try_floor_pick.py            # headless, prints results
     python try_floor_pick.py --watch    # live window (no GLX needed)

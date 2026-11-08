@@ -35,11 +35,15 @@ ARM_JOINTS = {
 
 class ArmIK:
     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData, side: str = "right",
-                 extra_graspable: Iterable[str] = ()):
+                 extra_graspable: Iterable[str] = (), site: str | None = None):
         self.model, self.data = model, data
         self.side = side
         self.scratch = mujoco.MjData(model)
-        self.site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"{side}_palm")
+        self.site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, site or f"{side}_palm")
+        self.held_body: int | None = None  # an item in the hand is part of the arm, not an obstacle
+        # By default the hand may approach items/the door (it is about to grasp them). Transport
+        # planning sets this False so the open hand keeps clear of items it is not after.
+        self.hand_may_touch_graspables = True
         jids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, j) for j in ARM_JOINTS[side]]
         self.qadr = np.array([model.jnt_qposadr[j] for j in jids])
         self.vadr = np.array([model.jnt_dofadr[j] for j in jids])
@@ -93,6 +97,11 @@ class ArmIK:
             c = s.contact[i]
             b1, b2 = self.model.geom_bodyid[c.geom1], self.model.geom_bodyid[c.geom2]
             if (b1 in self.arm_bodies) != (b2 in self.arm_bodies) and c.dist < margin:
+                arm_g, other_b = (c.geom1, b2) if b1 in self.arm_bodies else (c.geom2, b1)
+                if other_b == self.held_body:
+                    continue
+                if arm_g in self.hand_geoms and other_b in self.graspable_bodies:
+                    continue  # the open hand sits around the item it is about to grasp
                 hits.append((self.model.body(b1).name, self.model.body(b2).name))
         return hits
 
@@ -106,7 +115,10 @@ class ArmIK:
         pairs = []
         for i, j in zip(*np.nonzero(gap < self.detect_dist)):
             ga, go = int(a[i]), int(o[j])
-            if ga in self.hand_geoms and self.model.geom_bodyid[go] in self.graspable_bodies:
+            bo = self.model.geom_bodyid[go]
+            if bo == self.held_body:
+                continue  # the item in the hand moves with the arm
+            if self.hand_may_touch_graspables and ga in self.hand_geoms and bo in self.graspable_bodies:
                 continue  # the hand may touch what it grasps
             pairs.append((ga, go))
         return pairs
@@ -140,6 +152,18 @@ class ArmIK:
         s.qpos[self.qadr] = q
         mujoco.mj_kinematics(self.model, s)
         return self._collision_rows(s, self._candidate_pairs(s))[2]
+
+    def axis_error(self, q: np.ndarray, axes) -> float:
+        """Sum of the axis misalignments (sin of the angle, weighted) with the arm at q."""
+        if not axes:
+            return 0.0
+        s = self.scratch
+        s.qpos[:] = self.data.qpos
+        s.qpos[self.qadr] = q
+        mujoco.mj_kinematics(self.model, s)
+        R = s.site_xmat[self.site].reshape(3, 3)
+        return float(sum(w * np.linalg.norm(np.cross(R[:, i] if np.isscalar(i) else R @ np.asarray(i, float),
+                                                     v / np.linalg.norm(v))) for i, v, w in axes))
 
     def palm_pose(self, data: mujoco.MjData | None = None) -> tuple[np.ndarray, np.ndarray]:
         d = data or self.data
@@ -184,7 +208,8 @@ class ArmIK:
             e = [target_pos - p]
             J = [Jp]
             for idx, want, w in axes:
-                have = R[:, idx]
+                # idx: a site axis index (0/1/2) or a unit vector in the site frame
+                have = R[:, idx] if np.isscalar(idx) else R @ np.asarray(idx, float)
                 want = want / np.linalg.norm(want)
                 e.append(w * np.cross(have, want))
                 J.append(w * Jr)
@@ -195,7 +220,9 @@ class ArmIK:
             e = np.concatenate(e)
             J = np.vstack(J)
             err_pos = float(np.linalg.norm(target_pos - p))
-            if not col_rows and err_pos < tol and all(np.linalg.norm(np.cross(R[:, i], v / np.linalg.norm(v))) < 0.08 for i, v, _ in axes):
+            if not col_rows and err_pos < tol and all(
+                    np.linalg.norm(np.cross(R[:, i] if np.isscalar(i) else R @ np.asarray(i, float), v / np.linalg.norm(v))) < 0.08
+                    for i, v, _ in axes):
                 break
             JJt = J @ J.T + (damping ** 2) * np.eye(J.shape[0])
             dq = J.T @ np.linalg.solve(JJt, e)
