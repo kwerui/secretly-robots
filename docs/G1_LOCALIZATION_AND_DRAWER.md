@@ -49,8 +49,9 @@ estimate end to end (bottle from the drawer and the cup, both delivered upright)
 
 Still read from the simulator: the sensors themselves (a simulated LiDAR/camera is computed
 from the true state), the start pose (a known dock pose at reset), arm gravity feed-forward
-(`qfrc_bias`), and `holding_ok()` (item-in-hand check). Not done: the branch's live dynamic
-occupancy map (moved furniture/people in the planner); the planner still uses Jack's grid.
+(`qfrc_bias`), and `holding_ok()` (item-in-hand check). The live occupancy map is done on the
+grasp-physical branch (`costmap.py`, see `docs/NAV_NOTES.md`): the planner runs on what the
+robot's LiDAR and depth camera have seen, over the floor plan.
 `person_too_close` could come from the LiDAR (points not in the map, < 0.5 m).
 
 ## Arm / drawer: what was wrong and what changed

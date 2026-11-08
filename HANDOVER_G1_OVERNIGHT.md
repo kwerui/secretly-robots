@@ -76,7 +76,9 @@ brain.engine.Brain.start_task ──► FetchTask(item="water_bottle", destinati
    ▼
 assistive_g1/skills.py  AssistiveRobot: go_to, look, pick, open_articulated, close_opened, hand_over
    │
-   ├── nav.py              PD go-to-pose → (vx, vy, wz) for GR00T; Jack's occupancy grid + BFS planner
+   ├── nav.py              PD go-to-pose → (vx, vy, wz) for GR00T
+   ├── costmap.py          the robot's clearance map from its 3D LiDAR + depth camera (prior: floor plan);
+   │                       house.plan_path plans on it, go_to re-plans when a new obstacle cuts the route
    ├── ik.py               7-DoF damped-least-squares arm IK with collision rows (mj_geomDistance)
    ├── perception.py       head-camera ArUco (RGB-D refined)
    ├── articulation.py     one-shot hinge/slide fit
@@ -212,8 +214,13 @@ The robot's decisions use only the estimated `pos`, `yaw` and `vel_body`.
 - **A/B switch:** `G1_LOCALIZE=0` runs on simulator truth instead.
 - **Still read from the simulator:** the simulated sensors themselves, the start (dock) pose at
   reset, arm gravity feed-forward (`qfrc_bias`), and `holding_ok()`.
-- **Not done:** a live dynamic occupancy map (the planner still uses Jack's static grid), and
-  `person_too_close` from the LiDAR (points not in the map that are < 0.5 m away).
+- **Done since (grasp-physical branch):** the live occupancy map. `costmap.py` builds the
+  clearance map from the robot's 3D LiDAR and depth camera on top of the floor plan (walls +
+  fixed furniture), door leaves are recognised and ignored, `go_to` re-plans mid-walk when a
+  new obstacle cuts the route. Evidence and limits in `docs/NAV_NOTES.md`; `nav_test.py`.
+  `G1_NAV=static` is the old behaviour.
+- **Not done:** `person_too_close` from the LiDAR (points not in the map that are < 0.5 m away;
+  the costmap now has exactly those cells).
 
 ---
 

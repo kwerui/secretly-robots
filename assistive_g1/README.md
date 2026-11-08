@@ -74,6 +74,8 @@ from `decoupled_wbc/control/policy/g1_gear_wbc_policy.py`, and they match LeRobo
 | `tasks.py` | Deterministic fetch planner (search ranked stations, open cupboard if needed, pick, hand over) |
 | `agent.py` | LLM tool-use agent over the same skills (Anthropic SDK). Untested against the API |
 | `run_demo.py` | Scenario + MP4 recorder (follow cam + head-cam inset + captions) |
+| `costmap.py` | The robot's own clearance map: 3D LiDAR + depth camera into a voxel log-odds grid, seeded with the floor plan (walls, fixed furniture); door leaves recognised and ignored; clearance for the planner. `house.plan_path` plans on it and `go_to` re-plans mid-walk when a new obstacle cuts the route (see `docs/NAV_NOTES.md`). `G1_NAV=static` = the old planner on the simulator's geometry |
+| `nav_test.py` | Moved-chair test for the navigation: a chair the plan doesn't know at the start, and one put down in the route while walking; live vs static numbers, map pictures, `--video` |
 | `calibrate_camera.py` | ChArUco calibration for the real demo camera |
 | `voice_demo.py` | Voice demo: person speaks, G1 hears (head_cam mic), Whisper, rules/Gemma interpreter, asks, fetch mode (planned, not executed) |
 
@@ -118,7 +120,9 @@ from `decoupled_wbc/control/policy/g1_gear_wbc_policy.py`, and they match LeRobo
 
 ## Known shortcuts (say them if asked)
 
-- Localisation uses the simulator's base pose; the stations are fixed.
+- Localisation uses the simulator's base pose; the stations are fixed. (In the house: the
+  robot localises itself, `state_estimation.py`, and maps obstacles itself, `costmap.py`;
+  what it is given is the floor plan with the fixed furniture and where the doors hang.)
 - Grasping is a weld switched on when the palm reaches the item (the hand mesh is
   rigid). The door grip is position-only (torquescale 0), like a loose grip on a bar
   handle.

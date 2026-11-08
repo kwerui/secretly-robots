@@ -68,6 +68,15 @@ class LightRecorder(Recorder):
         frame[12:12 + ih, x0:x0 + iw] = cv2.resize(head, (iw, ih))
         cv2.rectangle(frame, (x0, 12), (x0 + iw, 12 + ih), (255, 255, 255), 2)
         cv2.putText(frame, "robot head camera", (x0 + 8, 12 + ih - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        if getattr(robot, "costmap", None) is not None:
+            # the robot's own clearance map (costmap.py): grey = floor plan, black = seen by its
+            # LiDAR / depth camera, blue = the route it is walking, red = where it thinks it is
+            mw, mh = self.size[0] * 3 // 10, self.size[0] * 9 // 40
+            amap = robot.costmap.image(path=robot.nav_path, robot_xy=robot.wbc.base_pos[:2], scale=2)
+            y0 = 12 + ih + 10
+            frame[y0:y0 + mh, x0:x0 + mw] = cv2.resize(amap, (mw, mh), interpolation=cv2.INTER_AREA)
+            cv2.rectangle(frame, (x0, y0), (x0 + mw, y0 + mh), (255, 255, 255), 2)
+            cv2.putText(frame, "robot's clearance map", (x0 + 8, y0 + mh - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (40, 40, 40), 1)
         if self.caption:
             cv2.rectangle(frame, (0, self.size[1] - 40), (self.size[0], self.size[1]), (20, 20, 20), -1)
             cv2.putText(frame, self.caption, (14, self.size[1] - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)

@@ -5,3 +5,7 @@ assets/markers/
 calib.npz
 __pycache__/
 debug/
+nav_test_*.json
+nav_test_*.png
+nav_clip*
+MUJOCO_LOG.TXT

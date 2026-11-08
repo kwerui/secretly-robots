@@ -260,25 +260,64 @@ class G1House(HouseEnv):
         d.qvel[m.jnt_dofadr[j]:m.jnt_dofadr[j] + 6] = 0
 
     # ------------------------------------------------------------------ navigation
+    costmap = None  # set by skills.AssistiveRobot when it maps the house itself (costmap.py)
+    DETOUR_FACTOR, DETOUR_SLACK = 1.3, 0.5  # a roomier route may be at most this much longer than the shortest
+    last_plan_radius = H.ROBOT_R
+    ROBOT_R_MIN = H.ROBOT_R - 0.04  # the body itself (shoulders ~0.3 m wide): never check a route tighter than this
+
     def plan_path(self, start_xy, goal_xy, goal_radius: float = 0.25) -> list[tuple[float, float]] | None:
-        """Jack's planner on his robot occupancy grid: list of (x, y) from start into the free
-        cells within `goal_radius` of goal_xy (the final approach to an exact station pose is
-        done by the caller, since stations sit closer to furniture than the grid's inflation)."""
+        """Jack's planner (BFS + line-of-sight shortening, squared-up doorway crossings) on the
+        robot's clearance map: list of (x, y) from start into the free cells within
+        `goal_radius` of goal_xy (the final approach to an exact station pose is done by the
+        caller, since stations sit closer to furniture than the grid's inflation).
+
+        The clearance comes from the robot's own perceived map (costmap.py: LiDAR + depth, prior
+        = walls and fixed furniture) when one is attached, else from the true geometry (G1_NAV=static).
+        """
         # Prefer paths with more clearance than Jack's ROBOT_R (his doorway band is only
         # +-0.22 m for a 0.28 m radius, and the walking G1 sways ~0.1 m), falling back to his.
-        locked = [g for dn in self.locked_doors for g in self.door_geoms[dn]]
-        clear = self._clearance(self.static_geoms + self.drawer_geoms + locked + self.active_mocap_geoms(), H.ROBOT_H)
+        if self.costmap is not None:
+            clear = self.costmap.clearance()
+        else:
+            locked = [g for dn in self.locked_doors for g in self.door_geoms[dn]]
+            clear = self._clearance(self.static_geoms + self.drawer_geoms + locked + self.active_mocap_geoms(), H.ROBOT_H)
+        # The roomier tiers win only if they don't send the robot the long way round (with a
+        # perceived map a half-seen chair near a doorway can close that doorway at 0.40 m of
+        # clearance while it is wide open at 0.28 m: through the door, not round the house).
+        found = []
         for r in (H.ROBOT_R + 0.12, H.ROBOT_R + 0.07, H.ROBOT_R):
-            path = self._plan_on(clear <= r, start_xy, goal_xy, goal_radius)
+            grid = clear <= r
+            path = self._plan_on(grid, start_xy, goal_xy, goal_radius)
             if path is not None:
-                return self._through_doorways(path)
-        return None
+                found.append((r, grid, path, self._length(path)))
+        if not found:
+            return None
+        shortest = min(L for _, _, _, L in found)
+        for r, grid, path, L in found:  # roomiest first
+            if L <= self.DETOUR_FACTOR * shortest + self.DETOUR_SLACK:
+                break
+        self.last_plan_radius = r
+        self.plan_clearance = clear.copy()  # what the route was planned on (for re-plan checks)
+        # (the squared crossings are checked against the map only when it is the perceived one;
+        # on the true geometry the routes stay exactly Jack's/Eren's)
+        return self._through_doorways(path, grid=grid if self.costmap is not None else None)
 
-    def _through_doorways(self, path, lead: float = 0.65):
+    @staticmethod
+    def _length(path) -> float:
+        p = np.asarray(path, float)
+        return float(np.linalg.norm(np.diff(p, axis=0), axis=1).sum()) if len(p) > 1 else 0.0
+
+    def _through_doorways(self, path, lead: float = 0.65, grid=None):
         """Make every doorway crossing square: a waypoint `lead` before the doorway centre and
         one `lead` after it, on the line through the centre perpendicular to the wall. The robot
         then meets a swung leaf straight on and pushes it round instead of being deflected
-        into the jamb (the leaf swings both ways)."""
+        into the jamb (the leaf swings both ways).
+        grid: the blocked cells the path was planned on. The squared crossing must stay on free
+        cells (the pre/post points, the run between them and the run in from the previous
+        waypoint: something may stand just beside a doorway); the lead is shortened (0.65,
+        0.45, 0.30 m) until it does, and the crossing is left as planned if none fits. A start
+        already inside the approach zone (re-planning in a doorway) gets no pre point: the
+        robot shouldn't double back."""
         out = [path[0]]
         for p, q in zip(path[:-1], path[1:]):
             p, q = np.asarray(p, float), np.asarray(q, float)
@@ -296,13 +335,32 @@ class G1House(HouseEnv):
                 if abs((hit - c) @ u) > H.DOOR_W / 2:
                     continue  # crosses the wall elsewhere (not through this doorway)
                 side = np.sign(sp)
-                # drop points already inside the approach zone on this side (they'd make the
-                # robot double back), then pre/post on the centre line
-                while len(out) > 1 and 0 < side * ((np.asarray(out[-1]) - c) @ nrm) < lead \
-                        and abs((np.asarray(out[-1]) - c) @ u) < lead + H.DOOR_W:
-                    out.pop()
-                out += [tuple(c + side * lead * nrm), tuple(c - side * lead * nrm)]
-                if 0 < -side * sq < lead and abs((q - c) @ u) < lead + H.DOOR_W:
+                fitted = None
+                for ld in ((lead, 0.45, 0.30) if grid is not None else (lead,)):
+                    pre, post = c + side * ld * nrm, c - side * ld * nrm
+                    # drop points already inside the approach zone on this side (they'd make
+                    # the robot double back), then pre/post on the centre line
+                    kept = list(out)
+                    while len(kept) > 1 and 0 < side * ((np.asarray(kept[-1]) - c) @ nrm) < ld \
+                            and abs((np.asarray(kept[-1]) - c) @ u) < ld + H.DOOR_W:
+                        kept.pop()
+                    s0 = np.asarray(kept[-1], float)
+                    start_in_zone = len(kept) == 1 and 0 < side * ((s0 - c) @ nrm) < ld \
+                        and abs((s0 - c) @ u) < ld + H.DOOR_W
+                    add = [tuple(post)] if start_in_zone else [tuple(pre), tuple(post)]
+                    if grid is None:
+                        fitted = (kept, add, ld)
+                        break
+                    first = np.asarray(add[0], float)
+                    if not grid[self._cell(*first)] and not grid[self._cell(*post)] \
+                            and self._line_free(grid, s0, first) and self._line_free(grid, pre, post):
+                        fitted = (kept, add, ld)
+                        break
+                if fitted is None:
+                    break  # no square crossing fits: keep the planned points
+                kept, add, ld = fitted
+                out = kept + add
+                if 0 < -side * sq < ld and abs((q - c) @ u) < ld + H.DOOR_W:
                     q = None  # inside the exit zone: the post waypoint replaces it
                 break
             if q is not None:
