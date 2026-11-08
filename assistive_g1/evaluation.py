@@ -112,6 +112,20 @@ class EpisodeMetrics:
     executed_actions: list[dict[str, Any]] = field(default_factory=list)
     decision_provenance: list[str] = field(default_factory=list)
     cloud_events: list[dict[str, str]] = field(default_factory=list)
+    # Perception-driven memory evidence.  It remains separate from physical task success.
+    memory_beliefs_before: dict[str, float] = field(default_factory=dict)
+    memory_beliefs_after: dict[str, float] = field(default_factory=dict)
+    predicted_top_ranked_station: str | None = None
+    memory_update_events: list[dict[str, Any]] = field(default_factory=list)
+    positive_camera_observations: list[dict[str, str]] = field(default_factory=list)
+    camera_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    search_order: list[str] = field(default_factory=list)
+    stations_visited_before_found: list[str] = field(default_factory=list)
+    stations_searched_before_detection: int | None = None
+    confirmed_negative_observations: list[str] = field(default_factory=list)
+    inaccessible_or_unobserved_stations: list[str] = field(default_factory=list)
+    persistent_memory_loaded: bool = False
+    persistent_memory_updated: bool = False
     schema_version: int = 3
 
     @classmethod
@@ -196,6 +210,30 @@ class TrialRecorder:
     def record_stage(self, field_name: str, succeeded: bool) -> None:
         """Record a nested robot step (for example close during a grasp action)."""
         setattr(self.metrics, field_name, Outcome.SUCCESS if succeeded else Outcome.FAILURE)
+
+    def record_memory_execution(self, execution: dict[str, Any]) -> None:
+        """Record AI-memory evidence without conflating it with physical verification."""
+        if "memory_beliefs_before" in execution and not self.metrics.memory_beliefs_before:
+            self.metrics.memory_beliefs_before = dict(execution["memory_beliefs_before"])
+        if "memory_beliefs_after" in execution:
+            self.metrics.memory_beliefs_after = dict(execution["memory_beliefs_after"])
+        if "predicted_top_ranked_station" in execution and self.metrics.predicted_top_ranked_station is None:
+            self.metrics.predicted_top_ranked_station = execution["predicted_top_ranked_station"]
+        for metric_name, execution_name in (
+            ("memory_update_events", "memory_updates"),
+            ("positive_camera_observations", "positive_camera_observations"),
+            ("camera_diagnostics", "camera_diagnostics"),
+            ("search_order", "search_order"),
+            ("stations_visited_before_found", "stations_visited"),
+            ("confirmed_negative_observations", "confirmed_negative_observations"),
+            ("inaccessible_or_unobserved_stations", "inaccessible_or_unobserved_stations"),
+        ):
+            target = getattr(self.metrics, metric_name)
+            for value in execution.get(execution_name, []):
+                if value not in target:
+                    target.append(value)
+        if "stations_searched_before_detection" in execution:
+            self.metrics.stations_searched_before_detection = execution["stations_searched_before_detection"]
 
     def finish(self, truth: TruthSnapshot, *, simulation_duration_s: float | None = None) -> EpisodeMetrics:
         verified = verify_truth(truth)

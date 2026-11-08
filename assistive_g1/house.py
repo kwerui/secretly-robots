@@ -88,6 +88,17 @@ def drawer(unit: str, index: int) -> Drawer:
 
 KITCHEN_TOP = drawer("kitchen_drawers", 2)
 
+# These are deliberately limited to existing HouseEnv placement targets for which the G1
+# integration has a corresponding search station.  Keep the simulator's ground-truth target
+# names separate from what is exposed to the planner.
+SUPPORTED_BOTTLE_TARGETS = ("kitchen_drawer", "kitchen_counter", "kitchen_table")
+BOTTLE_TARGET_STATIONS = {
+    "kitchen_drawer": "kitchen_drawers",
+    "kitchen_counter": "kitchen_counter",
+    "kitchen_table": "kitchen_table",
+}
+COUNTER_CUP_X_OFFSET_M = -0.22
+
 
 def _station_facing(target_xy, yaw, standoff, lateral=0.15) -> Station:
     """Pelvis pose for working on `target_xy`: facing `yaw`, `standoff` behind it, the target in
@@ -220,7 +231,18 @@ class G1House(HouseEnv):
             self._set_furniture("coffee_table", *COFFEE_TABLE_POS, 0.0)
         self.set_drawers(0.0)
         mujoco.mj_kinematics(self.model, self.data)
-        for name, (kind, where) in self.placement.items():
+        placements = dict(self.placement)
+        # The default cup and the counter bottle target share an exact surface coordinate.
+        # Move the cup deterministically along the same counter before placing either object;
+        # this is scenario configuration, not robot knowledge or a control change.
+        if target == "kitchen_counter" and placements.get("cup") == ("surface", "kitchen_counter"):
+            surface = self.surface_xyz("kitchen_counter")
+            cup = self.items["cup"]
+            placements["cup"] = ("position", (
+                float(surface[0] + COUNTER_CUP_X_OFFSET_M), float(surface[1]),
+                float(surface[2] + cup.size[2] + 0.002),
+            ))
+        for name, (kind, where) in placements.items():
             self.place_item(name, kind, where)
         if self.target_container:
             # Jack puts the bottle 21 cm behind the handle; 10 cm behind the inside of the front

@@ -352,7 +352,11 @@ class AssistiveRobot:
 
     # ------------------------------------------------------------------ perception
     def look(self) -> dict:
-        """Detect markers in the head camera. Returns item names -> world position."""
+        """Detect markers in the head camera. Returns item names -> world position.
+
+        A single marker frame does not establish full station coverage, so absence remains
+        unconfirmed unless a future perception scan explicitly supplies that evidence.
+        """
         det = self.cam.detect()
         self.last_seen = det
         if self.costmap is not None:  # every look also updates the clearance map (RGB-D)
@@ -363,7 +367,9 @@ class AssistiveRobot:
             extra["cupboard_door"] = det[DOOR_MARKER].position.round(3).tolist()
         if ANCHOR_MARKER in det:
             extra["cupboard_anchor"] = det[ANCHOR_MARKER].position.round(3).tolist()
-        return {"ok": True, "station": self.station, "items": items, **extra}
+        return {"ok": True, "station": self.station, "items": items,
+                "marker_ids": sorted(int(marker_id) for marker_id in det),
+                "absence_confirmed": False, **extra}
 
     def look_closer(self) -> dict:
         """Re-approach the current station, then lean in and look again.
