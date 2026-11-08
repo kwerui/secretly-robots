@@ -35,7 +35,7 @@ class MarkerPose:
 class HeadCamera:
     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData, cam: str = "head_cam",
                  width: int = 960, height: int = 720):
-        # 960x720 so a 5 cm marker on the floor ~1 m away is still detected (G1's D435: 1280x720)
+        # (the video recorder reuses this renderer for its inset)
         self.model, self.data = model, data
         self.cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, cam)
         self.width, self.height = width, height
@@ -47,6 +47,7 @@ class HeadCamera:
         params = cv2.aruco.DetectorParameters()
         params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         self.detector = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(MARKER_DICT), params)
+        self.last_rgb: np.ndarray | None = None
 
     def render(self) -> np.ndarray:
         self.renderer.update_scene(self.data, camera=self.cam_id)
@@ -55,8 +56,9 @@ class HeadCamera:
     def detect(self, rgb: np.ndarray | None = None) -> dict[int, MarkerPose]:
         if rgb is None:
             rgb = self.render()
+        self.last_rgb = rgb
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        corners, ids, _ = self.detector.detectMarkers(gray)
+        corners, ids = self._detect_raw(gray)
         out: dict[int, MarkerPose] = {}
         if ids is None:
             return out
@@ -78,10 +80,28 @@ class HeadCamera:
             out[mid] = MarkerPose(mid, cam_pos + cam_rot @ p_mj, cam_rot @ r_mj, float(np.linalg.norm(tvec)))
         return out
 
+    def _detect_raw(self, gray: np.ndarray):
+        """Detect markers; markers missed in the plain image (small or in shadow, e.g. inside a
+        cupboard) get a second pass on a 2x upscaled, contrast-equalised (CLAHE) image."""
+        corners, ids, _ = self.detector.detectMarkers(gray)
+        corners, ids = list(corners), ([] if ids is None else [int(i) for i in ids.flatten()])
+        if len(set(ids) & set(MARKER_SIZES)) < len(MARKER_SIZES):
+            eq = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
+            big = cv2.resize(eq, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+            c2, i2, _ = self.detector.detectMarkers(big)
+            if i2 is not None:
+                for c, mid in zip(c2, i2.flatten()):
+                    if int(mid) not in ids:
+                        corners.append((c / 2.0 - 0.25).astype(np.float32))  # undo the 2x resize (pixel centres)
+                        ids.append(int(mid))
+        if not ids:
+            return [], None
+        return corners, np.array(ids).reshape(-1, 1)
+
     def annotate(self, rgb: np.ndarray, detections: dict[int, MarkerPose]) -> np.ndarray:
         img = np.ascontiguousarray(rgb.copy())
         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        corners, ids, _ = self.detector.detectMarkers(gray)
+        corners, ids = self._detect_raw(gray)
         if ids is not None:
             cv2.aruco.drawDetectedMarkers(img, corners, ids)
             for c, mid in zip(corners, ids.flatten()):

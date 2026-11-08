@@ -98,7 +98,7 @@ def capture_video(source, calib: Path, out: Path, grasp_in_part: np.ndarray, sho
 
 
 # ----------------------------------------------------------------------------- simulation
-def capture_sim(out: Path, open_angle: float = 1.4, seconds: float = 3.0, video: Path | None = None) -> ArticulationModel:
+def capture_sim(out: Path, open_angle: float = 1.75, seconds: float = 3.5, video: Path | None = None) -> ArticulationModel:
     import mujoco
 
     from perception import HeadCamera

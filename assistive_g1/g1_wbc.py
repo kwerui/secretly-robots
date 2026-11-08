@@ -37,9 +37,10 @@ DEFAULT_ANGLES[[3, 9]] = 0.3  # knee
 DEFAULT_ANGLES[[4, 10]] = -0.2  # ankle pitch
 
 # Arm home pose: elbows bent, hands in front of the hips. Left 7 then right 7.
+# Shoulder roll +-0.40 keeps the hands ~4 cm clear of the hips (arms collide with the body).
 ARM_HOME = np.array(
-    [0.2, 0.25, 0.0, 0.9, 0.0, 0.0, 0.0,
-     0.2, -0.25, 0.0, 0.9, 0.0, 0.0, 0.0],
+    [0.2, 0.40, 0.0, 0.9, 0.0, 0.0, 0.0,
+     0.2, -0.40, 0.0, 0.9, 0.0, 0.0, 0.0],
     dtype=np.float32,
 )
 

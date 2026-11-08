@@ -4,12 +4,11 @@ Everything is built with MjSpec on top of the GR00T G1 model, so the layout is p
 Python you can edit. Coordinates are metres in the world frame; the robot starts at
 the origin facing +x.
 
-Collision groups:
-  robot      contype 1 / conaffinity 1
-  furniture  contype 3 / conaffinity 3   (collides with robot and items)
-  items+door contype 2 / conaffinity 2   (collide with furniture, not with the robot)
-Items don't collide with the hand, so an approach can't knock them over; grasping is a
-weld constraint switched on when the palm reaches the item (see skills.py).
+Collisions: everything collides with everything (robot, furniture, door, items), except
+  * torso vs the two shoulder links that sit against its hull at the joint, and
+  * the grasping (right) hand vs items and the door: the hand is a rigid block, so the palm
+    has to be allowed inside what it grasps. The forearm and the rest of the arm still collide.
+Grasping is a weld constraint switched on when the palm reaches the item (see skills.py).
 """
 
 from __future__ import annotations
@@ -52,6 +51,10 @@ ITEMS = {
     "pill_box": Item("pill_box", 3, (0.035, 0.03, 0.03), (0.9, 0.3, 0.3, 1)),
 }
 
+RIGHT_HAND_BODIES = ["right_wrist_yaw_link"] + [f"right_hand_{f}_link" for f in
+                                                ("thumb_0", "thumb_1", "thumb_2", "index_0", "index_1",
+                                                 "middle_0", "middle_1")]
+
 DOOR_MARKER = 10  # on the cupboard door front
 ANCHOR_MARKER = 11  # on the cupboard body, fixed
 DOOR_MARKER_SIZE = 0.06
@@ -60,7 +63,7 @@ STATIONS = {
     "home": Station("home", 0.0, 0.0, 0.0),
     "table": Station("table", 1.42, 0.0, 0.0),
     "shelf": Station("shelf", 0.0, 1.62, np.pi / 2),
-    "cupboard": Station("cupboard", 0.0, -1.52, -np.pi / 2),
+    "cupboard": Station("cupboard", 0.25, -1.55, -np.pi / 2),  # left of the handle: right-arm pull
     "person": Station("person", -0.75, 0.83, 3 * np.pi / 4),
 }
 
@@ -74,7 +77,7 @@ SIDE_TABLE = dict(pos=(-0.95, 1.2), top=0.62, half=(0.21, 0.21))  # next to the 
 # Default item placements: (surface name, x, y). The location memory decides where to look.
 DEFAULT_PLACEMENT = {
     "water_bottle": ("table", 1.72, -0.12),
-    "cup": ("cupboard", -0.07, -2.12),
+    "cup": ("cupboard", 0.0, -2.12),
     "pill_box": ("shelf", 0.12, 2.0),
 }
 
@@ -166,21 +169,22 @@ def build_scene(placement: dict[str, tuple[str, float, float]] | None = None) ->
     world.add_light(pos=[2.0, 0, 2.6], dir=[0, 0, -1], diffuse=[0.2, 0.2, 0.2], specular=[0, 0, 0], cutoff=70)
     world.add_light(pos=[0, 0, 2.6], dir=[0, 0, -1], diffuse=[0.2, 0.2, 0.2], specular=[0, 0, 0], cutoff=70)
 
-    # Robot head camera (approximately the G1's RealSense, ~48 deg pitched down).
+    # Robot head camera (approximately the G1's RealSense).
     torso = spec.body("torso_link")
-    pitch = 0.85
+    pitch = 0.65  # ~37 deg down: sees the floor ~0.6 m ahead up to the top of the cupboard
     torso.add_camera(name="head_cam", pos=[0.08, 0.0, 0.45], fovy=70,
                      xyaxes=[0, -1, 0, np.sin(pitch), 0, np.cos(pitch)])
-    # The torso mesh is collided as its convex hull, which swallows the space in front of the
-    # shoulders; exclude torso-arm pairs so the arms can move in front of the chest.
-    arm_links = ["shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow",
-                 "wrist_roll", "wrist_pitch", "wrist_yaw"]
+    # Wrist roll and wrist yaw are two links apart and their meshes touch at the joint.
     for side in ("left", "right"):
-        for link in arm_links:
+        spec.add_exclude(bodyname1=f"{side}_wrist_roll_link", bodyname2=f"{side}_wrist_yaw_link")
+    # Arms collide with the torso. Only the two shoulder links that sit against the torso's
+    # collision hull at the joint are excluded (0.8-2 cm apart even in the home pose).
+    for side in ("left", "right"):
+        for link in ("shoulder_pitch", "shoulder_roll"):
             spec.add_exclude(bodyname1="torso_link", bodyname2=f"{side}_{link}_link")
     # A fixed room camera (a home camera / the carer's phone on a shelf) that watches the cupboard.
-    world.add_camera(name="room_cam", pos=[0.75, -1.25, 1.45], xyaxes=_look_at_xyaxes([0.75, -1.25, 1.45], [0.0, -2.05, 0.95]),
-                     fovy=60)
+    world.add_camera(name="room_cam", pos=[-0.75, -1.25, 1.45],
+                     xyaxes=_look_at_xyaxes([-0.75, -1.25, 1.45], [0.0, -2.05, 0.95]), fovy=60)
     # Palm site used as the grasp point (fingers extend along +x of the wrist yaw link).
     for side in ("left", "right"):
         spec.body(f"{side}_wrist_yaw_link").add_site(name=f"{side}_palm", pos=[0.10, 0.0, 0.0], size=[0.012])
@@ -210,29 +214,35 @@ def build_scene(placement: dict[str, tuple[str, float, float]] | None = None) ->
     _box(cup_body, (0.01, dpt, h / 2), (-w, 0, h / 2), wall)  # left wall
     _box(cup_body, (0.01, dpt, h / 2), (w, 0, h / 2), wall)  # right wall
     _box(cup_body, (w, 0.01, h / 2), (0, -dpt, h / 2), wall)  # back wall
-    # Anchor marker on a small upright plate on the counter beside the hinge (rigid with the
-    # cupboard), facing the room.
     q_front = _quat_facing(np.array([0, 1, 0]))
-    _box(cup_body, (0.055, 0.006, 0.055), (w + 0.09, dpt - 0.01, 0.055), (0.95, 0.95, 0.95, 1))
-    _sticker(cup_body, spec, ANCHOR_MARKER, DOOR_MARKER_SIZE, (w + 0.09, dpt - 0.003, 0.055), q_front)
+    # Anchor marker (rigid with the cupboard) on a stand on the roof, tilted 45 deg towards the
+    # room: above the door, so the opening door never hides it from the room camera, and in
+    # view of the robot's head camera at the station.
+    q_tilt = _quat_facing(np.array([0, 1.0, 1.0]))
+    anchor_pos = np.array([w - 0.07, dpt - 0.05, h + 0.045])
+    cup_body.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, size=[0.055, 0.055, 0.004],
+                      pos=list(anchor_pos - 0.005 * np.array([0, 0.707, 0.707])),
+                      quat=q_tilt, rgba=[0.95, 0.95, 0.95, 1], contype=0, conaffinity=0)
+    _box(cup_body, (0.04, 0.01, 0.03), (w - 0.07, dpt - 0.08, h + 0.03), (0.75, 0.75, 0.8, 1))  # stand
+    _sticker(cup_body, spec, ANCHOR_MARKER, DOOR_MARKER_SIZE, anchor_pos, q_tilt)
 
-    # Door: hinged on the cupboard's +x edge (the robot's left when it faces the cupboard),
-    # handle on the -x edge so the right hand can pull it. Positive angle swings it open
-    # towards the robot.
-    door = cup_body.add_body(name="cupboard_door", pos=[w, dpt + 0.012, 0])
-    door.add_joint(name="door_hinge", type=mujoco.mjtJoint.mjJNT_HINGE, axis=[0, 0, -1],
+    # Door: hinged on the cupboard's -x edge (the robot's RIGHT when it faces the cupboard),
+    # handle near the +x edge. Positive angle swings it open towards the robot and to its
+    # right, so a right-handed pull never crosses the body and the open door ends up beside
+    # the robot's right shoulder, clear of the opening.
+    door = cup_body.add_body(name="cupboard_door", pos=[-w, dpt + 0.012, 0])
+    door.add_joint(name="door_hinge", type=mujoco.mjtJoint.mjJNT_HINGE, axis=[0, 0, 1],
                    range=[0, 1.9], damping=0.3, frictionloss=0.05)
     # panel clears the counter by 5 mm so it swings freely
-    _box(door, (w - 0.003, 0.01, h / 2 - 0.008), (-w, 0, h / 2), (0.6, 0.45, 0.3, 1), contype=2, conaffinity=2,
-         name="door_panel")
-    hx = -2 * w + 0.05
+    _box(door, (w - 0.003, 0.01, h / 2 - 0.008), (w, 0, h / 2), (0.6, 0.45, 0.3, 1), name="door_panel")
+    hx = 2 * w - 0.05
     door.add_geom(name="door_handle", type=mujoco.mjtGeom.mjGEOM_CAPSULE, size=[0.012],
                   fromto=[hx, 0.04, h / 2 - 0.06, hx, 0.04, h / 2 + 0.06],
-                  rgba=[0.2, 0.2, 0.2, 1], contype=2, conaffinity=2)
+                  rgba=[0.2, 0.2, 0.2, 1], contype=3, conaffinity=3)
     for dz in (-0.05, 0.05):
         _box(door, (0.008, 0.02, 0.008), (hx, 0.02, h / 2 + dz), (0.2, 0.2, 0.2, 1), contype=0, conaffinity=0)
     door.add_site(name="door_handle_site", pos=[hx, 0.04, h / 2])
-    _sticker(door, spec, DOOR_MARKER, DOOR_MARKER_SIZE, (-w + 0.02, 0.0105, h / 2 + 0.06), q_front)
+    _sticker(door, spec, DOOR_MARKER, DOOR_MARKER_SIZE, (w - 0.02, 0.0105, h / 2 + 0.06), q_front)
 
     # Items (free bodies) with a marker on top
     surfaces = {"table": TABLE["top"], "shelf": SHELF["top"], "cupboard": z0 + 0.0, "counter": z0, "floor": 0.0,
@@ -242,13 +252,17 @@ def build_scene(placement: dict[str, tuple[str, float, float]] | None = None) ->
         body = world.add_body(name=name, pos=[x, y, surfaces[surface] + it.size[2] + 0.002])
         body.add_freejoint(name=f"{name}_free")
         body.add_geom(name=f"{name}_geom", type=mujoco.mjtGeom.mjGEOM_BOX, size=list(it.size), rgba=list(it.rgba),
-                      mass=0.15, contype=2, conaffinity=2, friction=[1.0, 0.01, 0.001])
+                      mass=0.15, contype=3, conaffinity=3, friction=[1.0, 0.01, 0.001])
         _sticker(body, spec, it.marker_id, it.marker_size, (0, 0, it.size[2] + 0.001))
         # Weld used for grasping (inactive until the hand closes on the item)
         spec.add_equality(name=f"grasp_{name}", type=mujoco.mjtEq.mjEQ_WELD, name1="right_wrist_yaw_link",
                           name2=name, objtype=mujoco.mjtObj.mjOBJ_BODY, active=False)
     spec.add_equality(name="grasp_door", type=mujoco.mjtEq.mjEQ_WELD, name1="right_wrist_yaw_link",
                       name2="cupboard_door", objtype=mujoco.mjtObj.mjOBJ_BODY, active=False)
+    # The grasping hand may overlap what it grasps (rigid hand): exclude hand vs items and door.
+    for target in list(placement) + ["cupboard_door"]:
+        for hb in RIGHT_HAND_BODIES:
+            spec.add_exclude(bodyname1=hb, bodyname2=target)
 
     model = spec.compile()
     data = mujoco.MjData(model)

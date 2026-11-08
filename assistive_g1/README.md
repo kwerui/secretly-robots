@@ -84,8 +84,10 @@ from `decoupled_wbc/control/policy/g1_gear_wbc_policy.py`, and they match LeRobo
    marker, metres); measure it with a ruler. A MediaPipe wrist track at the moment the
    door starts moving would supply this automatically: good teammate task.
 4. `python run_demo.py --model cupboard_model.json` runs the robot with the real
-   demonstration. The sim cupboard's hinge is on the robot's left with the handle on its
-   right, so demo the real cupboard the same way round, or mirror `scene.py`.
+   demonstration. The sim cupboard's hinge is on the robot's right (handle on its left,
+   door swings out to the robot's right), so demo the real cupboard the same way round,
+   or mirror `scene.py`. If you change the cupboard geometry, delete
+   `cupboard_model.json` so the sim demo is re-recorded.
 
 ## What is tested (in this repo's sim)
 
@@ -96,10 +98,13 @@ from `decoupled_wbc/control/policy/g1_gear_wbc_policy.py`, and they match LeRobo
   down beside the right knee with a top-down grasp (2 mm), then delivered. Lowest
   reachable grasp point is ~0.11 m above the floor, so a cup (10 cm tall) and the pill
   box (6 cm) are too low with the GR00T policy.
-- From the sim carer demo: hinge within ~1.6 cm, axis within ~5°, angle 1.37 rad vs
-  1.40 true, fit residual 4 mm.
-- The robot opens the cupboard along the learned arc to 1.39–1.41 rad, steps in, picks
-  the cup (1.1 cm) and places it on the side table.
+- From the sim carer demo (door swung to 1.75 rad): learned angle 1.64 rad, fit
+  residual 4.3 mm, 97 samples.
+- The robot opens the cupboard along the learned arc to ~1.55 rad (89°), walking
+  backwards while it pulls so the door never comes into its body, steps in, picks the cup
+  (2.6 cm) and places it on the side table.
+- Arm collisions: across the full scenario 0% of control ticks have any arm penetration
+  over 1 cm (worst 0.8 cm). Before collision avoidance: 21.6% of ticks, worst 12 cm.
 - Full scenario (`run_demo.py`): the bottle is searched for at the shelf first (most
   likely per memory), not found, then found on the table and delivered. The cup is
   fetched from the closed cupboard. Both end upright on the side table. That's ~140 s of
@@ -111,10 +116,13 @@ from `decoupled_wbc/control/policy/g1_gear_wbc_policy.py`, and they match LeRobo
 - Grasping is a weld switched on when the palm reaches the item (the hand mesh is
   rigid). The door grip is position-only (torquescale 0), like a loose grip on a bar
   handle.
-- Torso–arm self-collision is excluded because the torso mesh's convex hull covers the
-  space in front of the shoulders.
-- Items don't collide with the robot (only with furniture), so approaches can't knock
-  them over. While an item is carried, its collisions are off as well; they come back on
-  when it is set down.
+- Collisions are on for everything. The arm IK keeps 3 cm clearance from the torso, legs,
+  furniture and the door (`mj_geomDistance` rows in `ik.py`), and every grasp is planned
+  collision-free first. Excluded pairs: torso vs the two shoulder links (they sit against
+  the torso hull at the joint), wrist roll vs wrist yaw, and the grasping hand vs items
+  and the door (the hand is a rigid block, so the palm has to be allowed inside what it
+  grasps; the forearm still collides).
+- A held item collides with furniture and other items but not with the robot; robot
+  contact comes back once the arm has retracted after setting it down.
 - The hand-over places the item on the side table next to the armchair, at a free spot
   (seen by the camera, plus where the robot put things before).

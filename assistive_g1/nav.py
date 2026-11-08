@@ -32,7 +32,7 @@ def wrap(a: float) -> float:
 
 @dataclass
 class NavParams:
-    kp_lin: float = 1.0  # 1/s
+    kp_lin: float = 1.3  # 1/s
     kd_lin: float = 0.4  # on measured body velocity
     kp_yaw: float = 1.8
     kd_yaw: float = 0.15
@@ -48,9 +48,20 @@ class NavParams:
     pos_tol: float = 0.04  # m
     yaw_tol: float = 0.05  # rad
     settle_scale: float = 2.0  # accept 2x the tolerances once the PD output is tiny (no dithering)
-    min_cmd: float = 0.08  # smallest non-zero command (below ~0.05 GR00T switches to balance)
+    min_cmd: float = 0.12  # smallest non-zero command: below ~0.1 the walk policy shuffles in place
+                           # (worse with an arm raised); below 0.05 GR00T switches to balance
+    min_vx: float = 0.12  # per-axis minimum speeds in the fine approach (m/s, m/s, rad/s)
+    min_vy: float = 0.10
+    min_wz: float = 0.25
     vel_tau: float = 0.5  # s, low-pass on measured velocity (the pelvis sways +-0.2 m/s every step)
     dwell: float = 0.6  # s inside the settle band -> arrived, even if the PD output isn't tiny
+
+
+def _floor(v: float, err: float, tol: float, vmin: float) -> float:
+    """Zero inside the tolerance; otherwise at least vmin in the direction of the error."""
+    if abs(err) < tol:
+        return 0.0
+    return float(np.sign(err) * max(abs(v), vmin)) if np.sign(v) == np.sign(err) or v == 0 else float(v)
 
 
 class Navigator:
@@ -92,7 +103,14 @@ class Navigator:
             yaw_err = wrap((gyaw if gyaw is not None else th) - th)
             vx = np.clip(p.kp_lin * ex - p.kd_lin * vx_m, -p.v_back, p.v_max)
             vy = np.clip(p.kp_lin * ey - p.kd_lin * vy_m, -p.vy_max, p.vy_max)
+            # GR00T doesn't track small per-axis velocities (it shuffles in place), so each axis
+            # either commands at least what the policy really walks at, or zero once it's in
+            # tolerance (deadband). Arrival/dwell below stops any residual hunting.
+            vx = _floor(vx, ex, p.pos_tol, p.min_vx)
+            vy = _floor(vy, ey, p.pos_tol, p.min_vy)
         wz = np.clip(p.kp_yaw * yaw_err - p.kd_yaw * wz_m, -p.w_max, p.w_max)
+        if dist <= p.far:
+            wz = _floor(wz, yaw_err, p.yaw_tol, p.min_wz)
         desired = np.array([vx, vy, wz])
 
         # arrival with hysteresis

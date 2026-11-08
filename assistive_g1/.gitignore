@@ -4,3 +4,4 @@ assets/markers/
 *.mp4
 calib.npz
 __pycache__/
+debug/

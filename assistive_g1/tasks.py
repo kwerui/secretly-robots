@@ -6,6 +6,7 @@ the fallback when no LLM is available. agent.py exposes the same skills as LLM t
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable
 
 from articulation import ArticulationModel
@@ -34,6 +35,7 @@ def fetch(
     item: str,
     cupboard_model: ArticulationModel | None = None,
     say: Callable[[str], None] = print,
+    debug_dir: Path | None = Path("debug"),
 ) -> dict:
     memory.new_episode()
     for station, p in memory.ranked(item):
@@ -50,8 +52,13 @@ def fetch(
             if not res["ok"]:
                 say(f"Couldn't open it fully: {res}")
             seen = robot.look()
+        if item not in seen["items"] and station == "cupboard":
+            seen = robot.look_closer()  # backed off while opening: step back in, lean, look
         if item not in seen["items"]:
             say(f"Not at the {station}")
+            if debug_dir is not None:
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                robot.save_view(debug_dir / f"{item}_not_at_{station}.png")
             memory.observe_search(item, station, False)
             continue
         memory.observe_search(item, station, True)
@@ -61,9 +68,15 @@ def fetch(
             say(f"Pick failed: {res['error']}")
             return {"ok": False, "stage": "pick", **res}
         say("Bringing it over")
-        robot.go_to("person")
+        res = robot.go_to("person")
+        if not res["ok"]:
+            say(f"Sorry, I got stuck: {res['error']}")
+            return {"ok": False, "stage": "deliver", **res}
         res = robot.hand_over()
+        if not res["ok"]:
+            say(f"Sorry, something went wrong: {res['error']}")
+            return {"ok": False, "stage": "hand_over", **res}
         say("Here you go")
-        return {"ok": res["ok"], "found_at": station}
+        return {"ok": True, "found_at": station}
     say(f"I couldn't find the {item.replace('_', ' ')}. Asking the carer where it lives.")
     return {"ok": False, "stage": "search", "ask_carer": f"Where do you keep the {item}?"}
