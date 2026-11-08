@@ -222,8 +222,8 @@ def main():
                                          fallback=brain.last_decision_provenance == "fallback_after_cloud_rejection_or_failure")
                 if brain.last_cloud_event is not None:
                     recorder.record_cloud_event(**brain.last_cloud_event)
-                say(f"  brain [{decision.source}]: {decision.action}({decision.target or ''}) - {decision.reason}")
-                if decision.action in ("complete", "ask_for_help"):
+                if decision.action in ("complete", "ask_for_help"):  # (executed actions are logged by the bridge, before they run)
+                    say(f"  brain [{decision.source}]: {decision.action}({decision.target or ''}) - {decision.reason}")
                     outcome = decision.action
                     break
                 feedback = bridge.execute_high_level(decision)

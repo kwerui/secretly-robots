@@ -1,0 +1,3 @@
+# Only needed to (re)generate the person's voice clips with Gemini TTS.
+# Playing the committed clips in the sim needs nothing extra.
+google-genai>=3.0.0

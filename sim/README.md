@@ -41,6 +41,24 @@ Viewer options and modes:
 | L     | next layout (same bottle position)                       |
 | T     | next target position (surfaces + drawer targets)         |
 | O     | new random angles for the unlocked doors                 |
+| V     | person on the sofa asks for water (plays a voice clip)   |
+| Y / N | person answers the robot: "Yes, please." / "No, thank you." |
+
+## Person's voice (Gemini text-to-speech)
+
+Press **V** in the viewer and the person on the sofa says one of eight phrases that all mean "get me water" ("I am thirsty.", "I need water.", "I'm parched.", ...). The clip plays through your speakers, a caption appears at the bottom of the viewer, and the line is recorded in `env.info["last_utterance"]` with its sim time. The list is `PHRASES` in [`person_voice.py`](person_voice.py).
+
+The clips are made once with Gemini text-to-speech and saved in `assets/voice/`, so the sim needs no network or key to play them. To make or remake them:
+
+```bash
+.venv/bin/pip install -r requirements-voice.txt
+export GEMINI_API_KEY='your-key'                 # shell only, never in a file
+.venv/bin/python person_voice.py --generate      # only makes missing clips; --force remakes all
+.venv/bin/python person_voice.py --say           # play one from the terminal
+.venv/bin/python person_voice.py                 # list which clips exist
+```
+
+The model defaults to `gemini-3.8-flash-tts` with the prebuilt voice `Gacrux`. Override them with `--model`/`--voice` or `GEMINI_TTS_MODEL`/`GEMINI_TTS_VOICE`. This is the *person's* voice only. The robot's listening runs onboard and has to work from the audio, not from the phrase text.
 
 To push a door or pull a drawer yourself: double-click it, then hold Ctrl and right-drag.
 

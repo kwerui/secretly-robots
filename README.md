@@ -1,10 +1,22 @@
-# Secretly Robots — offline-first AI brain starter
+# Secretly Robots — perception-driven adaptive-memory robot prototype
 
 **AgentVerse 2026 · Robotics track · 7–8 November 2026**
 
-**Mission:** A simulated household assistant helps an older adult with limited mobility by fetching a light object. The current house places a water bottle on named furniture surfaces (for example `tv_unit`, `kitchen_counter` or `study_desk`); a future robot must use fresh observations to adapt when it moves.
+**Mission:** A Unitree G1 humanoid in MuJoCo helps a person with limited mobility retrieve a small household item. It uses head-camera perception, a recency-weighted location memory and fresh observations to search, manipulate a drawer, and deliver to a tray by the sofa.
 
-> **Status — integrated planning scaffold, not yet an autonomous fetching robot.** This package has an offline intent parser, high-level state-aware task planner, validation, event logs, a real MuJoCo ground-truth observation adapter and tests. It **does not yet** have camera detection, actual voice recognition, articulated grasping, robot control, or genuine one-shot visual imitation learning. Those require teammates' robot and perception implementation.
+> **Status — simulation research prototype.** The G1 integration supports camera-derived item sightings, location-memory search, learned drawer motion, locomotion, grasping and delivery in MuJoCo. The current relocation benchmark verified a physical delivery in all three recorded episodes, but only **1/3** met the full-task criterion because drawer closing failed in episodes 1–2. It is not a real-world robot, medical device, or reliable autonomous household product.
+
+## Judge-facing benchmark snapshot
+
+The latest three-episode relocation run is deliberately reported as separate checks rather than a single inflated success number:
+
+| Measure | Result | Interpretation |
+| --- | --- | --- |
+| Verified physical deliveries | **3/3** | The item reached the simulated delivery tray and passed the simulator end-state check. |
+| Full-task successes | **1/3** | A full success also requires the drawer to be closed; episodes 1–2 failed that check. |
+| Adaptive-memory behavior | **Observed in episode 3** | After memory reload, the robot searched the counter first before continuing its search. |
+
+See [`docs/G1_EVALUATION.md`](docs/G1_EVALUATION.md) for the definitions, evidence format and limitations. The benchmark is simulation-only; it does not establish real-world safety or reliability.
 
 ## Quick start (Mac / Python 3.14.3 already works for your local MuJoCo)
 
@@ -86,6 +98,114 @@ drawer; `drawer_open` is therefore always `False`. Replace or supplement it
 with a real sensor bridge only when the perception team supplies
 confidence-calibrated detections.
 
+## Voice: the person asks, the robot listens (onboard)
+
+Press **V** in the sim and the person on the sofa asks for water (clips made with Gemini text-to-speech, see `sim/README.md`). The robot hears it from its head camera position, transcribes it with Whisper on the laptop's CPU, and turns the text into a command state. A live window shows each transcript, how long speech-to-text took and the command it produced. Nothing in the robot's listening path uses the network.
+
+```bash
+sim/.venv/bin/pip install -r requirements-hearing.txt -r requirements-stt.txt
+sim/.venv/bin/python -m brain.speech_to_text --download    # once, ~145 MB into models/ (gitignored)
+sim/.venv/bin/mjpython -m scripts.voice_robot              # sim viewer + window; press V
+sim/.venv/bin/python -m scripts.voice_robot --mic          # talk to it through the laptop mic instead
+```
+
+**Hints get a question first.** A request that names the drink ("I need water", "Can you get me something to drink?") sets the fetch command straight away. A hint that doesn't ("My mouth is so dry", "I'm parched", "I am thirsty") makes the robot ask *"Would you like some water?"* in its own Gemini voice (clips in `assets/robot_voice/`, made once with `python -m brain.robot_voice --generate`, played locally). The command state is `confirming` until the person answers: yes starts the fetch, no or 10 s of silence ends as `declined`. In the sim, press **Y** or **N** to answer; on the mic, just say it. While the robot talks, the mic ignores what it hears so it doesn't answer itself.
+
+The window is at http://127.0.0.1:8765 and opens by itself. Each run is also logged to `logs/voice_events.jsonl`; replay one with `python -m brain.voice_window logs/voice_events.jsonl`.
+
+### The G1 voice demo (the full sequence)
+
+The Unitree G1 stands in the house, balancing on its GR00T policy. The person on the sofa speaks; the robot hears, interprets, asks if it needs to, and goes into **fetch mode**. Everything the robot does runs on the laptop: no network, no API key.
+
+**One-time setup** (from the repo root, using the sim's virtualenv):
+
+```bash
+sim/.venv/bin/pip install -r requirements-hearing.txt -r requirements-stt.txt
+sim/.venv/bin/python -m brain.speech_to_text --download        # Whisper base.en, ~145 MB into models/
+(cd assistive_g1 && ../sim/.venv/bin/python fetch_assets.py)   # G1 model + GR00T policies, ~35 MB
+# Optional, for free-form speech (see "Gemma" below):
+brew install ollama && brew services start ollama && ollama pull gemma4:e4b   # ~9.5 GB
+```
+
+The voice clips are already in the repo (`sim/assets/voice/` for the person, `assets/robot_voice/` for the robot), so the demo needs no Gemini key.
+
+**Run it:**
+
+```bash
+cd assistive_g1
+../sim/.venv/bin/python voice_demo.py --list          # the 25 scenarios
+../sim/.venv/bin/mjpython voice_demo.py --scenario 19  # pick one
+```
+
+On macOS the viewer must run under `mjpython`; on Linux use `../sim/.venv/bin/python`. The MuJoCo viewer opens with the G1 at the sofa, and the speech-to-text window opens in your browser at http://127.0.0.1:8765.
+
+| Key | What happens |
+|---|---|
+| **V** | The person says one of eight water lines. Some are requests ("I need water", "Can you get me something to drink?"), some are hints ("My mouth is so dry", "I'm parched", "I am thirsty"). |
+| **C** | The person asks for their cup ("Could you bring me my cup?", "I'd like my cup, please.", "Can I have my mug?"). |
+| **Y** / **N** | The person answers the robot's question ("Yes, please." / "No, thank you."). |
+| **F** | Toggle what fetch mode does: carry the fetch out (default) or only plan it. |
+| **X** | Cancel and go back to listening. |
+
+**Scenarios: showing adaptation.** There are 25 fixed scenarios, `5 × placement + setup`, all run through with the real G1 (`validate_scenarios.py`):
+
+| Placement | Bottle (spawn odds) | Cup (spawn odds) |
+|---|---|---|
+| 0 | kitchen counter (30%) | kitchen counter (35%) |
+| 1 | kitchen drawer (25%) | kitchen table (25%) |
+| 2 | kitchen table (20%) | study desk (15%) |
+| 3 | study desk (15%) | coffee table (15%) |
+| 4 | coffee table (10%) | TV unit (10%) |
+
+| Setup | Floor |
+|---|---|
+| 0 | tidy |
+| 1 | light clutter (laundry) |
+| 2 | heavy clutter (moving boxes) |
+| 3 | living–kitchen door locked |
+| 4 | living–kitchen door locked + clutter |
+
+So scenario 19 is placement 3 (bottle on the study desk) with setup 4 (locked door + clutter). Each item has five spots with set probabilities (`assistive_g1/scenario.py`, `SPAWNS`), and the robot's location memory starts from the same odds. What adapting looks like:
+- **Where things are:** it searches the likeliest place first. The markers over each place show its beliefs: they shrink and turn red as places are ruled out, and turn green where it finds the item.
+- **Locked door:** it doesn't know which door is locked. It plans through the shortest doorway, finds the door shut when it gets there, says *"That door's locked. I'll go round the other way."*, marks it (red bar) and replans through the bedroom and study.
+- **Clutter:** it plans and walks round it; the route being walked is drawn on the floor.
+
+`--random --seed N` draws a new house from the odds instead (`--bottle`, `--cup`, `--lock-door`, `--clutter` fix parts of it).
+
+**What you see:**
+
+1. **Listening.** Grey light above the G1's head; top-left of the viewer says LISTENING.
+2. **The person speaks.** A caption at the bottom; the G1's head-camera microphone hears it (about 2 m away, quieter with distance), and Whisper transcribes it in about 0.3 s. The window adds a card with the transcript, timing, loudness and distance.
+3. **A hint** makes the robot say *"Would you like some water?"* in its own voice. The light turns amber and the viewer says ASKING. The question lapses after 10 s with no answer.
+4. **A request, or a yes,** puts it in **FETCH MODE**. The light turns green and the robot says *"Okay, I'll get you some water."* (or *"…your cup"*). The brain now has the task `water_bottle → sofa`, and the robot carries it out with the G1 team's `RobotBridge`: search (opening the drawer with the learned motion if needed), grasp, walk to the sofa, put it on the tray, *"Here's your water."* (light turns blue). Each step is captioned and listed in the window with the robot's current beliefs. If it can't find the item it says so and asks for help (light turns red). With **F** (or `--plan-only`) it only shows the first step.
+5. **A no** gets *"Okay. Just let me know if you need anything."* and it goes back to listening.
+
+Other options: `--plan-only`, `--speed 2` (sim faster than real time while fetching), `--no-browser`, `--no-gemma`. The grasp uses the G1 team's fallback (`G1_CHEAT_GRASP=fallback`): it tries the real grasp first, and abstracts the contact if that fails.
+
+**Test phrasing by talking to it.** `sim/.venv/bin/python -m scripts.voice_robot --mic` listens to the laptop mic. Each thing you say prints one line, FETCH / HINT / DECLINED / NOT A REQUEST, with which interpreter decided and how long it took. The robot answers out loud, and Ctrl+C saves a summary to `logs/phrase_test.csv`. Use headphones, or wait for it to finish talking. The rules handle the bottle and the cup ("Could I have my cup, please?", "I need my mug", "I want my bottle"), and Gemma handles freer phrasing if it's running.
+
+**The pipeline** (all onboard):
+
+```text
+person's clip (Gemini TTS, pre-made) -> G1 head_cam microphone (brain/hearing.py: distance falloff, room noise, voice activity)
+  -> Whisper base.en on CPU (brain/speech_to_text.py)
+  -> interpreter (brain/command.py): rules first, instant; local Gemma 4 only for phrasing the rules don't know
+  -> request / hint / yes / no / other -> CommandState: confirming -> understood | declined
+  -> Brain.set_task(...) + planner's first step shown (assistive_g1/voice_demo.py)
+```
+
+**Gemma (optional).** The rules cover every scripted phrase and Y/N, so the demo works without Gemma. Gemma 4 (`gemma4:e4b` on the local Ollama server, `127.0.0.1` only) handles anything else, e.g. "I could do with something cold, it's warm in here" → hint, "pop over and grab my book" → request, "bring me my pills" → refused (no medication). Live-tested: about 0.2–0.45 s per answer once loaded.
+- **The first load takes about 2 minutes** (9.5 GB of weights). The demo starts on the rules straight away and switches Gemma on when it's ready; the window's status line says when. Start the demo a couple of minutes before you present.
+- It then stays in memory (about 9.4 GB) for 2 hours after its last use. On a 16 GB Mac that's a lot: free it with `ollama stop gemma4:e4b`, and stop the server with `brew services stop ollama`.
+- Some Ollama builds (the MLX engine) answer `501` to schema-constrained output. The client then asks for JSON in the prompt instead and validates every field, so this needs no action.
+
+**Troubleshooting**
+- *Window opens but never shows the house:* make sure you're on the latest branch (an early version deadlocked the viewer).
+- *Exit code 143 when you close the viewer:* normal under `mjpython`.
+- *"Gemma 4 unavailable":* Ollama isn't running (`brew services start ollama`) or the model isn't pulled.
+- *No sound:* the clips play with `afplay` (macOS) or `paplay`/`aplay` (Linux); the captions still work without audio.
+- Logs: `logs/voice_events.jsonl` (everything the window shows) and `logs/brain_events.jsonl`. Replay a run with `sim/.venv/bin/python -m brain.voice_window logs/voice_events.jsonl`.
+
 ## How the brain makes decisions
 
 ```python
@@ -109,20 +229,15 @@ Then the simulation team executes the controller action, reads new state, and as
 
 ### Optional genuine local AI (no Wi-Fi at inference time)
 
-1. Install [Ollama](https://ollama.com/download).
-2. Download a small on-device model while internet is available:
+Gemma 4 runs on the laptop through [Ollama](https://ollama.com/download), using only `http://127.0.0.1:11434`:
 
-   ```bash
-   ollama pull gemma4:e2b
-   ```
+```bash
+brew install ollama && brew services start ollama
+ollama pull gemma4:e4b            # ~9.5 GB, once, while online
+python -m scripts.local_brain     # a real local request
+```
 
-3. Ensure the Ollama local server is running (usually the Ollama app, or `ollama serve`). Test:
-
-   ```bash
-   python -m scripts.local_brain
-   ```
-
-This sends a **real** structured-output request to your local model, using only `http://127.0.0.1:11434`. The trained model's weights must already be downloaded. Memory needs and latency depend on your laptop; the E2B model download can be several GB. The robot's basic high-level planner and safety guard are **still Python**, not the LLM. If Ollama is missing, the example reports that fact rather than faking a successful call.
+The voice demo uses it for speech the rules don't recognise (see "Gemma" above): live-tested, about 0.3 s per answer once loaded, about 2 minutes for the first load. The planner and safety guard are **still Python**, not the LLM, and every model answer is validated. If Ollama is missing, the code says so rather than faking a result, and the rules carry on.
 
 ### Optional Google DeepMind prize integration (cloud, not required for offline base)
 
@@ -155,11 +270,13 @@ The adapter uses `gemini-4-argon` and the official `google-genai` structured JSO
 | Human-near / lost-sensor stop and retry limit | ✅ High-level decision logic; real emergency braking must be wired |
 | JSONL decision and feedback logging | ✅ Implemented |
 | Deterministic Python planner | ✅ Working offline fallback |
-| Gemma 4 local inference through Ollama | 🟡 Optional adapter; not yet confirmed live-tested |
+| Gemma 4 local inference through Ollama | ✅ Live-tested (`gemma4:e4b`, ~0.3 s per answer once loaded); optional, rules fallback |
+| Voice: person speaks (Gemini TTS clips), robot hears, Whisper STT, interprets, asks, fetch mode | ✅ Onboard; headless tests drive the real G1, clips and Whisper (`assistive_g1/voice_demo.py`) |
 | Gemini 4 Argon cloud option | ✅ Implemented and successfully live-tested; still optional and locally validated |
-| Simulated cameras/object-recognition/robot control | ⏳ Teammates' integration needed |
-| Autonomous grasping and delivery | ⏳ Teammates' integration needed |
-| One-shot learned manipulation policy from video | ❌ Not implemented; `teach_once.py` stores **symbolic** task goals only |
+| G1 head-camera perception, locomotion, manipulation and delivery | ✅ Integrated in MuJoCo; benchmarked with the limitations reported above |
+| Full-task drawer close + delivery reliability | 🟡 1/3 in the latest relocation benchmark; drawer closing failed in two otherwise delivered episodes |
+| Location-memory teaching from a live carer demonstration | 🟡 Memory can be saved/reloaded; the current benchmark uses reloaded saved memory rather than a live teaching flow |
+| One-shot learned manipulation policy from arbitrary video | ❌ Not implemented; drawer motion uses a fitted articulation model in the G1 simulation path |
 | Actual WebRTC call | ❌ Not implemented; browser mic/camera permission test exists in `web/` |
 
 ## File guide
@@ -174,12 +291,20 @@ brain/
   integration.py      # interface teammates implement for actual MuJoCo
   mujoco_observation.py # HouseEnv ground truth -> brain Observation adapter
   teach_once.py       # small symbolic goal memory; not motor imitation
+  hearing.py          # robot's ears, onboard: sim/mic audio -> speech segments (python -m scripts.hearing_demo)
+  speech_to_text.py   # onboard Whisper (base.en, CPU): speech segment -> transcript
+  voice_pipeline.py   # heard speech -> transcript -> command state, off the sim thread
+  voice_window.py     # live speech-to-text window at http://127.0.0.1:8765
+  command.py          # onboard interpreter (rules, then Gemma) + CommandListener: confirm, understood, declined
+  robot_voice.py      # robot's spoken lines (Gemini TTS clips in assets/robot_voice/, played locally)
   gemini_client.py    # official google-genai structured-output boundary
   gemini_optional.py  # checked Gemini task/next-decision adapters
   demo.py             # hand-authored explanatory example
 robot_core/            # original neutral MuJoCo smoke-test scaffold
 scenes/smoke.xml       # real minimal physics test scene
 sim/house_env.py        # teammate-owned house environment used by the adapter
+sim/person_voice.py     # the sofa person's voice lines (Gemini TTS clips in sim/assets/voice/)
+assistive_g1/voice_demo.py # the G1 voice demo: V speak, Y/N answer, fetch mode
 scripts/               # smoke test and local inference checks
 tests/                 # automatic regression tests
 docs/ROADMAP.md        # TWO-DAY execution plan, roles, demo and plan B

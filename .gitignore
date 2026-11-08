@@ -3,6 +3,10 @@ __pycache__/
 .pytest_cache/
 *.pyc
 .env
+.env.*
+!.env.example
 logs/
 .DS_Store
 .venv/
+models/
+evaluation_results/

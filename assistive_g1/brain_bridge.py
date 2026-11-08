@@ -227,10 +227,13 @@ class RobotBridge:
     def execute_high_level(self, decision: Decision) -> ActionFeedback:
         a, t = decision.action, decision.target
         self.last_execution = {}
-        try:
-            ok, detail = getattr(self, f"_do_{a}")(t)
-        except AttributeError:
+        # the decision (and the reason, which was written before this action ran) first, then the result
+        self.say(f"  brain [{getattr(decision, 'source', '?')}]: {a}({t or ''}) - {getattr(decision, 'reason', '')}")
+        skill = getattr(self, f"_do_{a}", None)
+        if skill is None:
             ok, detail = False, f"no skill for action {a!r}"
+        else:
+            ok, detail = skill(t)
         self.say(f"  -> {a}({t or ''}): {'ok' if ok else 'FAILED'} {detail}")
         return ActionFeedback(a, t, ok, detail)
 
