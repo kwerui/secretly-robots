@@ -1,10 +1,22 @@
-# Secretly Robots — offline-first AI brain starter
+# Secretly Robots — perception-driven adaptive-memory robot prototype
 
 **AgentVerse 2026 · Robotics track · 7–8 November 2026**
 
-**Mission:** A simulated household assistant helps an older adult with limited mobility by fetching a light object. The current house places a water bottle on named furniture surfaces (for example `tv_unit`, `kitchen_counter` or `study_desk`); a future robot must use fresh observations to adapt when it moves.
+**Mission:** A Unitree G1 humanoid in MuJoCo helps a person with limited mobility retrieve a small household item. It uses head-camera perception, a recency-weighted location memory and fresh observations to search, manipulate a drawer, and deliver to a tray by the sofa.
 
-> **Status — integrated planning scaffold, not yet an autonomous fetching robot.** This package has an offline intent parser, high-level state-aware task planner, validation, event logs, a real MuJoCo ground-truth observation adapter and tests. It **does not yet** have camera detection, actual voice recognition, articulated grasping, robot control, or genuine one-shot visual imitation learning. Those require teammates' robot and perception implementation.
+> **Status — simulation research prototype.** The G1 integration supports camera-derived item sightings, location-memory search, learned drawer motion, locomotion, grasping and delivery in MuJoCo. The current relocation benchmark verified a physical delivery in all three recorded episodes, but only **1/3** met the full-task criterion because drawer closing failed in episodes 1–2. It is not a real-world robot, medical device, or reliable autonomous household product.
+
+## Judge-facing benchmark snapshot
+
+The latest three-episode relocation run is deliberately reported as separate checks rather than a single inflated success number:
+
+| Measure | Result | Interpretation |
+| --- | --- | --- |
+| Verified physical deliveries | **3/3** | The item reached the simulated delivery tray and passed the simulator end-state check. |
+| Full-task successes | **1/3** | A full success also requires the drawer to be closed; episodes 1–2 failed that check. |
+| Adaptive-memory behavior | **Observed in episode 3** | After memory reload, the robot searched the counter first before continuing its search. |
+
+See [`docs/G1_EVALUATION.md`](docs/G1_EVALUATION.md) for the definitions, evidence format and limitations. The benchmark is simulation-only; it does not establish real-world safety or reliability.
 
 ## Quick start (Mac / Python 3.14.3 already works for your local MuJoCo)
 
@@ -261,9 +273,10 @@ The adapter uses `gemini-4-argon` and the official `google-genai` structured JSO
 | Gemma 4 local inference through Ollama | ✅ Live-tested (`gemma4:e4b`, ~0.3 s per answer once loaded); optional, rules fallback |
 | Voice: person speaks (Gemini TTS clips), robot hears, Whisper STT, interprets, asks, fetch mode | ✅ Onboard; headless tests drive the real G1, clips and Whisper (`assistive_g1/voice_demo.py`) |
 | Gemini 4 Argon cloud option | ✅ Implemented and successfully live-tested; still optional and locally validated |
-| Simulated cameras/object-recognition/robot control | ⏳ Teammates' integration needed |
-| Autonomous grasping and delivery | ⏳ Teammates' integration needed |
-| One-shot learned manipulation policy from video | ❌ Not implemented; `teach_once.py` stores **symbolic** task goals only |
+| G1 head-camera perception, locomotion, manipulation and delivery | ✅ Integrated in MuJoCo; benchmarked with the limitations reported above |
+| Full-task drawer close + delivery reliability | 🟡 1/3 in the latest relocation benchmark; drawer closing failed in two otherwise delivered episodes |
+| Location-memory teaching from a live carer demonstration | 🟡 Memory can be saved/reloaded; the current benchmark uses reloaded saved memory rather than a live teaching flow |
+| One-shot learned manipulation policy from arbitrary video | ❌ Not implemented; drawer motion uses a fitted articulation model in the G1 simulation path |
 | Actual WebRTC call | ❌ Not implemented; browser mic/camera permission test exists in `web/` |
 
 ## File guide
