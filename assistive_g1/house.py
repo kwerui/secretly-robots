@@ -37,7 +37,7 @@ from sim import house_env as H  # noqa: E402
 from sim.house_env import HouseEnv, DRAWER_UNITS, FURNITURE, ROBOT_START  # noqa: E402
 
 from g1_wbc import ASSET_DIR  # noqa: E402
-from scene import (ITEMS, Item, Station, RIGHT_HAND_BODIES, LEFT_HAND_BODIES, DOOR_MARKER_SIZE, add_robot_extras,  # noqa: E402
+from scene import (ITEMS, Item, Station, RIGHT_HAND_BODIES, DOOR_MARKER_SIZE, add_robot_extras,  # noqa: E402
                    _sticker, _box, _look_at_xyaxes, _quat_facing)
 
 G1_XML = ASSET_DIR / "g1" / "g1.xml"
@@ -200,8 +200,8 @@ class G1House(HouseEnv):
                 # left hand: closes the drawer while the right one holds the item
                 spec.add_equality(name=f"grasp_left_{b}", type=mujoco.mjtEq.mjEQ_WELD, name1="left_wrist_yaw_link",
                                   name2=b, objtype=mujoco.mjtObj.mjOBJ_BODY, active=False)
-                for hb in LEFT_HAND_BODIES:
-                    spec.add_exclude(bodyname1=hb, bodyname2=b)
+                # (no left-hand excludes: drawers are pushed shut with the left fingertips, which
+                # needs the contact; skills.close_opened)
         for t in targets:
             for hb in RIGHT_HAND_BODIES:
                 spec.add_exclude(bodyname1=hb, bodyname2=t)

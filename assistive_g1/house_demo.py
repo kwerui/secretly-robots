@@ -209,6 +209,9 @@ def main():
         p = d.body(body).xpos
         results.setdefault("final_item_pos", {})[item] = np.round(p, 3).tolist()
     results["fallen"] = robot.wbc.fallen()
+    if robot.estimator is not None:  # self-localization vs simulator truth (evaluation only)
+        results["localization_error_now"] = robot.estimator.error()
+        results["lidar_scans"] = dict(robot.estimator.stats)
     results["sim_s"] = round(d.time, 1)
     results["wall_s"] = round(time.time() - t0, 1)
     for k, v in results.items():

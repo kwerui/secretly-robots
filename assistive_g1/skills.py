@@ -45,6 +45,13 @@ ABOVE_ELBOW_MAX = float(os.environ.get("G1_ABOVE_ELBOW_MAX", "0.20"))
 # and put the hand near shoulder height, i.e. the elbow above the head.
 ABOVE_CLEARS = (0.12, 0.18, 0.26)
 ABOVE_STANDOFF = 0.45  # m, pelvis behind an item picked from above (body ~0.28 m clear of an open drawer's handle)
+DEBUG = bool(os.environ.get("ASSISTIVE_DEBUG"))
+GRASP_TOL = 0.05  # m, palm-to-grasp residual accepted before the grasp weld (it pulls in the rest)
+# Self-localization (state_estimation.py: IMU + leg odometry + LiDAR scan matching, RGB-D head
+# camera) in Jack's house. G1_LOCALIZE=0 falls back to the simulator's root pose.
+PUSH_FACE = 0.045  # m, drawer front behind its bar handle (Jack's HANDLE_STANDOFF)
+FINGER_REACH = 0.11  # m, Dex3 fingertips past the palm site along the fingers
+LOCALIZE = os.environ.get("G1_LOCALIZE", "1") != "0"
 
 
 def wrap(a: float) -> float:
@@ -52,7 +59,8 @@ def wrap(a: float) -> float:
 
 
 class AssistiveRobot:
-    def __init__(self, placement=None, on_frame: Callable[["AssistiveRobot"], None] | None = None, world=None):
+    def __init__(self, placement=None, on_frame: Callable[["AssistiveRobot"], None] | None = None, world=None,
+                 localize: bool | None = None):
         """world: None = our one-room scene (scene.build_scene); or a house.G1House (Jack's house),
         which supplies the model, stations, items, delivery surface, extra markers and a planner."""
         self.world = world
@@ -88,11 +96,26 @@ class AssistiveRobot:
         self._grip_dist = 0.0  # palm-to-body distance when the current grasp weld was made
         self._best_q = None
         self.wbc.place(*start)
+        self.estimator = None
+        if (LOCALIZE if localize is None else localize) and world is not None:
+            self._attach_estimator(world)
         self.wait(1.0)
+
+    def _attach_estimator(self, world) -> None:
+        """From here on the robot knows where it is only from its own sensors: the walking
+        controller, navigation, the arm IK and the head camera all use the estimate."""
+        from state_estimation import StateEstimator
+        est = StateEstimator(world, self.model, self.data, self.wbc)
+        self.estimator = est
+        self.wbc.estimator = est
+        self.ik.root_pose = self.left_ik.root_pose = lambda: (est.pos, est.quat)
+        self.cam.pose_source = est.camera_pose
 
     # ------------------------------------------------------------------ basics
     def _tick(self) -> None:
         self.wbc.step(int(round(CONTROL_DT / SIM_DT)))
+        if self.estimator is not None:
+            self.estimator.tick(CONTROL_DT)
         if self.on_frame is not None:
             self.on_frame(self)
 
@@ -445,7 +468,18 @@ class AssistiveRobot:
             self._swing(side, q_pre, 1.2)
         else:
             mover(pre, axes, duration=1.2, settle=0.1, q_ref=q_pre)
-        return mover(target, axes, duration=duration, q_ref=q_t)
+        e = mover(target, axes, duration=duration, q_ref=q_t)
+        if e > 0.02:
+            # The tracked approach stalls short of the target (collision rows near furniture, or a
+            # local minimum). The plan's own target configuration was collision-free: finish with a
+            # short joint-space move to it, re-solved for the current body pose.
+            q_fin, e_fin = ik.solve(target, axes, q_init=q_t, iters=200, q_ref=q_t)
+            if e_fin < e and not ik.collisions(q_fin):
+                self._swing(side, q_fin, 0.6)
+                e = float(np.linalg.norm(ik.palm_pose()[0] - target))
+            if DEBUG:
+                print(f"   reach[{side}]: tracked stalled, joint-space finish e_fin {e_fin:.3f} -> residual {e:.3f}")
+        return e
 
     def _choose(self, pre, grasp, candidates, postures, multi_start: bool = True, elbow_max: float | None = None):
         """Try postures in order; return (axes, score) of the best plan (see _plan). The plan's
@@ -506,7 +540,10 @@ class AssistiveRobot:
         self._item_collisions(item, False)
         self.holding = item
         _, R_palm = self.ik.palm_pose()
-        self.hold_vert = (0, R_palm[:, 0].copy())  # fingers (pointing down) keep their direction
+        # The item stood upright: keep its axis (world up, as seen from the palm at the grasp)
+        # vertical. Keeping the finger direction instead lets a pitched hand roll about it,
+        # which tilts the item (it then fell off the tray at the hand-over).
+        self.hold_vert = (R_palm.T @ np.array([0, 0, 1.0]), np.array([0, 0, 1.0]))
         self.hold_mode, self.hold_dz = "top", grasp[2] - centre[2]
         self.move_hand(pre + np.array([0, 0, 0.1]), axes, duration=0.8, settle=0.0, q_ref=q_pre)
         self.carry()
@@ -525,8 +562,15 @@ class AssistiveRobot:
         left = np.array([-np.sin(th), np.cos(th), 0.0])
         self._raise_hand(top[2] + 0.25, toward=top)
         up = np.array([0, 0, 1.0])
-        candidates = [[(0, -up, 0.6), (1, left, 0.3)], [(0, -up, 0.6), (1, fwd, 0.3)],
-                      [(0, -up, 0.6), (1, -left, 0.3)], [(0, -up, 0.6)]]
+
+        def pitched(deg):  # fingers down, tilted forward (away from us) by `deg`
+            a = np.deg2rad(deg)
+            return -up * np.cos(a) + fwd * np.sin(a)
+        # Pitched first (from the grasp-physical branch): with the fingers tilted forward the
+        # forearm comes over the drawer front lower, so the elbow stays down; straight down last.
+        candidates = [[(0, pitched(35), 0.6), (1, -left, 0.3)], [(0, pitched(35), 0.6), (1, left, 0.3)],
+                      [(0, pitched(20), 0.6), (1, -left, 0.3)], [(0, pitched(50), 0.6), (1, -left, 0.3)],
+                      [(0, -up, 0.6), (1, left, 0.3)], [(0, -up, 0.6), (1, fwd, 0.3)], [(0, -up, 0.6)]]
         # The item's distance varies with how far the drawer actually opened: try a few stances
         for standoff in (ABOVE_STANDOFF, ABOVE_STANDOFF + 0.05, ABOVE_STANDOFF - 0.04):
             goal = top[:2] - standoff * fwd[:2] + GRASP_LATERAL * left[:2]
@@ -553,7 +597,10 @@ class AssistiveRobot:
         # interpolation from the raised hand would drag the IK back into its local minimum).
         q_pre, q_g = self._best_q
         e = self._reach("right", q_pre, pre, grasp, q_g, axes, duration=1.0)
-        if e > 0.04:
+        if DEBUG:
+            print(f"   above: plan {best:.3f} clear {clear} posture {self.wbc.height_cmd:.2f}/{self.wbc.rpy_cmd[1]:.2f} "
+                  f"descent residual {e:.3f} hits {self.ik.collisions(self.arm_cmd)}")
+        if e > GRASP_TOL:
             self.move_hand(pre, axes, duration=0.8, q_ref=q_pre)
             self._set_posture(0.74, 0.0)
             self.arm_home()
@@ -562,7 +609,10 @@ class AssistiveRobot:
         self._item_collisions(item, False)
         self.holding = item
         _, R_palm = self.ik.palm_pose()
-        self.hold_vert = (0, R_palm[:, 0].copy())  # fingers (pointing down) keep their direction
+        # The item stood upright: keep its axis (world up, as seen from the palm at the grasp)
+        # vertical. Keeping the finger direction instead lets a pitched hand roll about it,
+        # which tilts the item (it then fell off the tray at the hand-over).
+        self.hold_vert = (R_palm.T @ np.array([0, 0, 1.0]), np.array([0, 0, 1.0]))
         self.hold_mode, self.hold_dz = "top", grasp[2] - centre[2]
         # Lift until the item's base clears the drawer front (it stands between us and the item),
         # however low the hand came in
@@ -675,6 +725,10 @@ class AssistiveRobot:
         self.move_hand(spot + np.array([0, 0, 0.17]), axes, duration=1.2)
         self.move_hand(spot, axes, duration=0.9)
         item = self.holding
+        if DEBUG:
+            b = self.model.body(self.item_body[item]).id
+            print(f"   hand_over: spot {spot.round(3)} palm {self.ik.palm_pose()[0].round(3)} item {self.data.xpos[b].round(3)} "
+                  f"item z-axis {self.data.xmat[b].reshape(3, 3)[:, 2].round(2)} surface top {surface['top']:.3f}")
         self._weld(f"grasp_{self.item_body[item]}", False)
         self.holding = None
         self.placed.append(spot.copy())
@@ -746,19 +800,40 @@ class AssistiveRobot:
         self._raise_hand(handle[2], toward=handle)
         candidates = [[(0, into, 0.6), (1, up, 0.4)], [(0, into, 0.6), (1, -up, 0.4)],
                       [(0, into, 0.6), (2, up, 0.4)], [(0, into, 0.6), (2, -up, 0.4)]]
-        axes, best, q_pre, q_h = self._plan(self.ik, self.arm_cmd.copy(), pre, handle, candidates)
-        if best > 0.05:
+        # Plan and reach from where we stand; if the handle can't be planned for or the reach
+        # falls short, step in (whole-body reach: the base is part of the plan) so the handle sits
+        # in front of the right shoulder, square to the front, look again and re-plan.
+        yaw_in = float(np.arctan2(into[1], into[0]))
+        f_in = np.array([np.cos(yaw_in), np.sin(yaw_in)])
+        l_in = np.array([-f_in[1], f_in[0]])
+        e, why = np.inf, ""
+        for dist in (None, 0.36, 0.31):
+            if dist is not None:
+                self.arm_home(0.6)
+                goal = handle[:2] - dist * f_in + GRASP_LATERAL * l_in
+                self._drive_to(goal[0], goal[1], yaw_in, tol=0.025, timeout=8.0)
+                det = self.cam.detect()  # re-measure from the new stance
+                if anchor_marker in det:
+                    A = det[anchor_marker]
+                    Ra, pa = A.rotation, A.position
+                    handle = Ra @ np.array(model.grasp_start) + pa
+                    pre = handle - 0.12 * into
+                self._raise_hand(handle[2], toward=handle)
+            axes, best, q_pre, q_h = self._plan(self.ik, self.arm_cmd.copy(), pre, handle, candidates)
+            if best > 0.05:
+                th = self.wbc.base_yaw
+                d = handle - self.wbc.base_pos
+                rel = [d[0] * np.cos(th) + d[1] * np.sin(th), -d[0] * np.sin(th) + d[1] * np.cos(th), d[2]]
+                why = (f"handle not reachable from here (score {best:.3f}; handle at "
+                       f"fwd {rel[0]:.2f} left {rel[1]:.2f} up {rel[2]:.2f} m from the pelvis)")
+                continue
+            e = self._reach("right", q_pre, pre, handle, q_h, axes, duration=0.8)
+            if e <= GRASP_TOL:
+                break
+            why = f"could not reach handle (residual {e:.3f} m)"
+        if e > GRASP_TOL:
             self.arm_home()
-            th = self.wbc.base_yaw
-            d = handle - self.wbc.base_pos
-            rel = [d[0] * np.cos(th) + d[1] * np.sin(th), -d[0] * np.sin(th) + d[1] * np.cos(th), d[2]]
-            return {"ok": False, "error": f"handle not reachable from here (score {best:.3f}; handle at "
-                    f"fwd {rel[0]:.2f} left {rel[1]:.2f} up {rel[2]:.2f} m from the pelvis)"}
-
-        e = self._reach("right", q_pre, pre, handle, q_h, axes, duration=0.8)
-        if e > 0.045:
-            self.arm_home()
-            return {"ok": False, "error": f"could not reach handle (residual {e:.3f} m)"}
+            return {"ok": False, "error": why}
         # Position-only grip on the handle: the door turns about its hinge while the wrist
         # keeps a comfortable orientation (like a loose grip around a bar handle).
         self._weld(weld, True, torquescale=0.0)
@@ -860,13 +935,14 @@ class AssistiveRobot:
                 best, best_t = score, t
         return best_t
 
-    def scratch_palm_axis(self, q: np.ndarray, idx: int) -> np.ndarray:
+    def scratch_palm_axis(self, q: np.ndarray, idx) -> np.ndarray:
         """World direction of palm axis `idx` if the right arm were at q."""
         s = self.ik.scratch
-        s.qpos[:] = self.data.qpos
+        self.ik._load(s)
         s.qpos[self.ik.qadr] = q
         mujoco.mj_kinematics(self.model, s)
-        return s.site_xmat[self.ik.site].reshape(3, 3)[:, idx].copy()
+        R = s.site_xmat[self.ik.site].reshape(3, 3)
+        return (R[:, idx] if np.isscalar(idx) else R @ idx).copy()
 
     def _turn_to(self, yaw: float, tol: float = 0.05, timeout: float = 6.0) -> None:
         """Turn in place. GR00T barely responds to small yaw-rate commands when the arms carry a
@@ -897,7 +973,7 @@ class AssistiveRobot:
             return float(np.arctan2(np.cross(c, n) @ a, c @ n))
         return None
 
-    def close_opened(self, seconds: float = 4.0, retries: int = 1) -> dict:
+    def close_opened(self, seconds: float = 4.0, retries: int = 1, push: bool = False) -> dict:
         """Close what open_articulated() opened, with the LEFT hand, while the right hand keeps
         holding whatever was taken out.
 
@@ -905,7 +981,13 @@ class AssistiveRobot:
         closing is the learned line (drawer) or arc (door) run from the current opening back
         to zero. The robot re-finds the anchor marker, grips the handle (for a bar handle, on
         its own left half), and walks forward as the part moves away from it.
+
+        push (drawers only): don't grip, push the handle bar shut with the open hand. Used when
+        the grip can't be reached or was lost part-way (a drawer doesn't need pulling to close).
         """
+        # Drawers are always pushed shut (gripping and walking the bar back lost it part-way in
+        # tests); doors are gripped past their free edge.
+        push = self.open_state is not None and self.open_state["model"].kind == "prismatic"
         st = self.open_state
         if st is None:
             return {"ok": False, "error": "nothing open"}
@@ -973,9 +1055,20 @@ class AssistiveRobot:
                 opened = measured
                 R_open, t_open = model.transform(opened)
                 handle = Ra @ (R_open @ g0 + t_open) + pa
-            goal = handle - 0.40 * fwd - GRASP_LATERAL * left
+            goal = handle - (0.42 if push else 0.40) * fwd - GRASP_LATERAL * left
+            if DEBUG:
+                print(f"   close stance: measured {measured} opened {opened:.3f} handle {handle.round(3)} "
+                      f"base {self.wbc.base_pos.round(3)} goal {goal[:2].round(3)}")
             if np.linalg.norm(goal[:2] - self.wbc.base_pos[:2]) < 0.06 and abs(wrap(yaw_goal - self.wbc.base_yaw)) < 0.1:
                 break
+            b = self.wbc.base_pos
+            back = float((goal[:2] - b[:2]) @ fwd[:2])
+            side = float((goal[:2] - b[:2]) @ left[:2])
+            if back < -0.05 and abs(side) > 0.10:
+                # Back off first, then sideways: a diagonal move sweeps the held item (tucked out
+                # to the right) along the open drawer's front and catches it on the handle bar
+                mid = b[:2] + back * fwd[:2]
+                self._drive_to(mid[0], mid[1], yaw_goal, tol=0.04, timeout=6.0)
             self._drive_to(goal[0], goal[1], yaw_goal, tol=0.03, timeout=8.0)
             self._turn_to(yaw_goal)
 
@@ -983,18 +1076,28 @@ class AssistiveRobot:
         pre = handle - 0.12 * into
         candidates = [[(0, into, 0.6), (1, up, 0.4)], [(0, into, 0.6), (1, -up, 0.4)],
                       [(0, into, 0.6), (2, up, 0.4)], [(0, into, 0.6), (2, -up, 0.4)]]
-        axes, best, q_best, q_h = self._plan(self.left_ik, self.left_cmd.copy(), pre, handle, candidates)
+        # Pushing: fingertips (~11 cm past the palm site) on the drawer front, 8 cm above the bar
+        push_off = (PUSH_FACE - FINGER_REACH) * into + np.array([0, 0, 0.08])
+        contact = handle + push_off if push else handle
+        if push:
+            pre = contact - 0.10 * into
+        axes, best, q_best, q_h = self._plan(self.left_ik, self.left_cmd.copy(), pre, contact, candidates)
+        if best > 0.05 and not push and model.kind == "prismatic":
+            return self.close_opened(seconds, 0, push=True)
         if best > 0.05:
             rel = handle - self.wbc.base_pos
             return {"ok": False, "error": f"handle not reachable with the left hand (score {best:.3f})",
                     "handle_rel_pelvis": rel.round(3).tolist(), "yaw": round(self.wbc.base_yaw, 3),
                     "yaw_goal": round(yaw_goal, 3)}
         # joint-space swing to the pre-grasp (avoids IK local minima from the hand-by-the-hip pose)
-        e = self._reach("left", q_best, pre, handle, q_h, axes, duration=0.8)
+        e = self._reach("left", q_best, pre, contact, q_h, axes, duration=0.8)
         if e > 0.04:
             self.left_arm_home()
+            if not push and model.kind == "prismatic":
+                return {**self.close_opened(seconds, 0, push=True), "grip_failed": round(e, 3)}
             return {"ok": False, "error": f"could not reach the handle with the left hand (residual {e:.3f} m)"}
-        self._weld(lweld, True, torquescale=0.0, ik=self.left_ik)
+        if not push:
+            self._weld(lweld, True, torquescale=0.0, ik=self.left_ik)
 
         # The learned path, backwards: opening `opened` -> 0. Paced by the hand's path length:
         # the feet (GR00T, <= 0.15 m/s sideways) have to keep the handle within reach.
@@ -1009,37 +1112,59 @@ class AssistiveRobot:
         for k in range(1, steps + 1):
             s = k / steps
             s = s * s * (3 - 2 * s)
-            R, t = model.transform(opened * (1 - s))
-            targets.append(Ra @ (R @ g0 + t) + pa)
+            if push:  # fingertips pressed 2.5 cm into the front, running 3 cm past shut
+                R, t = model.transform(opened * (1 - s) - 0.03 * s)
+                targets.append(Ra @ (R @ g0 + t) + pa + push_off + 0.025 * into)
+            else:
+                R, t = model.transform(opened * (1 - s))
+                targets.append(Ra @ (R @ g0 + t) + pa)
         q = self.left_cmd.copy()
         q_ref = q.copy()  # stay on the grasp configuration's branch
         bad, reached = 0, 0
         vel = np.zeros(2)
         hand_home = np.array([0.36, GRASP_LATERAL])  # where the handle should sit in the body frame (well within reach)
-        for i, p in enumerate(targets):
-            # Follow the handle with the feet: keep it ~0.42 m ahead and in line with the left
+        k, i = 0, 0
+        while k < len(targets) and i < 3 * len(targets):
+            p = targets[k]
+            i += 1
+            # Follow the handle with the feet: keep it ~0.36 m ahead and in line with the left
             # shoulder (body frame, so a drifted heading doesn't fool it), and hold the heading.
             th = self.wbc.base_yaw
             d = (p - self.wbc.base_pos)[:2]
             rel = np.array([np.cos(th) * d[0] + np.sin(th) * d[1], -np.sin(th) * d[0] + np.cos(th) * d[1]])
             e = rel - hand_home
-            want = np.where(np.abs(e) > 0.04, np.clip(1.2 * e, -BACKOFF_SPEED, BACKOFF_SPEED), 0.0)
+            lim = np.array([0.25, BACKOFF_SPEED])  # walking forward can be quicker than sideways
+            want = np.where(np.abs(e) > 0.03, np.clip(1.2 * e, -lim, lim), 0.0)
             vel += np.clip(want - vel, -0.5 * CONTROL_DT, 0.5 * CONTROL_DT)
             yerr = wrap(yaw_goal - th)
             wz = float(np.clip(1.5 * yerr, -0.5, 0.5)) if abs(yerr) > 0.08 else 0.0
             v_cmd = np.where(np.abs(vel) > 0.05, vel, 0.0)
             self.wbc.set_velocity(float(v_cmd[0]), float(v_cmd[1]), wz)
-            q, _ = self.left_ik.solve(p, [(axes[1][0], axes[1][1], 0.2)], q_init=q, iters=25, q_ref=q_ref)
+            # gripping: only a weak palm-up preference (the part turns the hand); pushing: the
+            # fingers must keep pointing into the front, or the fingertips miss it
+            q, _ = self.left_ik.solve(p, axes if push else [(axes[1][0], axes[1][1], 0.2)], q_init=q, iters=25,
+                                      q_ref=q_ref)
             self._set_left_arm(q)
             self._tick()
             err = float(np.linalg.norm(self.left_ik.palm_pose()[0] - p))
+            # Pace the path by the feet: only move the target on while the hand keeps up and the
+            # target is still comfortably within reach (the feet are slower than the arm)
+            if err < 0.05 and rel[0] < hand_home[0] + 0.06:
+                k += 1
             bad = bad + 1 if err > 0.07 else 0  # the part's damping makes the soft arm lag a bit
-            reached = i + 1
-            if bad >= 40:
+            reached = k
+            if DEBUG and i % 50 == 0 and self.world is not None:
+                print(f"     close tick {i}: k {k}/{len(targets)} err {err:.3f} rel {rel.round(2)} "
+                      f"vel {v_cmd.round(2)} drawer {__import__("house").G1House.drawer_open_m(self.world, __import__("house").KITCHEN_TOP):.3f}")
+            if bad >= 60:
+                if DEBUG:
+                    print(f"   close: lost the path at {k}/{steps}: err {err:.3f} target rel body {rel.round(3)} "
+                          f"vel {v_cmd.round(2)} hits {self.left_ik.collisions(self.left_cmd)}")
                 break
         self.wbc.set_velocity(0, 0, 0)
         self.wait(0.4)
-        self._weld(lweld, False)
+        if not push:
+            self._weld(lweld, False)
         p, R_palm = self.left_ik.palm_pose()
         self.move_left_hand(p - 0.10 * R_palm[:, 0], None, duration=0.6, settle=0.1)
         self.left_arm_home()
@@ -1056,10 +1181,10 @@ class AssistiveRobot:
         self.open_state = None if shut else {**st, "opened": closed_to}
         if not shut and retries > 0 and reached > 0:
             # lost it part-way: grip it again where it is now and finish
-            again = self.close_opened(seconds, retries - 1)
+            again = self.close_opened(seconds, retries - 1, push=True)
             return {**again, "retried": True, "first_try_left_open": round(closed_to, 3)}
         unit = "rad" if model.kind == "revolute" else "m"
-        return {"ok": shut, f"closed_from_{unit}": round(opened, 3), f"left_open_{unit}": round(closed_to, 3),
+        return {"ok": shut, "pushed": push, f"closed_from_{unit}": round(opened, 3), f"left_open_{unit}": round(closed_to, 3),
                 "checked_by_camera": seen is not None, "still_holding": self.holding}
 
     def put_down(self, height_offset: float = 0.0) -> dict:

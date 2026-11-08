@@ -55,6 +55,15 @@ class HeadCamera:
         params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         self.detector = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(MARKER_DICT), params)
         self.last_rgb: np.ndarray | None = None
+        # RGB-D: a depth image from the same camera refines each marker's position (PnP range
+        # error grows with distance; depth doesn't care about the marker's apparent size)
+        self.use_depth = True
+        self.depth_renderer = mujoco.Renderer(model, height, width)
+        self.depth_renderer.enable_depth_rendering()
+        self.last_depth: np.ndarray | None = None
+        # () -> (camera position, camera rotation) the robot believes (state estimator +
+        # forward kinematics); None = simulator truth
+        self.pose_source = None
 
     def render(self) -> np.ndarray:
         self.renderer.update_scene(self.data, camera=self.cam_id)
@@ -69,8 +78,12 @@ class HeadCamera:
         out: dict[int, MarkerPose] = {}
         if ids is None:
             return out
-        cam_pos = self.data.cam_xpos[self.cam_id].copy()
-        cam_rot = self.data.cam_xmat[self.cam_id].reshape(3, 3).copy()
+        if self.pose_source is not None:
+            cam_pos, cam_rot = self.pose_source()
+        else:
+            cam_pos = self.data.cam_xpos[self.cam_id].copy()
+            cam_rot = self.data.cam_xmat[self.cam_id].reshape(3, 3).copy()
+        depth = self.render_depth() if self.use_depth else None
         for c, mid in zip(corners, ids.flatten()):
             mid = int(mid)
             if mid not in self.sizes:
@@ -82,10 +95,34 @@ class HeadCamera:
             if not ok:
                 continue
             r_cv, _ = cv2.Rodrigues(rvec)
-            p_mj = CV_TO_MJ @ tvec.flatten()
+            if depth is not None:
+                tvec = self._depth_refine(depth, c.reshape(4, 2), tvec.flatten())
+            p_mj = CV_TO_MJ @ np.asarray(tvec).flatten()
             r_mj = CV_TO_MJ @ r_cv
             out[mid] = MarkerPose(mid, cam_pos + cam_rot @ p_mj, cam_rot @ r_mj, float(np.linalg.norm(tvec)))
         return out
+
+    def render_depth(self) -> np.ndarray:
+        """Metric depth image (m along the optical axis) from the head camera."""
+        self.depth_renderer.update_scene(self.data, camera=self.cam_id)
+        self.last_depth = self.depth_renderer.render().copy()
+        return self.last_depth
+
+    def _depth_refine(self, depth: np.ndarray, corners: np.ndarray, t_pnp: np.ndarray) -> np.ndarray:
+        """Marker centre from the depth image (median depth over the marker's inner pixels,
+        back-projected through the centre pixel). Falls back to PnP if depth disagrees a lot
+        (e.g. the marker is partly occluded)."""
+        u, v = corners.mean(axis=0)
+        r = max(2, int(0.25 * np.linalg.norm(corners[0] - corners[2])))
+        i0, i1 = int(max(v - r, 0)), int(min(v + r + 1, depth.shape[0]))
+        j0, j1 = int(max(u - r, 0)), int(min(u + r + 1, depth.shape[1]))
+        patch = depth[i0:i1, j0:j1]
+        patch = patch[(patch > 0.05) & (patch < 10.0)]
+        if patch.size < 4:
+            return t_pnp
+        z = float(np.median(patch))
+        t_d = z * np.linalg.solve(self.K, np.array([u, v, 1.0]))
+        return t_d if np.linalg.norm(t_d - t_pnp) < 0.10 else t_pnp
 
     def _detect_raw(self, gray: np.ndarray):
         """Detect markers; markers missed in the plain image (small or in shadow, e.g. inside a

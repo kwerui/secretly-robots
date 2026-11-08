@@ -120,6 +120,12 @@ class G1WBC:
         self._root_q = model.jnt_qposadr[root]
         self._root_v = model.jnt_dofadr[root]
         self.pelvis_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
+        gyro = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, "imu-pelvis-angular-velocity")
+        self._gyro_adr = int(model.sensor_adr[gyro]) if gyro >= 0 else None
+        # Optional state estimator (state_estimation.StateEstimator). When set, base_pos /
+        # base_yaw / base_vel_body / fallen() and the policy's IMU inputs come from the robot's
+        # own sensors instead of the simulator's root pose; true_* stay for evaluation.
+        self.estimator = None
 
         self.reset_controller()
 
@@ -146,29 +152,51 @@ class G1WBC:
         return self.data.qpos[self._qpos_ids[ARM_SLICE]].copy()
 
     @property
-    def base_pos(self) -> np.ndarray:
+    def dq(self) -> np.ndarray:
+        return self.data.qvel[self._qvel_ids].copy()
+
+    # Simulator truth (evaluation, and the sim-side setup only)
+    @property
+    def true_base_pos(self) -> np.ndarray:
         return self.data.qpos[self._root_q:self._root_q + 3].copy()
 
     @property
-    def base_quat(self) -> np.ndarray:
+    def true_base_quat(self) -> np.ndarray:
         return self.data.qpos[self._root_q + 3:self._root_q + 7].copy()
 
     @property
-    def base_yaw(self) -> float:
-        w, x, y, z = self.base_quat
+    def true_base_yaw(self) -> float:
+        w, x, y, z = self.true_base_quat
         return float(np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)))
+
+    # What the robot believes (the estimator's output when one is attached)
+    @property
+    def base_pos(self) -> np.ndarray:
+        return self.estimator.pos if self.estimator is not None else self.true_base_pos
+
+    @property
+    def base_quat(self) -> np.ndarray:
+        return self.estimator.quat if self.estimator is not None else self.true_base_quat
+
+    @property
+    def base_yaw(self) -> float:
+        return float(self.estimator.yaw) if self.estimator is not None else self.true_base_yaw
 
     @property
     def base_vel_body(self) -> np.ndarray:
         """(vx, vy, wz) of the pelvis in its own heading frame."""
+        if self.estimator is not None:
+            return self.estimator.vel.copy()
         v = self.data.qvel[self._root_v:self._root_v + 3]  # world frame for a free joint
-        th = self.base_yaw
+        th = self.true_base_yaw
         vx = np.cos(th) * v[0] + np.sin(th) * v[1]
         vy = -np.sin(th) * v[0] + np.cos(th) * v[1]
         return np.array([vx, vy, self.data.qvel[self._root_v + 5]])
 
     def fallen(self) -> bool:
-        return self.base_pos[2] < 0.25 or gravity_in_body(self.base_quat)[2] > -0.5
+        if self.estimator is not None:
+            return self.estimator.z < 0.25 or self.estimator.gravity_body[2] > -0.5
+        return self.true_base_pos[2] < 0.25 or gravity_in_body(self.true_base_quat)[2] > -0.5
 
     # ------------------------------------------------------------------ loop
     def reset_controller(self) -> None:
@@ -194,13 +222,18 @@ class G1WBC:
         d = self.data
         qj = d.qpos[self._qpos_ids].astype(np.float32)
         dqj = d.qvel[self._qvel_ids].astype(np.float32)
-        omega = d.qvel[self._root_v + 3:self._root_v + 6].astype(np.float32)  # body frame
+        if self.estimator is not None and self._gyro_adr is not None:
+            omega = d.sensordata[self._gyro_adr:self._gyro_adr + 3].astype(np.float32)  # pelvis gyro
+            grav = self.estimator.gravity_body.astype(np.float32)  # IMU attitude filter
+        else:
+            omega = d.qvel[self._root_v + 3:self._root_v + 6].astype(np.float32)  # body frame
+            grav = gravity_in_body(self.true_base_quat)
         obs = np.zeros(OBS_DIM, dtype=np.float32)
         obs[0:3] = self.cmd * CMD_SCALE
         obs[3] = self.height_cmd
         obs[4:7] = self.rpy_cmd
         obs[7:10] = omega * ANG_VEL_SCALE
-        obs[10:13] = gravity_in_body(self.base_quat)
+        obs[10:13] = grav
         obs[13:42] = qj - DEFAULT_ANGLES
         obs[42:71] = dqj * DOF_VEL_SCALE
         obs[71:86] = self.action
@@ -228,6 +261,8 @@ class G1WBC:
                 tau[ARM_SLICE] += d.qfrc_bias[self._qvel_ids[ARM_SLICE]]
             d.ctrl[self._act_ids] = tau
             mujoco.mj_step(self.model, d)
+            if self.estimator is not None:
+                self.estimator.imu_step(SIM_DT)
             self._tick += 1
 
     def step_seconds(self, t: float) -> None:

@@ -169,6 +169,8 @@ def main():
         for item, body in env.item_body.items():
             print(f"  {item}: {[round(float(v), 3) for v in d.body(body).xpos]}")
         print(f"  drawer open: {env.drawer_open_m(KITCHEN_TOP):.3f} m, fallen: {robot.wbc.fallen()}, sim {d.time:.1f} s")
+        if robot.estimator is not None:
+            print(f"  localization (estimate vs truth): {robot.estimator.error()}, LiDAR {robot.estimator.stats}")
         if viewer is not None:
             print("Close the viewer window (or Ctrl+C) to exit.")
             try:

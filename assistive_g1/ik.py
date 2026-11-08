@@ -69,6 +69,11 @@ class ArmIK:
         self.model, self.data = model, data
         self.side = side
         self.scratch = mujoco.MjData(model)
+        self._palm_buf = mujoco.MjData(model)
+        # () -> (base position, base quaternion wxyz) the robot believes; None = simulator truth
+        self.root_pose = None
+        root = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "floating_base_joint")
+        self.root_q = model.jnt_qposadr[root]
         self.site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"{side}_palm")
         self.elbow = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{side}_elbow_link")
         self.shoulder = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{side}_shoulder_pitch_link")
@@ -117,7 +122,7 @@ class ArmIK:
     def collisions(self, q: np.ndarray, margin: float = 0.01) -> list[tuple[str, str]]:
         """Contacts between this arm and anything else if the arm were at q (current base pose)."""
         s = self.scratch
-        s.qpos[:] = self.data.qpos
+        self._load(s)
         s.qpos[self.qadr] = q
         mujoco.mj_forward(self.model, s)
         hits = []
@@ -168,7 +173,7 @@ class ArmIK:
     def min_clearance(self, q: np.ndarray) -> float:
         """Smallest arm-to-obstacle distance (m, negative = penetration) with the arm at q."""
         s = self.scratch
-        s.qpos[:] = self.data.qpos
+        self._load(s)
         s.qpos[self.qadr] = q
         mujoco.mj_kinematics(self.model, s)
         return self._collision_rows(s, self._candidate_pairs(s))[2]
@@ -176,7 +181,7 @@ class ArmIK:
     def elbow_lift(self, q: np.ndarray) -> float:
         """How high the elbow is relative to the shoulder (m) if the arm were at q; negative = below."""
         s = self.scratch
-        s.qpos[:] = self.data.qpos
+        self._load(s)
         s.qpos[self.qadr] = q
         mujoco.mj_kinematics(self.model, s)
         return float(s.xpos[self.elbow, 2] - s.xpos[self.shoulder, 2])
@@ -194,7 +199,21 @@ class ArmIK:
         """Smallest distance (rad) of any joint of q to its limit."""
         return float(np.minimum(q - self.lo, self.hi - q).min())
 
+    def _load(self, s: mujoco.MjData) -> None:
+        """Current joint state into the scratch buffer, with the base where the robot *believes*
+        it is (root_pose, from the state estimator) instead of the simulator's root pose."""
+        s.qpos[:] = self.data.qpos
+        if self.root_pose is not None:
+            pos, quat = self.root_pose()
+            s.qpos[self.root_q:self.root_q + 3] = pos
+            s.qpos[self.root_q + 3:self.root_q + 7] = quat
+
     def palm_pose(self, data: mujoco.MjData | None = None) -> tuple[np.ndarray, np.ndarray]:
+        if data is None and self.root_pose is not None:
+            s = self._palm_buf
+            self._load(s)
+            mujoco.mj_kinematics(self.model, s)
+            return s.site_xpos[self.site].copy(), s.site_xmat[self.site].reshape(3, 3).copy()
         d = data or self.data
         return d.site_xpos[self.site].copy(), d.site_xmat[self.site].reshape(3, 3).copy()
 
@@ -214,12 +233,12 @@ class ArmIK:
     ) -> tuple[np.ndarray, float]:
         """Return (7 arm joint angles, final position error in metres).
 
-        axes: list of (site axis index 0/1/2, desired world direction, weight).
+        axes: list of (site axis index 0/1/2 or a palm-frame unit vector, desired world direction, weight).
         q_ref: planned configuration to stay near (null-space pull, ref_weight) instead of the
         home pose: keeps the executed motion on the branch the plan was checked on.
         """
         s = self.scratch
-        s.qpos[:] = self.data.qpos
+        self._load(s)
         s.qvel[:] = 0
         q = s.qpos[self.qadr].copy() if q_init is None else np.array(q_init, dtype=float)
         q = np.clip(q, self.lo, self.hi)
@@ -244,7 +263,7 @@ class ArmIK:
             e = [target_pos - p]
             J = [Jp]
             for idx, want, w in axes:
-                have = R[:, idx]
+                have = R[:, idx] if np.isscalar(idx) else R @ idx  # a palm axis, or any palm-frame vector
                 want = want / np.linalg.norm(want)
                 e.append(w * np.cross(have, want))
                 J.append(w * Jr)
@@ -255,7 +274,8 @@ class ArmIK:
             e = np.concatenate(e)
             J = np.vstack(J)
             err_pos = float(np.linalg.norm(target_pos - p))
-            if not col_rows and err_pos < tol and all(np.linalg.norm(np.cross(R[:, i], v / np.linalg.norm(v))) < 0.08 for i, v, _ in axes):
+            if not col_rows and err_pos < tol and all(np.linalg.norm(np.cross(R[:, i] if np.isscalar(i) else R @ i, v / np.linalg.norm(v))) < 0.08
+                                                             for i, v, _ in axes):
                 break
             JJt = J @ J.T + (damping ** 2) * np.eye(J.shape[0])
             dq = J.T @ np.linalg.solve(JJt, e)
