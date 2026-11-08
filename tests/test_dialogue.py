@@ -264,3 +264,22 @@ def test_gemma_classify_validates_model_output(monkeypatch):
     monkeypatch.setattr(g, "_chat", lambda *a: {"kind": "yes", "item_id": "unknown"})
     assert g.classify("sure")[0] == "other"  # a 'yes' with no question pending means nothing
     assert g.classify("sure", expecting_answer=True)[0] == "yes"
+
+
+def test_gemma_falls_back_to_prompt_json_when_schema_output_is_501(monkeypatch):
+    from urllib.error import HTTPError
+    from brain.intent import OllamaIntentParser
+    g = OllamaIntentParser()
+    calls = []
+
+    def post(system, user, schema):
+        calls.append(schema is not None)
+        if schema is not None:
+            raise HTTPError("u", 501, "Not Implemented", {}, None)
+        assert "Reply with exactly one JSON object" in system
+        return {"kind": "hint", "item_id": "water_bottle"}
+
+    monkeypatch.setattr(g, "_post", post)
+    assert g.classify("I'm feeling a bit dried out") == ("hint", "water_bottle")
+    assert g.classify("I'm feeling a bit dried out") == ("hint", "water_bottle")
+    assert calls == [True, False, False]  # schema tried once, then remembered as unsupported

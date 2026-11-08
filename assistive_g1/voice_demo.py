@@ -149,7 +149,7 @@ class Demo:
         self.captions[who] = (text, time.time() + seconds)
 
     # ------------------------------------------------------------------ drawing
-    def draw(self, viewer) -> None:
+    def texts(self) -> list:
         now = time.time()
         texts = []
         if self.mode == "fetch" and self.plan:
@@ -168,8 +168,10 @@ class Demo:
                  for w, (t, until) in sorted(self.captions.items()) if until > now]
         if lines:
             texts.append((FONT, mujoco.mjtGridPos.mjGRID_BOTTOM, "\n".join(lines), None))
-        viewer.set_texts(texts)
+        return texts
 
+    def draw_scene(self, viewer) -> None:
+        """Mode light and planned-route line. Call while holding the viewer lock."""
         scn, m, d = viewer.user_scn, self.env.model, self.env.data
         scn.ngeom = 0
         head = d.xpos[m.body("torso_link").id] + np.array([0, 0, 0.75])
@@ -200,13 +202,20 @@ class Demo:
             v.cam.distance, v.cam.azimuth, v.cam.elevation = 4.5, 200, -25
             print("keys: V person speaks | Y/N person answers | X cancel fetch mode")
             t0, s0 = time.time(), self.env.data.time
+            shown = None
             while v.is_running():
                 self.handle_keys()
                 self.robot.wait(0.04)  # two 50 Hz control ticks: the G1 keeps balancing
                 self.listen()
                 self.follow_events()
                 with v.lock():
-                    self.draw(v)
+                    self.draw_scene(v)
+                # set_texts waits for the viewer's GUI thread, which needs the lock: never call it
+                # while holding the lock (deadlock), and only when the text actually changes.
+                texts = self.texts()
+                if texts != shown:
+                    v.set_texts(texts)
+                    shown = texts
                 v.sync()
                 ahead = (self.env.data.time - s0) - (time.time() - t0)
                 if ahead > 0:

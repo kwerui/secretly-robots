@@ -15,7 +15,7 @@ import time
 from brain.hearing import MicAudioSource, SimAudioSource
 from brain.robot_voice import RobotVoice
 from brain.speech_to_text import WhisperSTT
-from brain.voice_pipeline import VoicePipeline, default_listener, local_gemma
+from brain.voice_pipeline import VoicePipeline, default_listener, load_gemma_in_background
 from brain.voice_window import PORT, VoiceEvents, serve
 
 
@@ -34,17 +34,21 @@ def build(port: int, open_browser: bool, with_commands: bool, use_gemma: bool = 
         print(f'  robot: "{text}"')
         return text
 
-    gemma = None
-    if with_commands and use_gemma:
-        events.add("status", message="loading Gemma 4 (local Ollama)…", listening=False)
-        gemma = local_gemma()
-        print("interpreter: rules + Gemma 4 (local Ollama)" if gemma else
-              "interpreter: rules only (start `ollama serve` and pull gemma4:e4b for free-form speech)")
-    listener = default_listener(say=say, gemma=gemma) if with_commands else None
+    listener = default_listener(say=say) if with_commands else None
     if with_commands and listener is None:
         print("brain.command not available: showing transcripts only")
     pipeline = VoicePipeline(stt, events, listener).start()
-    pipeline.interpreter_name = "rules + Gemma 4" if gemma else "rules"
+    pipeline.interpreter_name = "rules"
+    if listener is not None and use_gemma:
+        pipeline.interpreter_name = "rules (Gemma 4 loading…)"
+
+        def ready(g):
+            pipeline.interpreter_name = "rules + Gemma 4" if g else "rules (Gemma 4 unavailable)"
+            print("interpreter: rules + Gemma 4 (local Ollama)" if g else
+                  "interpreter: rules only (run `ollama serve`; `ollama pull gemma4:e4b`)", flush=True)
+            events.add("status", listening=True, message=f"interpreter now: {pipeline.interpreter_name}")
+
+        load_gemma_in_background(listener, ready)
     return events, pipeline, robot
 
 

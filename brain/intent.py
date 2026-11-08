@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import re
 from urllib.request import Request, urlopen
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from .contracts import FetchTask
 
 ALLOWED_OBJECTS = {"water_bottle", "cup", "book"}
@@ -160,19 +160,48 @@ class OllamaIntentParser:
         return kind, item
 
     def _chat(self, system: str, user: str, schema: dict) -> dict:
+        """One local chat call returning a JSON object.
+
+        Prefers Ollama's schema-constrained output. Some Ollama engines (the MLX runner
+        without xgrammar) answer 501 to that; then ask for the JSON in the prompt instead
+        and parse it. Either way the caller validates every field.
+        """
+        if not getattr(self, "_no_format", False):
+            try:
+                return self._post(system, user, schema)
+            except HTTPError as exc:
+                if exc.code != 501:
+                    raise IntentError(f"Local model error: HTTP {exc.code}") from exc
+                self._no_format = True
+        fields = ", ".join(f'"{k}": one of {v["enum"]}' for k, v in schema["properties"].items())
+        system = f"{system}\nReply with exactly one JSON object and nothing else: {{{fields}}}."
+        return self._post(system, user, None)
+
+    def _post(self, system: str, user: str, schema: dict | None) -> dict:
         payload = {
-            "model": self.model, "stream": False, "format": schema, "think": False,
-            "keep_alive": "30m",
+            "model": self.model, "stream": False, "think": False, "keep_alive": "2h",
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "options": {"temperature": 0},
         }
+        if schema is not None:
+            payload["format"] = schema
         req = Request(self.endpoint, json.dumps(payload).encode(), {"Content-Type": "application/json"})
         try:
             with urlopen(req, timeout=self.timeout_s) as response:
                 answer = json.loads(response.read().decode())
-            return json.loads(answer["message"]["content"])
+            content = answer["message"]["content"]
+        except HTTPError:
+            raise
         except (URLError, TimeoutError, KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
             raise IntentError(f"Local model unavailable or invalid output: {exc}") from exc
+        match = re.search(r"\{.*\}", content, re.S)  # tolerate ```json fences or stray words
+        try:
+            value = json.loads(match.group(0) if match else content)
+        except json.JSONDecodeError as exc:
+            raise IntentError(f"Local model did not return JSON: {content[:80]!r}") from exc
+        if not isinstance(value, dict):
+            raise IntentError("Local model did not return a JSON object")
+        return value
 
     def warm_up(self) -> None:
         """Load the model into memory before anyone speaks (first call is slow)."""

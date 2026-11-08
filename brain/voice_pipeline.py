@@ -28,15 +28,32 @@ class _Listener(Protocol):
     def heard(self, transcript: str, stt_ms: float | None = None): ...
 
 
-def local_gemma(model: str = "gemma4:e4b"):
-    """Gemma 4 on the local Ollama server, warmed up; None if it isn't running."""
+def local_gemma(model: str = "gemma4:e4b", load_timeout_s: float = 300, call_timeout_s: float = 20):
+    """Gemma 4 on the local Ollama server, loaded and warmed up; None if it isn't available.
+
+    The first load of the weights can take minutes; after that each call is ~0.3 s.
+    """
     from .intent import IntentError, OllamaIntentParser
-    g = OllamaIntentParser(model=model, timeout_s=20)
+    g = OllamaIntentParser(model=model, timeout_s=load_timeout_s)
     try:
         g.warm_up()
     except IntentError:
         return None
+    g.timeout_s = call_timeout_s
     return g
+
+
+def load_gemma_in_background(listener, on_ready=None, model: str = "gemma4:e4b") -> threading.Thread:
+    """Start with the rules; switch Gemma on for unfamiliar speech once it has loaded."""
+    def run():
+        g = local_gemma(model)
+        if g is not None:
+            listener.interpreter.gemma = g
+        if on_ready is not None:
+            on_ready(g)
+    t = threading.Thread(target=run, daemon=True, name="gemma-loader")
+    t.start()
+    return t
 
 
 def default_listener(log_file: str | None = str(Path(__file__).resolve().parent.parent / "logs" / "brain_events.jsonl"),
