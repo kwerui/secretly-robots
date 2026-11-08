@@ -85,7 +85,7 @@ def test_no_declines_without_a_task():
     lis, said, brain = make()
     lis.heard("I'm parched.")
     s = lis.heard("No, thank you.")
-    assert s.status == "declined" and s.reason == "person said no" and s.task is None
+    assert s.status == "declined" and s.reason == "person said no (rules)" and s.task is None
     assert said == ["ask_water", "declined"] and brain.tasks == []
 
 
@@ -188,3 +188,79 @@ def test_real_conversation_in_the_house():
     assert say(ANSWERS["no"]).status == "declined"
     assert said == ["ask_water", "will_fetch_water", "ask_water", "declined"]
     assert len(brain.tasks) == 1
+
+
+# ---------------------------------------------------------------- Gemma for what the rules don't know
+
+class FakeGemma:
+    """Stands in for OllamaIntentParser.classify; records what it was asked."""
+    endpoint = "http://127.0.0.1:11434/api/chat"
+
+    def __init__(self, answers):
+        self.answers, self.asked = answers, []
+
+    def classify(self, text, expecting_answer=False):
+        self.asked.append((text, expecting_answer))
+        out = self.answers[text]
+        if isinstance(out, Exception):
+            raise out
+        return out
+
+
+def make_with_gemma(answers):
+    from brain.command import OnboardInterpreter
+    gemma = FakeGemma(answers)
+    said, brain = [], FakeBrain()
+    lis = CommandListener(OnboardInterpreter(gemma=gemma), brain=brain, clock=Clock(),
+                          say=lambda k: (said.append(k), LINES[k])[1])
+    return lis, gemma, said, brain
+
+
+def test_known_phrases_never_wait_for_gemma():
+    lis, gemma, said, _ = make_with_gemma({})
+    assert lis.heard("I need water.").parser_source == "rules"
+    lis.heard("My mouth is so dry.")
+    assert lis.heard("Yes, please.").status == "understood"
+    assert gemma.asked == []
+
+
+def test_gemma_handles_free_form_hint_and_answer():
+    lis, gemma, said, brain = make_with_gemma({
+        "I could do with something cold, it's warm in here": ("hint", "water_bottle"),
+        "go for it": ("yes", "unknown"),
+    })
+    s = lis.heard("I could do with something cold, it's warm in here")
+    assert s.status == "confirming" and s.parser_source == "gemma"
+    s = lis.heard("go for it")
+    assert s.status == "understood" and len(brain.tasks) == 1
+    assert gemma.asked[1] == ("go for it", True)  # told it's an answer
+
+
+def test_gemma_request_and_other():
+    lis, gemma, _, brain = make_with_gemma({
+        "pop over and grab my book would you": ("request", "book"),
+        "my knee is aching today": ("other", "unknown"),
+    })
+    s = lis.heard("pop over and grab my book would you")
+    assert s.status == "understood" and s.task == FetchTask("book") and s.parser_source == "gemma"
+    s = lis.heard("my knee is aching today")
+    assert s.status == "rejected" and "gemma" in s.reason
+    assert len(brain.tasks) == 1
+
+
+def test_gemma_down_falls_back_to_rules_without_crashing():
+    from brain.intent import IntentError
+    lis, gemma, _, brain = make_with_gemma({"fetch the cup": IntentError("Local model unavailable")})
+    s = lis.heard("fetch the cup")
+    assert s.status == "understood" and s.parser_source == "rules" and s.task == FetchTask("cup")
+
+
+def test_gemma_classify_validates_model_output(monkeypatch):
+    from brain.intent import IntentError, OllamaIntentParser
+    g = OllamaIntentParser()
+    monkeypatch.setattr(g, "_chat", lambda *a: {"kind": "request", "item_id": "pill_box"})
+    with pytest.raises(IntentError):
+        g.classify("bring my pills")  # unsupported item is refused, not guessed
+    monkeypatch.setattr(g, "_chat", lambda *a: {"kind": "yes", "item_id": "unknown"})
+    assert g.classify("sure")[0] == "other"  # a 'yes' with no question pending means nothing
+    assert g.classify("sure", expecting_answer=True)[0] == "yes"

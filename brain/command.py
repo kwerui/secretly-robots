@@ -41,6 +41,43 @@ class OnboardInterpreter:
         self.rules = rules or RulesIntentParser()
         self._clock = clock
 
+    def classify(self, transcript: str, expecting_answer: bool = False):
+        """Rules first (instant); Gemma only for what the rules don't recognise.
+
+        Returns (kind, task, source, reason, intent_ms) with kind in
+        request / hint / yes / no / other and task set for request and hint.
+        """
+        start = self._clock()
+        if expecting_answer:
+            ans = classify_answer(transcript)
+            if ans is not None:
+                return ans, None, "rules", "", _ms(start, self._clock())
+        need = classify_need(transcript)
+        if need is not None:
+            kind = "request" if need[0] == "direct" else "hint"
+            return kind, FetchTask(need[1]), "rules", "", _ms(start, self._clock())
+        classify = getattr(self.gemma, "classify", None)
+        if classify is None:
+            # No local model: the legacy parsers are the only other option.
+            task, source, reason, ms = self.interpret(transcript)
+            return ("request" if task else "other"), task, source, reason, ms
+        try:
+            kind, item = classify(transcript, expecting_answer=expecting_answer)
+        except IntentError as exc:
+            task, source, reason, _ = self.interpret_rules(transcript)
+            return ("request" if task else "other"), task, source, f"gemma: {exc}; {reason}".strip("; "), \
+                _ms(start, self._clock())
+        task = FetchTask(item) if kind in ("request", "hint") else None
+        reason = "" if kind != "other" else "gemma: not a request for a supported item"
+        return kind, task, "gemma", reason, _ms(start, self._clock())
+
+    def interpret_rules(self, transcript: str):
+        start = self._clock()
+        try:
+            return self.rules.parse(transcript), "rules", "", _ms(start, self._clock())
+        except IntentError as exc:
+            return None, None, f"rules: {exc}", _ms(start, self._clock())
+
     def interpret(self, transcript: str) -> tuple[FetchTask | None, str | None, str, float]:
         """Return (task, source, reason, intent_ms). task is None when rejected."""
         start = self._clock()
@@ -100,12 +137,12 @@ class CommandListener:
             self._set(CommandState("heard", transcript, stt_ms=stt_ms, timestamp=self._clock()))
             if not transcript:
                 return self._set(replace(self.state, status="rejected", reason="empty transcript"))
-            need = classify_need(transcript)
-            if need is not None and need[0] == "hint":
-                return self._ask(FetchTask(need[1]), transcript, stt_ms)
-            task, source, reason, intent_ms = self.interpreter.interpret(transcript)
-            if task is None:
-                return self._set(replace(self.state, status="rejected", reason=reason, intent_ms=intent_ms))
+            kind, task, source, reason, intent_ms = self.interpreter.classify(transcript)
+            if kind == "hint" and task is not None:
+                return self._ask(task, transcript, stt_ms, source, intent_ms)
+            if kind != "request" or task is None:
+                return self._set(replace(self.state, status="rejected", parser_source=source,
+                                         reason=reason or "not a request", intent_ms=intent_ms))
             state = self._set(replace(self.state, status="understood", task=task,
                                       parser_source=source, intent_ms=intent_ms))
             self._start(task, transcript, f"voice_{source}")
@@ -128,29 +165,33 @@ class CommandListener:
 
     # -- confirmation -----------------------------------------------------
 
-    def _ask(self, task: FetchTask, transcript: str, stt_ms: float | None) -> CommandState:
+    def _ask(self, task: FetchTask, transcript: str, stt_ms: float | None,
+             source: str | None = None, intent_ms: float | None = None) -> CommandState:
         self._pending = task
         question = self._speak("ask_water") or "Would you like some water?"
         now = self._clock()
         return self._set(CommandState("confirming", transcript, task=task, stt_ms=stt_ms,
-                                      question=question, expires_at=now + self.confirm_timeout_s,
-                                      timestamp=now))
+                                      parser_source=source, intent_ms=intent_ms, question=question,
+                                      expires_at=now + self.confirm_timeout_s, timestamp=now))
 
     def _answer(self, transcript: str, stt_ms: float | None) -> CommandState | None:
         """Handle a reply to the open question; None if it wasn't a yes/no answer."""
-        answer = classify_answer(transcript)
-        if answer is None:
+        kind, _task, source, _reason, intent_ms = self.interpreter.classify(transcript, expecting_answer=True)
+        if kind not in ("yes", "no"):
             return None  # e.g. a fresh request: interpret it normally
+        answer = kind
         task, asked = self._pending, self.state
         self._pending = None
         both = f"{asked.transcript} -> {transcript}"
         now = self._clock()
         if answer == "no":
             self._speak("declined")
-            return self._set(CommandState("declined", both, stt_ms=stt_ms, question=asked.question,
-                                          reason="person said no", timestamp=now))
+            return self._set(CommandState("declined", both, stt_ms=stt_ms, intent_ms=intent_ms,
+                                          question=asked.question, reason=f"person said no ({source})",
+                                          timestamp=now))
         state = self._set(CommandState("understood", both, task=task, parser_source="confirmed",
-                                       stt_ms=stt_ms, question=asked.question, timestamp=now))
+                                       stt_ms=stt_ms, intent_ms=intent_ms, question=asked.question,
+                                       timestamp=now))
         self._speak("will_fetch_water")
         self._start(task, both, "voice_confirmed")
         return state

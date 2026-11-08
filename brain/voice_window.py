@@ -167,7 +167,7 @@ function card(t){
 function cmdText(e){
   if(e.status==="understood"){const t=e.task||{};return `Command: fetch ${t.item_id} → ${t.destination}  ·  ${e.parser_source}, ${fmt(e.intent_ms,0)} ms`}
   if(e.status==="rejected") return `Not a command: ${e.reason||"not understood"}`;
-  if(e.status==="confirming") return `Hint understood → asked “${e.question}” · waiting for an answer`;
+  if(e.status==="confirming") return `Hint understood (${e.parser_source}, ${fmt(e.intent_ms,0)} ms) → asked “${e.question}” · waiting for an answer`;
   if(e.status==="declined") return `No fetch: ${e.reason}`;
   return `Command: ${e.status}`;
 }

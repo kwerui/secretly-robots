@@ -27,17 +27,29 @@ class _Listener(Protocol):
     def heard(self, transcript: str, stt_ms: float | None = None): ...
 
 
-def default_listener(log_file: str | None = "logs/brain_events.jsonl", say=None):
+def local_gemma(model: str = "gemma4:e4b"):
+    """Gemma 4 on the local Ollama server, warmed up; None if it isn't running."""
+    from .intent import IntentError, OllamaIntentParser
+    g = OllamaIntentParser(model=model, timeout_s=20)
+    try:
+        g.warm_up()
+    except IntentError:
+        return None
+    return g
+
+
+def default_listener(log_file: str | None = "logs/brain_events.jsonl", say=None, gemma=None):
     """The onboard CommandListener feeding a Brain, if that module is present.
 
     `say(key) -> text` lets it speak (e.g. ask "Would you like some water?").
+    `gemma` (an OllamaIntentParser) handles speech the rules don't recognise.
     """
     try:
-        from .command import CommandListener
+        from .command import CommandListener, OnboardInterpreter
         from .engine import Brain
     except ImportError:
         return None
-    return CommandListener(brain=Brain(log_file=log_file), say=say)
+    return CommandListener(OnboardInterpreter(gemma=gemma), brain=Brain(log_file=log_file), say=say)
 
 
 class VoicePipeline:

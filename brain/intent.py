@@ -104,18 +104,79 @@ GEMMA_SYSTEM_PROMPT = (
 )
 
 
+UTTERANCE_KINDS = ("request", "hint", "yes", "no", "other")
+
+GEMMA_CLASSIFY_PROMPT = (
+    "You are the language understanding of a home-care robot. A person with limited "
+    "mobility, sitting on a sofa, has just said something. Classify it. Return JSON only.\n"
+    "kind:\n"
+    "- request: they ask for an item, or say they need/want one and name it "
+    "('bring me my book', 'I need some water', 'could I get a drink').\n"
+    "- hint: they describe a feeling or problem that an item would help with, without "
+    "asking for or naming it ('my mouth is so dry', 'I'm parched', 'I'm a bit thirsty'). "
+    "The robot will ask before acting.\n"
+    "- yes / no: an answer to a yes-or-no question ('sure', 'that would be lovely' = yes; "
+    "'I'm alright', 'not now' = no). Use these only when the robot is waiting for an answer.\n"
+    "- other: anything else (pain, tiredness, chat, questions, unclear). Never guess a request.\n"
+    "item_id: water_bottle for thirst or any drink; cup or book if named; otherwise unknown. "
+    "Medication is never a supported item: use other."
+)
+
+
 class OllamaIntentParser:
     """Real local model call via Ollama's loopback API; no cloud access.
 
     Requires separately installed Ollama and downloaded model weights.
     If unavailable, raises IntentError: it does NOT silently fake model output.
     """
-    def __init__(self, model: str = "gemma4:e2b", endpoint: str = "http://127.0.0.1:11434/api/chat", timeout_s: float = 60):
+    def __init__(self, model: str = "gemma4:e4b", endpoint: str = "http://127.0.0.1:11434/api/chat", timeout_s: float = 60):
         if not endpoint.startswith("http://127.0.0.1:") and not endpoint.startswith("http://localhost:"):
             raise ValueError("For the offline configuration, only loopback Ollama endpoints are allowed")
         self.model = model
         self.endpoint = endpoint
         self.timeout_s = timeout_s
+
+    def classify(self, text: str, expecting_answer: bool = False) -> tuple[str, str]:
+        """(kind, item_id) for one utterance, kind in UTTERANCE_KINDS.
+
+        Raises IntentError if the local model is unavailable or returns junk.
+        """
+        schema = {
+            "type": "object", "properties": {
+                "kind": {"type": "string", "enum": list(UTTERANCE_KINDS)},
+                "item_id": {"type": "string", "enum": sorted(ALLOWED_OBJECTS) + ["unknown"]},
+            }, "required": ["kind", "item_id"], "additionalProperties": False,
+        }
+        context = ("The robot just asked them a yes-or-no question and is waiting for the answer."
+                   if expecting_answer else "The robot has not asked them anything.")
+        result = self._chat(GEMMA_CLASSIFY_PROMPT, f"{context}\nThey said: {text!r}", schema)
+        kind, item = result.get("kind"), result.get("item_id", "unknown")
+        if kind not in UTTERANCE_KINDS:
+            raise IntentError(f"Local model returned an unknown kind: {kind!r}")
+        if kind in ("request", "hint"):
+            item = normalize_item(item)  # raises for unknown/unsupported
+        if kind in ("yes", "no") and not expecting_answer:
+            kind = "other"
+        return kind, item
+
+    def _chat(self, system: str, user: str, schema: dict) -> dict:
+        payload = {
+            "model": self.model, "stream": False, "format": schema, "think": False,
+            "keep_alive": "30m",
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "options": {"temperature": 0},
+        }
+        req = Request(self.endpoint, json.dumps(payload).encode(), {"Content-Type": "application/json"})
+        try:
+            with urlopen(req, timeout=self.timeout_s) as response:
+                answer = json.loads(response.read().decode())
+            return json.loads(answer["message"]["content"])
+        except (URLError, TimeoutError, KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise IntentError(f"Local model unavailable or invalid output: {exc}") from exc
+
+    def warm_up(self) -> None:
+        """Load the model into memory before anyone speaks (first call is slow)."""
+        self.classify("hello")
 
     def parse(self, request: str) -> FetchTask:
         schema = {

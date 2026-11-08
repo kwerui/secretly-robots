@@ -15,11 +15,11 @@ import time
 from brain.hearing import MicAudioSource, SimAudioSource
 from brain.robot_voice import RobotVoice
 from brain.speech_to_text import WhisperSTT
-from brain.voice_pipeline import VoicePipeline, default_listener
+from brain.voice_pipeline import VoicePipeline, default_listener, local_gemma
 from brain.voice_window import PORT, VoiceEvents, serve
 
 
-def build(port: int, open_browser: bool, with_commands: bool):
+def build(port: int, open_browser: bool, with_commands: bool, use_gemma: bool = True):
     events = VoiceEvents()
     url = serve(events, port, open_browser=open_browser)
     print(f"speech-to-text window: {url}")
@@ -34,23 +34,31 @@ def build(port: int, open_browser: bool, with_commands: bool):
         print(f'  robot: "{text}"')
         return text
 
-    listener = default_listener(say=say) if with_commands else None
+    gemma = None
+    if with_commands and use_gemma:
+        events.add("status", message="loading Gemma 4 (local Ollama)…", listening=False)
+        gemma = local_gemma()
+        print("interpreter: rules + Gemma 4 (local Ollama)" if gemma else
+              "interpreter: rules only (start `ollama serve` and pull gemma4:e4b for free-form speech)")
+    listener = default_listener(say=say, gemma=gemma) if with_commands else None
     if with_commands and listener is None:
         print("brain.command not available: showing transcripts only")
-    return events, VoicePipeline(stt, events, listener).start(), robot
+    pipeline = VoicePipeline(stt, events, listener).start()
+    pipeline.interpreter_name = "rules + Gemma 4" if gemma else "rules"
+    return events, pipeline, robot
 
 
 def run_sim(args) -> None:
     from sim.house_env import HouseEnv, Mode, cmd_view
 
-    events, pipeline, _robot = build(args.port, not args.no_browser, not args.no_commands)
+    events, pipeline, _robot = build(args.port, not args.no_browser, not args.no_commands, not args.no_gemma)
     env = HouseEnv(seed=args.seed)
     ears: list[SimAudioSource] = []
 
     def on_tick(e):
         if not ears:  # the viewer resets the env first; attach the ears after that
             ears.append(SimAudioSource(e))
-            events.add("status", message=f"listening in the sim · V: person speaks · Y/N: answers · Whisper {pipeline.stt.name}",
+            events.add("status", message=f"listening in the sim · V: person speaks · Y/N: answers · Whisper {pipeline.stt.name} · {pipeline.interpreter_name}",
                        listening=True)
         pipeline.tick()
         for h in ears[0].poll():
@@ -65,7 +73,7 @@ def run_sim(args) -> None:
 
 
 def run_mic(args) -> None:
-    events, pipeline, robot = build(args.port, not args.no_browser, not args.no_commands)
+    events, pipeline, robot = build(args.port, not args.no_browser, not args.no_commands, not args.no_gemma)
     mic = MicAudioSource()
     print("calibrating to the room for 1 s, stay quiet…  (Ctrl+C to stop)")
     events.add("status", message="calibrating to the room…", listening=False)
@@ -76,7 +84,7 @@ def run_mic(args) -> None:
                 if mic.room_dbfs is not None and not announced:
                     announced = True
                     events.add("status", listening=True,
-                               message=f"listening on the mic · room {mic.room_dbfs:.0f} dBFS · Whisper {pipeline.stt.name}")
+                               message=f"listening on the mic · room {mic.room_dbfs:.0f} dBFS · Whisper {pipeline.stt.name} · {pipeline.interpreter_name}")
                     print("listening, speak now")
                 pipeline.tick()
                 for h in mic.poll():
@@ -96,6 +104,7 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--no-browser", action="store_true", help="don't open the window automatically")
     ap.add_argument("--no-commands", action="store_true", help="transcripts only, no command state")
+    ap.add_argument("--no-gemma", action="store_true", help="rules-only interpreter, skip the local Gemma model")
     ap.add_argument("--mode", choices=["static", "shuffled", "dynamic"], default="static")
     ap.add_argument("--layout")
     ap.add_argument("--target")
