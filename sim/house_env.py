@@ -1709,7 +1709,9 @@ def occupancy_image(env: HouseEnv, scale: int = 6):
     return im.resize((im.width * scale, im.height * scale), Image.NEAREST)
 
 
-def cmd_view(env: HouseEnv, layout=None, target=None, seed=None, mode=Mode.STATIC):
+def cmd_view(env: HouseEnv, layout=None, target=None, seed=None, mode=Mode.STATIC, on_tick=None):
+    """Interactive viewer. on_tick(env), if given, runs every frame under the viewer lock
+    (the robot side uses it to listen; the sim itself never imports robot code)."""
     import mujoco.viewer
 
     lays, tgts = list(LAYOUTS), list(ALL_TARGETS)
@@ -1786,6 +1788,8 @@ def cmd_view(env: HouseEnv, layout=None, target=None, seed=None, mode=Mode.STATI
                         show()
             with v.lock():
                 env.step(int(round(1 / 60 / env.model.opt.timestep)))
+                if on_tick is not None:
+                    on_tick(env)
             if state["caption"] and time.time() > state["caption_until"]:
                 state["caption"] = None
                 v.clear_texts()

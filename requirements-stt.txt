@@ -1,0 +1,3 @@
+# Onboard speech-to-text (Whisper on CPU). Download the model once with:
+#   python -m brain.speech_to_text --download
+faster-whisper>=1.1
