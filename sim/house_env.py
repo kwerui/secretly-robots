@@ -40,10 +40,12 @@ try:
     from .aruco import ARUCO_DIR, ARUCO_REGISTRY, ensure_aruco_assets, HAS_OPENCV
     from .dynamic_agent import DynamicAgentController, TrajectoryWaypoint
     from .textures import TEXTURES_DIR, ensure_texture_assets
+    from .person_voice import PersonVoice, clip_seconds
 except ImportError:
     from aruco import ARUCO_DIR, ARUCO_REGISTRY, ensure_aruco_assets, HAS_OPENCV
     from dynamic_agent import DynamicAgentController, TrajectoryWaypoint
     from textures import TEXTURES_DIR, ensure_texture_assets
+    from person_voice import PersonVoice, clip_seconds
 
 HERE = Path(__file__).resolve().parent
 ASSETS_DIR = HERE / "assets"
@@ -1713,7 +1715,8 @@ def cmd_view(env: HouseEnv, layout=None, target=None, seed=None, mode=Mode.STATI
     lays, tgts = list(LAYOUTS), list(ALL_TARGETS)
     modes = [Mode.STATIC, Mode.SHUFFLED, Mode.DYNAMIC]
     current_mode = Mode(mode)
-    state = {"pending": None, "mode": current_mode}
+    state = {"pending": None, "mode": current_mode, "caption": None, "caption_until": 0.0}
+    voice = PersonVoice(seed=seed)
 
     def show():
         i = env.info
@@ -1742,8 +1745,11 @@ def cmd_view(env: HouseEnv, layout=None, target=None, seed=None, mode=Mode.STATI
             state["pending"] = ("mode", Mode.SHUFFLED)
         elif key == ord("3"):
             state["pending"] = ("mode", Mode.DYNAMIC)
+        elif key == ord("V"):
+            state["pending"] = ("speak",)
 
     print("keys: SPACE random reset | L layout | T target (surfaces + drawers) | O doors | 1/2/3 modes")
+    print(f"      V: person on the sofa asks for water ({len(voice.available())} voice clips)")
     print("      1: Static House | 2: Shuffled Furniture & Drawers | 3: Dynamic Walking Person")
     print("push a door or pull a drawer: double-click it, then Ctrl + right-drag")
 
@@ -1768,11 +1774,27 @@ def cmd_view(env: HouseEnv, layout=None, target=None, seed=None, mode=Mode.STATI
                     elif p[0] == "mode":
                         state["mode"] = p[1]
                         env.reset(mode=state["mode"])
-                    show()
+                    if p[0] == "speak":
+                        utt = voice.speak(sim_time=env.data.time)
+                        if utt:
+                            env.info["last_utterance"] = {"speaker": utt.speaker, "phrase": utt.phrase,
+                                                          "wav": str(utt.wav), "sim_time": round(utt.sim_time, 3)}
+                            state["caption"] = utt.phrase
+                            state["caption_until"] = time.time() + clip_seconds(utt.wav) + 1.5
+                            print(f'  t={utt.sim_time:7.2f}s  user (sofa): "{utt.phrase}"')
+                    else:
+                        show()
             with v.lock():
                 env.step(int(round(1 / 60 / env.model.opt.timestep)))
+            if state["caption"] and time.time() > state["caption_until"]:
+                state["caption"] = None
+                v.clear_texts()
+            elif state["caption"]:
+                v.set_texts((mujoco.mjtFontScale.mjFONTSCALE_200, mujoco.mjtGridPos.mjGRID_BOTTOM,
+                             f'Person on sofa:  "{state["caption"]}"', None))
             v.sync()
             time.sleep(max(0.0, 1 / 60 - (time.time() - t0)))
+    voice.stop()
 
 
 def main():

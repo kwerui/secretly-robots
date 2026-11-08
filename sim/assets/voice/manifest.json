@@ -1,0 +1,16 @@
+{
+  "generator": "Gemini text-to-speech",
+  "model": "gemini-3.8-flash-tts",
+  "voice": "Gacrux",
+  "style": "Say this in the warm, slightly tired voice of an older person resting on a sofa",
+  "clips": {
+    "I am thirsty.": "i_am_thirsty.wav",
+    "I need water.": "i_need_water.wav",
+    "I need a drink.": "i_need_a_drink.wav",
+    "Could I have some water, please?": "could_i_have_some_water_please.wav",
+    "My mouth is so dry.": "my_mouth_is_so_dry.wav",
+    "I'm parched.": "i_m_parched.wav",
+    "Can you get me something to drink?": "can_you_get_me_something_to_drink.wav",
+    "I'd love a glass of water.": "i_d_love_a_glass_of_water.wav"
+  }
+}
