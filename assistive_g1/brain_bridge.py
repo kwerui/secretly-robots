@@ -5,7 +5,8 @@
   * PerceptionBridge.latest_observation(): an `Observation` built from what the robot itself
     knows: the items its HEAD CAMERA has seen (and where), the station it is at, whether it has
     a drawer open, what it holds and what it has delivered. Not simulator ground truth (unlike
-    brain/mujoco_observation.py); only the robot's base pose comes from the simulator.
+    brain/mujoco_observation.py); the base pose comes from its state estimator (or the
+    documented simulator-truth A/B fallback), not object ground truth.
   * ControllerBridge.execute_high_level(decision): runs our skills (skills.py) and reports an
     honest `ActionFeedback`:
         search(item)       -> visit stations in LOCATION-MEMORY order (memory.py); at a
@@ -54,16 +55,21 @@ class Container:
     weld: str
     part_markers: tuple[int, ...] = ()
     kind: str = "drawer"
+    drawer: object | None = None  # optional simulator handle, evaluation-only
 
 
 class RobotBridge:
     def __init__(self, robot: AssistiveRobot, memory: LocationMemory, containers: dict[str, Container],
-                 say: Callable[[str], None] = print):
+                 say: Callable[[str], None] = print, search_first: tuple[str, ...] = ()):
         self.robot, self.memory, self.containers, self.say = robot, memory, containers, say
         self.sightings: dict[str, ObjectSighting] = {}  # item -> where the head camera last saw it
         self.delivered: str | None = None
         self.open_station: str | None = None  # station whose container this robot has open
         self.searched: set[str] = set()  # stations already searched for the current task
+        self.search_first = search_first
+        # Evaluation metadata; it is not exposed through latest_observation() and therefore
+        # cannot become an input to the AI brain.
+        self.last_execution: dict[str, object] = {}
 
     # ------------------------------------------------------------------ areas <-> stations
     @staticmethod
@@ -133,6 +139,7 @@ class RobotBridge:
     # ------------------------------------------------------------------ ControllerBridge
     def execute_high_level(self, decision: Decision) -> ActionFeedback:
         a, t = decision.action, decision.target
+        self.last_execution = {}
         try:
             ok, detail = getattr(self, f"_do_{a}")(t)
         except AttributeError:
@@ -154,7 +161,11 @@ class RobotBridge:
 
     def _do_search(self, item: str):
         """Visit likely stations in location-memory order until the head camera sees `item`."""
-        for station, p in self.memory.ranked(item):
+        ranked = self.memory.ranked(item)
+        if self.search_first:
+            priority = {station: index for index, station in enumerate(self.search_first)}
+            ranked = sorted(ranked, key=lambda pair: (priority.get(pair[0], len(priority)), -pair[1]))
+        for station, p in ranked:
             if station in self.searched:
                 continue
             self.say(f"  searching for the {item.replace('_', ' ')} at the {station} (belief {p:.0%})")
@@ -164,13 +175,22 @@ class RobotBridge:
                 s = self.robot.stations[station]
                 off = float(np.hypot(*(self.robot.wbc.base_pos[:2] - np.array([s.x, s.y]))))
                 if off > 0.35:
+                    self.last_execution.setdefault("navigation_attempts", []).append(
+                        {"station": station, "reported_success": False, "accepted_for_search": False,
+                         "error": res.get("error", ""), "distance_from_station_m": round(off, 3)})
                     self.say(f"    couldn't get to the {station} ({res.get('error', '')}, {off:.2f} m off)")
                     self.searched.add(station)
                     continue
                 self.robot.station = station
                 off = self._square_up(station)
+                self.last_execution.setdefault("navigation_attempts", []).append(
+                    {"station": station, "reported_success": False, "accepted_for_search": True,
+                     "error": res.get("error", ""), "distance_from_station_m": round(off, 3)})
                 if off > 0.08:
                     self.say(f"    note: {off:.2f} m off the {station} pose")
+            else:
+                self.last_execution.setdefault("navigation_attempts", []).append(
+                    {"station": station, "reported_success": True, "accepted_for_search": True, "error": ""})
             seen = self._look_here()
             if item not in seen and station in self.containers and self.open_station != station:
                 ok, why = self._do_open_drawer(None)  # look inside, the way the carer showed us
@@ -185,6 +205,9 @@ class RobotBridge:
 
     def _do_navigate(self, area: str):
         res = self.robot.go_to(self.station(area))
+        self.last_execution.setdefault("navigation_attempts", []).append(
+            {"station": self.station(area), "reported_success": bool(res["ok"]),
+             "accepted_for_search": bool(res["ok"]), "error": res.get("error", "")})
         if res["ok"]:
             self._look_here()
         return res["ok"], res.get("error", "")
@@ -197,16 +220,44 @@ class RobotBridge:
         if self.open_station == st and self.robot.open_state is not None:
             return True, "already open"
         self._square_up(st)
+        self.last_execution["drawer_open_attempted"] = True
+        attempt = {"station": st, "before": self._drawer_opening_state(c)}
         res = self.robot.open_articulated(c.model, c.anchor_marker, c.weld, part_markers=c.part_markers)
+        self.last_execution["drawer_open_succeeded"] = bool(res["ok"])
+        attempt.update(result_ok=bool(res["ok"]), result_error=res.get("error", ""), after=self._drawer_opening_state(c))
+        self.last_execution.setdefault("drawer_opening_attempts", []).append(attempt)
         if res["ok"]:
             self.open_station = st
             self._look_here()
         return res["ok"], res.get("error", "")
 
+    def _drawer_opening_state(self, container: Container) -> dict:
+        """Evaluation metadata only; none of it is exposed in brain observations."""
+        r = self.robot
+        base = r.wbc.base_pos
+        true_base = r.wbc.true_base_pos
+        state = {
+            "base_pose": {"x": round(float(base[0]), 4), "y": round(float(base[1]), 4),
+                          "yaw": round(float(r.wbc.base_yaw), 4)},
+            "base_pose_truth": {"x": round(float(true_base[0]), 4), "y": round(float(true_base[1]), 4),
+                                "yaw": round(float(r.wbc.true_base_yaw), 4)},
+            "right_arm_command": np.round(r.arm_cmd, 4).tolist(),
+            "left_arm_command": np.round(r.left_cmd, 4).tolist(),
+            "right_palm_xyz": np.round(r.ik.palm_pose()[0], 4).tolist(),
+        }
+        world = r.world
+        drawer = getattr(container, "drawer", None)
+        if world is not None and drawer is not None:
+            state["drawer_open_m"] = round(float(world.drawer_open_m(drawer)), 4)
+        else:
+            state["drawer_open_m"] = None
+        return state
+
     def _do_grasp(self, item: str):
         s = self.sightings.get(item)
         from_above = bool(s and s.container)
         res = self.robot.pick(item, from_above=from_above)
+        retry_count = 0
         if not res["ok"] and self.robot.holding is None:
             # The grasp search depends on where we stand: square up on the station again with
             # the arm home, then one more try (the brain's own retry would ask from the same spot)
@@ -217,11 +268,15 @@ class RobotBridge:
                 self.robot._step_back(0.2)
                 self.robot._drive_to(st.x, st.y, st.yaw, tol=0.03, timeout=10.0)
             res = self.robot.pick(item, from_above=from_above)
+            retry_count = 1
+        self.last_execution["grasp_retry_count"] = retry_count
         if not res["ok"]:
             return False, res.get("error", "")
         self.sightings.pop(item, None)
         if self.robot.open_state is not None:  # tidy up: close it with the other hand
+            self.last_execution["drawer_close_attempted"] = True
             c = self.robot.close_opened()
+            self.last_execution["drawer_close_succeeded"] = bool(c.get("ok"))
             if c.get("ok"):
                 self.open_station = None
         return True, ""

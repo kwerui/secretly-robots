@@ -60,8 +60,14 @@ def test_argon_client_requests_json_schema_from_official_sdk_boundary():
     assert value["item_id"] == "water_bottle"
     call = sdk.models.calls[0]
     assert call["model"] == "gemini-4-argon"
-    assert call["config"].response_mime_type == "application/json"
-    assert call["config"].response_json_schema == {"type": "object"}
+    config = call["config"]
+
+    if isinstance(config, dict):
+        assert config["response_mime_type"] == "application/json"
+        assert config["response_json_schema"] == {"type": "object"}
+    else:
+        assert getattr(config, "response_mime_type") == "application/json"
+        assert getattr(config, "response_json_schema") == {"type": "object"}
 
 
 def test_argon_client_rejects_invalid_json_without_returning_text():
