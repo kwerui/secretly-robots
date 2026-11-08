@@ -142,9 +142,17 @@ main{max-width:760px;margin:0 auto;padding:16px}
 .card.robot{border-style:dashed;margin-left:32px}
 .who{font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 4px}
 .card.robot .text{font-size:19px;color:var(--accent)}
+.mode{max-width:760px;margin:12px auto 0;padding:0 16px}
+.mode div{border-radius:10px;padding:12px 16px;font-weight:600;display:none}
+.mode div.on{display:block}
+.mode .listening{background:var(--line);color:var(--muted)}
+.mode .asking{background:var(--waitbg);color:var(--wait)}
+.mode .fetch{background:var(--okbg);color:var(--ok);font-size:18px}
+.mode small{display:block;font-weight:400;font-size:13px;margin-top:4px;opacity:.9}
 footer{color:var(--muted);font-size:12px;text-align:center;padding:8px 16px 24px}
 </style></head><body>
 <header><h1>Robot hearing</h1><div class="status"><span class="dot" id="dot"></span><span id="status">connecting…</span></div></header>
+<div class="mode"><div id="mode"></div></div>
 <main><div id="list"><p class="empty" id="empty">Nothing heard yet. Press V in the sim, or speak to the mic.</p></div></main>
 <footer>Onboard speech-to-text. This page is served from 127.0.0.1 and nothing leaves the laptop.</footer>
 <script>
@@ -174,6 +182,14 @@ function cmdText(e){
 function apply(e){
   if(e.kind==="status"){$("#status").textContent=e.message; $("#dot").className="dot"+(e.listening?" live":""); return}
   if(e.kind==="transcript"){$("#empty")?.remove(); const c=card(e); byStart[e.start_s]=c; list.prepend(c); return}
+  if(e.kind==="mode"){const m=$("#mode"); m.className=e.mode+" on"; m.replaceChildren();
+    if(e.mode==="fetch"&&e.plan){const p=e.plan; m.append(`FETCH MODE: ${p.item} → ${p.destination}`);
+      const s=document.createElement("small");
+      s.textContent=`next step: ${p.action} ${p.target||""} · likely places: ${p.likely.slice(0,3).map(([a,b])=>`${a} ${Math.round(b*100)}%`).join(", ")} · planned, not carried out`;
+      m.appendChild(s)}
+    else if(e.mode==="asking"){m.textContent=`Asking: “${e.question}” · waiting for an answer`}
+    else {m.textContent="Listening"}
+    return}
   if(e.kind==="robot_said"){$("#empty")?.remove(); const c=document.createElement("div"); c.className="card robot new";
     const w=document.createElement("p"); w.className="who"; w.textContent="Robot said (Gemini voice, played onboard)";
     const p=document.createElement("p"); p.className="text"; p.textContent=`“${e.text}”`; c.append(w,p); list.prepend(c); return}

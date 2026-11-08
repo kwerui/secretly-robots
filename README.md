@@ -101,6 +101,17 @@ sim/.venv/bin/python -m scripts.voice_robot --mic          # talk to it through 
 
 The window is at http://127.0.0.1:8765 and opens by itself. Each run is also logged to `logs/voice_events.jsonl`; replay one with `python -m brain.voice_window logs/voice_events.jsonl`.
 
+### The G1 voice demo
+
+The full sequence with the Unitree G1 standing in the house (balancing on its GR00T policy):
+
+```bash
+cd assistive_g1 && ../sim/.venv/bin/python fetch_assets.py     # once: G1 model + policies (~35 MB)
+../sim/.venv/bin/mjpython voice_demo.py                          # V speak · Y/N answer · X cancel
+```
+
+Press **V** and the person speaks. The G1's head microphone hears it, Whisper transcribes it and the rules (or local Gemma 4) interpret it. A hint makes the robot ask *"Would you like some water?"* and the light above its head turns amber. A request or a yes puts it in **FETCH MODE**: the light turns green, the brain gets the task, and the viewer, the window and the console show the planner's first step and the most likely places (`search water_bottle`, kitchen_counter 57%), with a line to the first place. The step is planned, not carried out yet; `brain_bridge.RobotBridge` is what would carry it out.
+
 ## How the brain makes decisions
 
 ```python
