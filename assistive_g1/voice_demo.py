@@ -26,6 +26,11 @@ from viewer_env import relaunch_for_viewer
 
 relaunch_for_viewer()
 
+import functools  # noqa: E402
+import builtins  # noqa: E402
+
+print = functools.partial(builtins.print, flush=True)  # console stays live under mjpython and pipes
+
 import argparse  # noqa: E402
 import math  # noqa: E402
 import sys  # noqa: E402

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import queue
+from pathlib import Path
 import threading
 import time
 from typing import Callable, Protocol
@@ -38,7 +39,8 @@ def local_gemma(model: str = "gemma4:e4b"):
     return g
 
 
-def default_listener(log_file: str | None = "logs/brain_events.jsonl", say=None, gemma=None):
+def default_listener(log_file: str | None = str(Path(__file__).resolve().parent.parent / "logs" / "brain_events.jsonl"),
+                     say=None, gemma=None):
     """The onboard CommandListener feeding a Brain, if that module is present.
 
     `say(key) -> text` lets it speak (e.g. ask "Would you like some water?").

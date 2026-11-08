@@ -24,7 +24,7 @@ from urllib.parse import parse_qs, urlparse
 
 HOST = "127.0.0.1"
 PORT = 8765
-LOG = Path("logs/voice_events.jsonl")
+LOG = Path(__file__).resolve().parent.parent / "logs" / "voice_events.jsonl"  # repo logs/, wherever it runs from
 
 
 def _jsonable(v):
