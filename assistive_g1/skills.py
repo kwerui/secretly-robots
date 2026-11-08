@@ -52,6 +52,17 @@ GRASP_TOL = 0.05  # m, palm-to-grasp residual accepted before the grasp weld (it
 PUSH_FACE = 0.045  # m, drawer front behind its bar handle (Jack's HANDLE_STANDOFF)
 FINGER_REACH = 0.11  # m, Dex3 fingertips past the palm site along the fingers
 LOCALIZE = os.environ.get("G1_LOCALIZE", "1") != "0"
+# Stance selection (inverse reachability, done online): before walking up to something to
+# grasp, try candidate foot positions/headings/postures *in the planner's copy of the model*
+# and walk to the one where the arm reaches best, instead of a fixed standoff. G1_STANCE_SEARCH=0
+# switches back to the fixed standoffs (A/B).
+STANCE_SEARCH = os.environ.get("G1_STANCE_SEARCH", "1") != "0"
+# Postures whose body shape is measured once at start-up (pelvis height, torso pitch), so the
+# stance search can also ask "what if I leaned/crouched there" without doing it.
+CALIB_POSTURES = [(0.74, 0.0), (0.74, 0.15), (0.74, 0.3), (0.70, 0.45), (0.68, 0.45), (0.64, 0.5), (0.60, 0.5)]
+# After a reach falls short by up to this much, step the feet by the miss and try once more (m)
+STEP_CORRECT_MAX = 0.15
+REACH_COMFORT = 0.45  # m, forward pelvis-to-target distance beyond which a stance is penalised
 
 
 def wrap(a: float) -> float:
@@ -100,6 +111,9 @@ class AssistiveRobot:
         if (LOCALIZE if localize is None else localize) and world is not None:
             self._attach_estimator(world)
         self.wait(1.0)
+        self._posture_cache: dict = {}
+        if STANCE_SEARCH:
+            self._calibrate_postures()
 
     def _attach_estimator(self, world) -> None:
         """From here on the robot knows where it is only from its own sensors: the walking
@@ -362,26 +376,10 @@ class AssistiveRobot:
         # Raise the hand to chest height, close to the body, before anything else so it can't
         # catch under a table edge while lifting or stepping in.
         self._raise_hand(grasp[2] + 0.06, toward=grasp)
-        # Line up so the item is straight ahead of the right shoulder at STANDOFF, keeping the
-        # heading (facing the furniture). The hand then goes in and comes out perpendicular to
-        # the furniture: a diagonal path drags the item along a cupboard's side wall.
-        th = self.wbc.base_yaw
-        fwd2 = np.array([np.cos(th), np.sin(th)])
-        left2 = np.array([-np.sin(th), np.cos(th)])
-        goal = grasp[:2] - STANDOFF * fwd2 + GRASP_LATERAL * left2  # pelvis left of the item
-        if np.linalg.norm(goal - base[:2]) > 0.03:
-            self._drive_to(goal[0], goal[1], th, tol=0.025, timeout=8.0)
-            base = self.wbc.base_pos
+        # The hand goes in and comes out perpendicular to the furniture (keep the heading we
+        # arrived with, facing it): a diagonal path drags the item along a cupboard's side wall.
         th = self.wbc.base_yaw
         approach = np.array([np.cos(th), np.sin(th), 0.0])
-        reach = float((grasp - base)[:2] @ approach[:2])
-        # Pre-grasp back along the approach, but never closer than ~0.27 m to the pelvis:
-        # nearer than that the arm would have to fold into the torso.
-        back = float(np.clip(reach - 0.27, 0.06, 0.14))
-        pre = grasp - back * approach + np.array([0, 0, 0.04])
-
-        # Choose a posture (lean/crouch via the GR00T torso and height commands) and a wrist
-        # roll that reach both poses without touching furniture or the torso.
         up = np.array([0, 0, 1.0])
         candidates = [
             [(0, approach, 0.6), (2, up, 0.4)],
@@ -389,23 +387,71 @@ class AssistiveRobot:
             [(0, approach, 0.6), (1, -up, 0.4)],
             [(0, approach, 0.6), (2, -up, 0.4)],
         ]
-        axes, best = self._choose(pre, grasp, candidates, POSTURES)
-        if best > 0.05:
-            self._set_posture(0.74, 0.0)
-            return {"ok": False, "error": f"no collision-free grasp for {item} from here (score {best:.3f})"}
+        postures = POSTURES
+        # Where to stand: searched (reachability in the planner's model), else the item straight
+        # ahead of the right shoulder at STANDOFF.
+        back0 = float(np.clip(STANDOFF - 0.27, 0.06, 0.14))
+        st = self._choose_stance(self.ik, grasp - back0 * approach + np.array([0, 0, 0.04]), grasp, candidates,
+                                 th, STANDOFF, GRASP_LATERAL, POSTURES, label=f"pick {item}")
+        if st is not None:
+            self._go_stance(st)
+            postures = self._postures_from(st["posture"], POSTURES)
+        else:
+            fwd2, left2 = approach[:2], np.array([-np.sin(th), np.cos(th)])
+            goal = grasp[:2] - STANDOFF * fwd2 + GRASP_LATERAL * left2  # pelvis left of the item
+            if np.linalg.norm(goal - base[:2]) > 0.03:
+                self._drive_to(goal[0], goal[1], th, tol=0.025, timeout=8.0)
+        e1 = e2 = np.inf
+        for attempt in range(2):
+            det = self.cam.detect()  # closer view, from where we actually ended up
+            if it.marker_id in det:
+                top = det[it.marker_id].position
+                centre = top - np.array([0, 0, it.size[2] + 0.001])
+                grasp = centre + np.array([0, 0, 0.3 * it.size[2]])
+            base = self.wbc.base_pos
+            reach = float((grasp - base)[:2] @ approach[:2])
+            # Pre-grasp back along the approach, but never closer than ~0.27 m to the pelvis:
+            # nearer than that the arm would have to fold into the torso.
+            back = float(np.clip(reach - 0.27, 0.06, 0.14))
+            pre = grasp - back * approach + np.array([0, 0, 0.04])
+            # Posture (lean/crouch via the GR00T torso and height commands) and wrist roll that
+            # reach both poses without touching furniture or the torso.
+            axes, best = self._choose(pre, grasp, candidates, postures)
+            if best > 0.05:
+                st = self._restance(self.ik, pre, grasp, candidates, STANDOFF, GRASP_LATERAL, POSTURES, None,
+                                    f"pick {item} again") if attempt == 0 else None
+                if st is not None:
+                    postures = self._postures_from(st["posture"], POSTURES)
+                    continue
+                self._set_posture(0.74, 0.0)
+                return {"ok": False, "error": f"no collision-free grasp for {item} from here (score {best:.3f})"}
 
-        # Come in along the approach line: far pre-grasp (outside any cupboard), pre-grasp, grasp,
-        # all on the planned configurations (joint-space swing to the far pre-grasp).
-        q_pre, q_g = self._best_q
-        far = grasp - (back + 0.10) * approach + np.array([0, 0, 0.04])
-        q_far, _ = self.ik.solve(far, axes, q_init=q_pre, iters=150, q_ref=q_pre)
-        if self.ik.elbow_too_high(q_far):
-            q_far = q_pre
-        self._reach("right", q_far, far, pre, q_pre, axes, duration=0.7)
-        e1 = float(np.linalg.norm(self.ik.palm_pose()[0] - pre))
-        e2 = self.move_hand(grasp, axes, duration=0.9, q_ref=q_g)
+            # Come in along the approach line: far pre-grasp (outside any cupboard), pre-grasp,
+            # grasp, all on the planned configurations (joint-space swing to the far pre-grasp).
+            q_pre, q_g = self._best_q
+            far = grasp - (back + 0.10) * approach + np.array([0, 0, 0.04])
+            q_far, e_far = self.ik.solve(far, axes, q_init=q_pre, iters=150, q_ref=q_pre)
+            if self.ik.elbow_too_high(q_far) or e_far > 0.02 or self.ik.collisions(q_far):
+                far, q_far = pre, q_pre  # the far point isn't cleanly reachable from this stance: skip it
+            if DEBUG:
+                rel = self._body_rel(grasp)
+                print(f"   pick {item} [{attempt}]: plan {best:.3f} posture {self.wbc.height_cmd:.2f}/{self.wbc.rpy_cmd[1]:.2f} "
+                      f"grasp fwd {rel[0]:.2f} left {rel[1]:.2f} up {rel[2]:.2f}  far err {e_far:.3f}")
+            self._reach("right", q_far, far, pre, q_pre, axes, duration=0.7)
+            e1 = float(np.linalg.norm(self.ik.palm_pose()[0] - pre))
+            e2 = self.move_hand(grasp, axes, duration=0.9, q_ref=q_g)
+            if DEBUG:
+                print(f"   pick {item} [{attempt}]: pre err {e1:.3f} grasp err {e2:.3f} hits {self.ik.collisions(self.arm_cmd)}")
+            if e2 <= 0.04:
+                break
+            miss = grasp - self.ik.palm_pose()[0]
+            self.move_hand(pre - 0.06 * approach, axes, duration=0.8, q_ref=q_pre)
+            if attempt == 0 and np.linalg.norm(miss[:2]) < STEP_CORRECT_MAX:
+                # Short by a few cm: step the feet by the miss and plan again from there
+                self._step_by(miss[:2])
+                continue
+            break
         if e2 > 0.04:
-            self.move_hand(pre, axes, duration=0.8, q_ref=q_pre)
             self.arm_home()
             self._set_posture(0.74, 0.0)
             return {"ok": False, "error": f"could not reach {item} (residual {e2:.3f} m)", "pre_err": round(e1, 3)}
@@ -458,16 +504,124 @@ class AssistiveRobot:
         """No arm collisions along the straight joint-space path q0 -> q1 (sampled)."""
         return all(not ik.collisions((1 - a) * q0 + a * q1, margin=0.0) for a in np.linspace(0, 1, n)[1:])
 
+    def _free(self, ik: ArmIK, q: np.ndarray) -> bool:
+        return not ik.collisions(q, margin=0.0)
+
+    def _seg_free(self, ik: ArmIK, a: np.ndarray, b: np.ndarray, res: float = 0.08) -> bool:
+        n = max(2, int(np.ceil(np.abs(b - a).max() / res)) + 1)
+        return all(self._free(ik, (1 - t) * a + t * b) for t in np.linspace(0, 1, n)[1:])
+
+    def _joint_path(self, ik: ArmIK, q0: np.ndarray, q1: np.ndarray, max_iters: int = 3000,
+                    step: float = 0.25) -> list[np.ndarray] | None:
+        """Collision-free joint-space path q0 -> q1 for one arm (RRT-Connect, Kuffner & LaValle
+        2000, then shortcut smoothing), checked against the body and furniture with the same
+        contact test as the plans. The straight swing is tried first. The start may be touching
+        something (it is where the arm is now): its first segment is not checked."""
+        q0, q1 = np.asarray(q0, float), np.asarray(q1, float)
+        if self._seg_free(ik, q0, q1):
+            return [q0, q1]
+        if not self._free(ik, q1):
+            if DEBUG:
+                print(f"   rrt: goal in collision {ik.collisions(q1, margin=0.0)[:2]}")
+            return None
+        prefix = []
+        if not self._free(ik, q0):
+            # the arm starts touching something (often the raised hand against the chest): back
+            # out along the line to home, or to the goal, until free
+            for to in (ik.home, q1):
+                for t in np.linspace(0.1, 1.0, 10):
+                    qe = (1 - t) * q0 + t * np.asarray(to)
+                    if self._free(ik, qe):
+                        break
+                else:
+                    continue
+                break
+            else:
+                return None
+            prefix, q0 = [q0], qe
+            if self._seg_free(ik, q0, q1):
+                return prefix + [q0, q1]
+        rng = np.random.default_rng(0)
+        lo, hi = ik.lo, ik.hi
+        trees = [[(q0, -1)], [(q1, -1)]]  # (config, parent index)
+
+        def nearest(tree, q):
+            return int(np.argmin([np.abs(n[0] - q).max() for n in tree]))
+
+        def extend(tree, q, first_free=False):
+            i = nearest(tree, q)
+            qn = tree[i][0]
+            d = q - qn
+            dist = np.abs(d).max()
+            qs = q if dist <= step else qn + d * (step / dist)
+            if (first_free and i == 0) or self._seg_free(ik, qn, qs):
+                tree.append((qs, i))
+                return len(tree) - 1, dist <= step
+            return None, False
+
+        for it in range(max_iters):
+            a, b = trees[it % 2], trees[(it + 1) % 2]
+            qr = rng.uniform(lo, hi) if rng.random() > 0.2 else b[0][0]
+            ia, _ = extend(a, qr, first_free=(a is trees[0]))
+            if ia is None:
+                continue
+            # connect the other tree towards the new node
+            while True:
+                ib, reached = extend(b, a[ia][0], first_free=(b is trees[0]))
+                if ib is None:
+                    break
+                if reached:
+                    def chain(tree, i):
+                        out = []
+                        while i >= 0:
+                            out.append(tree[i][0])
+                            i = tree[i][1]
+                        return out
+                    pa, pb = chain(a, ia), chain(b, ib)
+                    path = (pa[::-1] + pb) if a is trees[0] else (pb[::-1] + pa)
+                    path = prefix + path
+                    # shortcut smoothing
+                    for _ in range(40):
+                        if len(path) <= 2:
+                            break
+                        i, j = sorted(rng.choice(len(path), 2, replace=False))
+                        if j - i > 1 and self._seg_free(ik, path[i], path[j]):
+                            path = path[:i + 1] + path[j:]
+                    if DEBUG:
+                        print(f"   rrt: path with {len(path)} waypoints after {it} iterations")
+                    return path
+        if DEBUG:
+            print("   rrt: no path")
+        return None
+
+    def _swing_path(self, side: str, path: list[np.ndarray], min_duration: float = 1.0) -> None:
+        """Joint-space moves through a planned path's waypoints."""
+        for k, q in enumerate(path[1:]):
+            self._swing(side, q, min_duration / max(1, len(path) - 1)) if k < len(path) - 2 else self._swing(side, q, 0.5)
+
     def _reach(self, side: str, q_pre: np.ndarray, pre: np.ndarray, target: np.ndarray, q_t: np.ndarray,
                axes, duration: float = 0.9) -> float:
         """Execute a plan: joint-space swing to q_pre (Cartesian with q_ref if the swing would hit
         something), then straight in to the target, staying on the plan's branch. Returns the error."""
         ik, cmd = (self.ik, self.arm_cmd) if side == "right" else (self.left_ik, self.left_cmd)
         mover = self.move_hand if side == "right" else self.move_left_hand
-        if self._path_clear(ik, cmd.copy(), q_pre):
+        clear = self._path_clear(ik, cmd.copy(), q_pre)
+        b0, t0 = self.wbc.base_pos.copy(), self.wbc.true_base_pos.copy()
+        path = None if clear else self._joint_path(ik, cmd.copy(), q_pre)
+        if clear:
             self._swing(side, q_pre, 1.2)
+        elif path is not None:
+            # the straight swing would hit the body or furniture: go around (planned path)
+            self._swing_path(side, path, 1.6)
         else:
             mover(pre, axes, duration=1.2, settle=0.1, q_ref=q_pre)
+        if DEBUG:
+            q_act = self.data.qpos[ik.qadr]
+            print(f"   reach[{side}]: {'swing' if clear else 'tracked'} to pre: palm err {np.linalg.norm(ik.palm_pose()[0] - pre):.3f} "
+                  f"joint track err {np.abs(q_act - (self.arm_cmd if side == 'right' else self.left_cmd)).max():.3f} "
+                  f"plan-vs-cmd {np.abs(q_pre - (self.arm_cmd if side == 'right' else self.left_cmd)).max():.3f} "
+                  f"base moved est {np.linalg.norm(self.wbc.base_pos[:2] - b0[:2]):.3f} true {np.linalg.norm(self.wbc.true_base_pos[:2] - t0[:2]):.3f} "
+                  f"hits {ik.collisions(q_act)}")
         e = mover(target, axes, duration=duration, q_ref=q_t)
         if e > 0.02:
             # The tracked approach stalls short of the target (collision rows near furniture, or a
@@ -571,9 +725,18 @@ class AssistiveRobot:
         candidates = [[(0, pitched(35), 0.6), (1, -left, 0.3)], [(0, pitched(35), 0.6), (1, left, 0.3)],
                       [(0, pitched(20), 0.6), (1, -left, 0.3)], [(0, pitched(50), 0.6), (1, -left, 0.3)],
                       [(0, -up, 0.6), (1, left, 0.3)], [(0, -up, 0.6), (1, fwd, 0.3)], [(0, -up, 0.6)]]
-        # The item's distance varies with how far the drawer actually opened: try a few stances
-        for standoff in (ABOVE_STANDOFF, ABOVE_STANDOFF + 0.05, ABOVE_STANDOFF - 0.04):
-            goal = top[:2] - standoff * fwd[:2] + GRASP_LATERAL * left[:2]
+        above_postures = [(0.74, 0.3), (0.74, 0.15), (0.70, 0.45), (0.64, 0.5)]
+        # The item's distance varies with how far the drawer actually opened: try a few stances,
+        # the searched one first (reachability in the planner's model), then fixed standoffs
+        goals = [top[:2] - so * fwd[:2] + GRASP_LATERAL * left[:2]
+                 for so in (ABOVE_STANDOFF, ABOVE_STANDOFF + 0.05, ABOVE_STANDOFF - 0.04)]
+        g0 = top - np.array([0, 0, min(0.03, it.size[2])])
+        stn = self._choose_stance(self.ik, g0 + np.array([0, 0, ABOVE_CLEARS[0]]), g0, candidates, th, ABOVE_STANDOFF,
+                                  GRASP_LATERAL, above_postures, ABOVE_ELBOW_MAX, label=f"above {item}", yaws=(0.0,))
+        if stn is not None and stn["raw"] < 0.05:
+            goals.insert(0, np.array([stn["x"], stn["y"]]))
+            above_postures = self._postures_from(stn["posture"], above_postures)
+        for goal in goals:
             if np.linalg.norm(goal - self.wbc.base_pos[:2]) > 0.03:
                 self._drive_to(goal[0], goal[1], th, tol=0.025, timeout=8.0)
             det = self.cam.detect()  # closer view
@@ -583,7 +746,7 @@ class AssistiveRobot:
             grasp = top - np.array([0, 0, min(0.03, it.size[2])])
             for clear in ABOVE_CLEARS:  # lowest first: the lower the hand, the lower the elbow
                 pre = grasp + np.array([0, 0, clear])
-                axes, best = self._choose(pre, grasp, candidates, [(0.74, 0.3), (0.74, 0.15), (0.70, 0.45), (0.64, 0.5)],
+                axes, best = self._choose(pre, grasp, candidates, above_postures,
                                           multi_start=True, elbow_max=ABOVE_ELBOW_MAX)
                 if best <= 0.05:
                     break
@@ -600,6 +763,25 @@ class AssistiveRobot:
         if DEBUG:
             print(f"   above: plan {best:.3f} clear {clear} posture {self.wbc.height_cmd:.2f}/{self.wbc.rpy_cmd[1]:.2f} "
                   f"descent residual {e:.3f} hits {self.ik.collisions(self.arm_cmd)}")
+        miss = grasp - self.ik.palm_pose()[0]
+        if e > GRASP_TOL and np.linalg.norm(miss[:2]) < STEP_CORRECT_MAX:
+            # A few cm short (the feet landed off the stance): back up over the item, step by the
+            # miss, look again, re-plan from there and descend once more
+            self.move_hand(pre, axes, duration=0.8, q_ref=q_pre)
+            self._step_by(miss[:2])
+            det = self.cam.detect()
+            if it.marker_id in det:
+                top = det[it.marker_id].position
+                centre = top - np.array([0, 0, it.size[2] + 0.001])
+                grasp = top - np.array([0, 0, min(0.03, it.size[2])])
+                pre = grasp + np.array([0, 0, clear])
+            axes2, best2 = self._choose(pre, grasp, candidates, above_postures, multi_start=True, elbow_max=ABOVE_ELBOW_MAX)
+            if best2 <= 0.05:
+                axes = axes2
+                q_pre, q_g = self._best_q
+                e = self._reach("right", q_pre, pre, grasp, q_g, axes, duration=1.0)
+                if DEBUG:
+                    print(f"   above (after step): plan {best2:.3f} descent residual {e:.3f}")
         if e > GRASP_TOL:
             self.move_hand(pre, axes, duration=0.8, q_ref=q_pre)
             self._set_posture(0.74, 0.0)
@@ -672,6 +854,231 @@ class AssistiveRobot:
         self.wbc.set_torso_rpy(0.0, pitch, 0.0)
         self.wait(1.2)
 
+    # ------------------------------------------------------------------ stance selection
+    # Inverse reachability, online: humanoid/mobile-manipulation planners choose where to stand
+    # from a reachability map before planning the arm (Burget & Bennewitz, ICRA 2015; Vahrenkamp
+    # et al.). Here the map is replaced by asking the arm IK directly, in its own scratch copy of
+    # the model with the base (and the measured posture) moved to each candidate stance. Nothing
+    # moves in the simulation until the best stance is chosen.
+
+    @property
+    def _leg_qadr(self) -> np.ndarray:
+        if not hasattr(self, "_leg_qadr_cache"):
+            from g1_wbc import BODY_JOINTS
+            jids = [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, j) for j in BODY_JOINTS[:15]]
+            self._leg_qadr_cache = np.array([self.model.jnt_qposadr[j] for j in jids])
+        return self._leg_qadr_cache
+
+    def _body_shape(self) -> dict:
+        """The current posture, heading-free: leg+waist joints, pelvis height and tilt."""
+        th = self.wbc.base_yaw
+        rel = np.zeros(4)
+        mujoco.mju_mulQuat(rel, np.array([np.cos(-th / 2), 0, 0, np.sin(-th / 2)]), np.asarray(self.wbc.base_quat, dtype=float))
+        return dict(legs=self.data.qpos[self._leg_qadr].copy(), z=float(self.wbc.base_pos[2]), quat=rel, xy=np.zeros(2))
+
+    def _calibrate_postures(self) -> None:
+        """Measure the body in each lean/crouch posture once (~8 s at start-up), including how far
+        the pelvis shifts from where it stood, so stances can be tried in those postures too."""
+        p0, th = self.wbc.base_pos[:2].copy(), self.wbc.base_yaw
+        c, s = np.cos(th), np.sin(th)
+        for h, pitch in CALIB_POSTURES:
+            self._set_posture(h, pitch)
+            rec = self._body_shape()
+            d = self.wbc.base_pos[:2] - p0
+            rec["xy"] = np.array([c * d[0] + s * d[1], -s * d[0] + c * d[1]])
+            self._posture_cache[(h, pitch)] = rec
+        self._set_posture(0.74, 0.0)
+
+    def _set_virtual(self, ik: ArmIK, x: float, y: float, yaw: float, posture=(0.74, 0.0)) -> bool:
+        """Put the planner's copy of the robot at a hypothetical stance: pelvis (x, y) as it would
+        stand there, heading yaw, in a measured posture. False if that posture isn't measured."""
+        rec = self._posture_cache.get(tuple(posture))
+        if rec is None:
+            return False
+        c, s = np.cos(yaw), np.sin(yaw)
+        px, py = x + c * rec["xy"][0] - s * rec["xy"][1], y + s * rec["xy"][0] + c * rec["xy"][1]
+        quat = np.zeros(4)
+        mujoco.mju_mulQuat(quat, np.array([np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]), rec["quat"])
+        ik.virtual_root = (np.array([px, py, rec["z"]]), quat)
+        ik.virtual_legs = (self._leg_qadr, rec["legs"])
+        return True
+
+    @staticmethod
+    def _clear_virtual(ik: ArmIK) -> None:
+        ik.virtual_root = None
+        ik.virtual_legs = None
+
+    def _stance_blocked(self, ik: ArmIK) -> bool:
+        """Would the body (legs, pelvis, torso; not the arms) intersect furniture at the
+        virtual stance?"""
+        if not hasattr(self, "_trunk_bodies"):
+            pelvis = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
+            arms = self.ik.arm_bodies | self.left_ik.arm_bodies
+            self._trunk_bodies = {b for b in range(self.model.nbody)
+                                  if self.ik._is_descendant(b, pelvis) and b not in arms}
+            self._robot_bodies = {b for b in range(self.model.nbody) if self.ik._is_descendant(b, pelvis)}
+        s = ik.scratch
+        ik._load(s)
+        mujoco.mj_kinematics(self.model, s)
+        mujoco.mj_collision(self.model, s)
+        for i in range(s.ncon):
+            c = s.contact[i]
+            b1, b2 = self.model.geom_bodyid[c.geom1], self.model.geom_bodyid[c.geom2]
+            if self.model.geom_type[c.geom1] == mujoco.mjtGeom.mjGEOM_PLANE or \
+                    self.model.geom_type[c.geom2] == mujoco.mjtGeom.mjGEOM_PLANE:
+                continue
+            if ((b1 in self._trunk_bodies and b2 not in self._robot_bodies) or
+                    (b2 in self._trunk_bodies and b1 not in self._robot_bodies)) and c.dist < -0.005:
+                return True
+        return False
+
+    def _quick_reach(self, ik: ArmIK, pre: np.ndarray, target: np.ndarray, cand, seeds, elbow_max) -> tuple:
+        """Cheap reachability score of one hand-axis candidate at the virtual stance (no collision
+        rows in the solve, collisions counted after). Returns (score, q_pre, q_t)."""
+        best = (np.inf, None, None)
+        for q0 in seeds:
+            q_t, e_t = ik.solve(target, cand, q_init=q0, iters=80, avoid=False)
+            q_p, e_p = ik.solve(pre, cand, q_init=q_t, iters=60, avoid=False, q_ref=q_t)
+            if ik.elbow_too_high(q_p, q_t, limit=elbow_max):
+                continue
+            hits = len(ik.collisions(q_p) + ik.collisions(q_t))
+            sc = e_t + e_p + 0.1 * hits + ELBOW_W * ik.elbow_cost(q_p, q_t) + 0.2 * max(0.0, 0.15 - ik.limit_margin(q_t))
+            if sc < best[0]:
+                best = (sc, q_p, q_t)
+        return best
+
+    def _choose_stance(self, ik: ArmIK, pre: np.ndarray, target: np.ndarray, candidates, yaw0: float,
+                       standoff: float, lateral: float, postures, elbow_max: float | None = None,
+                       label: str = "", yaws=(0.0, -0.15, 0.15)) -> dict | None:
+        """Where to stand (and how to lean) to reach `target` (via `pre`) with `ik`'s arm.
+
+        Stances are parameterized relative to the target, in the stance's own heading frame:
+        target `f` ahead of the pelvis and `l` to the side (+ = the pelvis is left of it, i.e.
+        right arm), heading yaw0 + dyaw. Three stages: (1) all stances x candidates in the first
+        posture with quick solves, (2) the 6 best stances in the other measured postures,
+        (3) the full collision-aware plan (_plan) for the 3 best, plus a robustness check: the
+        same plan from 3 cm off in each direction (the feet never land exactly). Returns
+        dict(x, y, yaw, posture, score, raw) or None."""
+        if not STANCE_SEARCH:
+            return None
+        cur = self.wbc.base_pos[:2]
+        seeds = [ik.home, self.arm_cmd.copy() if ik is self.ik else self.left_cmd.copy()]
+
+        def pelvis(f, l, yaw):
+            fw, lf = np.array([np.cos(yaw), np.sin(yaw)]), np.array([-np.sin(yaw), np.cos(yaw)])
+            return np.asarray(target[:2]) - f * fw + l * lf
+
+        def quick(x, y, yaw, posture):
+            if not self._set_virtual(ik, x, y, yaw, posture):
+                return np.inf, None
+            try:
+                if self._stance_blocked(ik):
+                    return np.inf, None
+                return min(((self._quick_reach(ik, pre, target, c, seeds, elbow_max)[0], i)
+                            for i, c in enumerate(candidates)), key=lambda t: t[0])
+            finally:
+                self._clear_virtual(ik)
+
+        stage1 = []
+        for dyaw in yaws:
+            for df in (0.0, -0.05, 0.05, -0.10, 0.10):
+                for dl in (0.0, -0.05, 0.05, -0.10):
+                    yaw = yaw0 + dyaw
+                    x, y = pelvis(standoff + df, lateral + dl, yaw)
+                    sc, ci = quick(x, y, yaw, postures[0])
+                    # prefer small moves: stepping is slow and the feet land a few cm off anyway
+                    pen = 0.15 * np.hypot(df, dl) + 0.05 * abs(dyaw) + 0.05 * np.hypot(x - cur[0], y - cur[1])
+                    # a long reach (arm far out in front) also pulls the balance off: keep it near
+                    pen += 0.4 * max(0.0, standoff + df - REACH_COMFORT)
+                    stage1.append((sc + pen, x, y, yaw, tuple(postures[0]), pen))
+        stage1.sort(key=lambda t: t[0])
+        stage2 = [s[:5] for s in stage1[:6]]
+        for _, x, y, yaw, _, pen in stage1[:6]:
+            for posture in postures[1:]:
+                sc, _ = quick(x, y, yaw, posture)
+                # Leaning is a last resort: with the arm out in front, a pitched torso moves the
+                # centre of mass forward and the balance policy shuffles the feet backwards
+                # (measured: 0.36-0.47 m of drift during one reach at 0.3 rad / 0.5 m)
+                lean = 0.06 + 0.15 * abs(posture[1]) + 0.5 * max(0.0, 0.74 - posture[0])
+                stage2.append((sc + pen + lean, x, y, yaw, tuple(posture)))
+        stage2 = sorted((s for s in stage2 if np.isfinite(s[0])), key=lambda t: t[0])[:3]
+        best = None
+        for sc, x, y, yaw, posture in stage2:
+            if not self._set_virtual(ik, x, y, yaw, posture):
+                continue
+            try:
+                cand, raw, q_p, q_t = self._plan(ik, seeds[1], pre, target, candidates, True, elbow_max)
+                if cand is None:
+                    continue
+                worst = 0.0
+                for ox, oy in ((0.03, 0), (-0.03, 0), (0, 0.03), (0, -0.03)):
+                    self._set_virtual(ik, x + ox, y + oy, yaw, posture)
+                    s2, _, _ = self._quick_reach(ik, pre, target, cand, [q_t], elbow_max)
+                    worst = max(worst, s2)
+            finally:
+                self._clear_virtual(ik)
+            total = raw + 0.3 * max(0.0, worst - 0.02)
+            if best is None or total < best["score"]:
+                best = dict(x=float(x), y=float(y), yaw=float(yaw), posture=posture, score=float(total), raw=float(raw))
+        if DEBUG:
+            print(f"   stance[{label}]: {len(stage1)} tried, best {best and {k: (round(v, 3) if isinstance(v, float) else v) for k, v in best.items()}}")
+        return best
+
+    def _go_stance(self, st: dict) -> None:
+        """Walk (standing) to a stance from _choose_stance, then take its posture."""
+        if self.wbc.height_cmd < 0.73 or abs(self.wbc.rpy_cmd[1]) > 1e-3:
+            self._set_posture(0.74, 0.0)
+        if np.hypot(st["x"] - self.wbc.base_pos[0], st["y"] - self.wbc.base_pos[1]) > 0.025 or \
+                abs(wrap(st["yaw"] - self.wbc.base_yaw)) > 0.05:
+            self._drive_to(st["x"], st["y"], st["yaw"], tol=0.025, timeout=10.0)
+
+    def _restance(self, ik: ArmIK, pre, target, candidates, standoff, lateral, postures, elbow_max, label,
+                  yaw0: float | None = None, yaws=(0.0, -0.15, 0.15)):
+        """The plan from where we ended up failed: search the stance again from here and step
+        there. Returns the stance, or None if there is nowhere better (or the search is off)."""
+        if ik is self.left_ik:
+            self.left_arm_home(0.6)
+        st = self._choose_stance(ik, pre, target, candidates, self.wbc.base_yaw if yaw0 is None else yaw0,
+                                 standoff, lateral, postures, elbow_max, label, yaws)
+        if st is None or st["raw"] > 0.08:
+            return None
+        self._go_stance(st)
+        return st
+
+    def _left_touching(self, weld: str) -> bool:
+        """Is the left hand in contact with the part a weld would hold (e.g. the drawer)? Reads the
+        contact list (a real robot: fingertip force / joint torque sensing)."""
+        eq = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_EQUALITY, weld)
+        if eq < 0:
+            return False
+        part = self.model.eq_obj2id[eq]
+        hand = self.left_ik.arm_bodies
+        for i in range(self.data.ncon):
+            c = self.data.contact[i]
+            b1, b2 = self.model.geom_bodyid[c.geom1], self.model.geom_bodyid[c.geom2]
+            if (b1 in hand and b2 == part) or (b2 in hand and b1 == part):
+                return True
+        return False
+
+    def _body_rel(self, p: np.ndarray) -> np.ndarray:
+        """World point -> (forward, left, up) from the pelvis, in its heading frame."""
+        th = self.wbc.base_yaw
+        d = np.asarray(p) - self.wbc.base_pos
+        return np.array([np.cos(th) * d[0] + np.sin(th) * d[1], -np.sin(th) * d[0] + np.cos(th) * d[1], d[2]])
+
+    def _step_by(self, d_xy: np.ndarray) -> None:
+        """Shift the feet by d_xy (world), keeping the heading, standing up for the step."""
+        self._set_posture(0.74, 0.0)
+        p = self.wbc.base_pos[:2] + np.asarray(d_xy)
+        if DEBUG:
+            print(f"   step-correct by {np.round(d_xy, 3)}")
+        self._drive_to(p[0], p[1], self.wbc.base_yaw, tol=0.02, timeout=6.0)
+
+    @staticmethod
+    def _postures_from(first, postures) -> list:
+        """`postures` with `first` tried first."""
+        return [tuple(first)] + [tuple(p) for p in postures if tuple(p) != tuple(first)]
+
     def carry(self) -> None:
         """Bring the held item close to the body (pelvis-relative carry pose)."""
         self._set_posture(0.74, 0.0)
@@ -697,6 +1104,9 @@ class AssistiveRobot:
             return {"ok": False, "error": f"lost the {item} on the way"}
         it = self.items[self.holding]
         surface = self.delivery
+        far = float(np.hypot(*(np.asarray(surface["pos"]) - self.wbc.base_pos[:2])))
+        if far > 0.8:  # not at the tray (e.g. the walk there failed): keep holding, don't drop it on the floor
+            return {"ok": False, "error": f"not at the delivery tray ({far:.2f} m away); still holding the {self.holding}"}
         th = self.wbc.base_yaw
         fwd = np.array([np.cos(th), np.sin(th), 0])
         axes = self._hold_axes(fwd)
@@ -1043,6 +1453,13 @@ class AssistiveRobot:
         self._turn_to(yaw_goal)
         fwd = np.array([np.cos(yaw_goal), np.sin(yaw_goal), 0.0])
         left = np.array([-fwd[1], fwd[0], 0.0])
+        up = np.array([0, 0, 1.0])
+        candidates = [[(0, into, 0.6), (1, up, 0.4)], [(0, into, 0.6), (1, -up, 0.4)],
+                      [(0, into, 0.6), (2, up, 0.4)], [(0, into, 0.6), (2, -up, 0.4)]]
+        # Pushing: fingertips (~11 cm past the palm site) on the drawer front, 8 cm above the bar
+        push_off = (PUSH_FACE - FINGER_REACH) * into + np.array([0, 0, 0.08])
+        searched_for = None  # handle position the stance was searched for
+        st_off = None  # chosen stance, relative to the handle (world xy offset)
         for _ in range(3):  # walking with a load drifts: look, drive, turn, check, repeat
             # look again: is it still open as far as we think? (it may have been knocked)
             measured = self._measure_opening(st, self.cam.detect(), Ra, pa)
@@ -1056,10 +1473,23 @@ class AssistiveRobot:
                 R_open, t_open = model.transform(opened)
                 handle = Ra @ (R_open @ g0 + t_open) + pa
             goal = handle - (0.42 if push else 0.40) * fwd - GRASP_LATERAL * left
+            if STANCE_SEARCH and (searched_for is None or np.linalg.norm(handle - searched_for) > 0.03):
+                # where the LEFT arm reaches the contact best (the right arm keeps the item tucked)
+                c_pt = handle + push_off if push else handle
+                stc = self._choose_stance(self.left_ik, c_pt - 0.10 * into, c_pt, candidates, yaw_goal,
+                                         float((c_pt - goal)[:2] @ fwd[:2]), float(-(c_pt - goal)[:2] @ left[:2]),
+                                         [(0.74, 0.0)], label="close", yaws=(0.0,))
+                searched_for = handle.copy()
+                if stc is not None and stc["raw"] < 0.08:
+                    st_off = np.array([stc["x"], stc["y"]]) - handle[:2]
+            if st_off is not None:
+                goal = handle.copy()
+                goal[:2] = handle[:2] + st_off
             if DEBUG:
                 print(f"   close stance: measured {measured} opened {opened:.3f} handle {handle.round(3)} "
                       f"base {self.wbc.base_pos.round(3)} goal {goal[:2].round(3)}")
-            if np.linalg.norm(goal[:2] - self.wbc.base_pos[:2]) < 0.06 and abs(wrap(yaw_goal - self.wbc.base_yaw)) < 0.1:
+            if np.linalg.norm(goal[:2] - self.wbc.base_pos[:2]) < (0.03 if st_off is not None else 0.06) and \
+                    abs(wrap(yaw_goal - self.wbc.base_yaw)) < 0.1:
                 break
             b = self.wbc.base_pos
             back = float((goal[:2] - b[:2]) @ fwd[:2])
@@ -1069,19 +1499,25 @@ class AssistiveRobot:
                 # to the right) along the open drawer's front and catches it on the handle bar
                 mid = b[:2] + back * fwd[:2]
                 self._drive_to(mid[0], mid[1], yaw_goal, tol=0.04, timeout=6.0)
-            self._drive_to(goal[0], goal[1], yaw_goal, tol=0.03, timeout=8.0)
+            arrived = self._drive_to(goal[0], goal[1], yaw_goal, tol=0.03, timeout=8.0)
             self._turn_to(yaw_goal)
+            if DEBUG:
+                print(f"   close drive: arrived {arrived} base {self.wbc.base_pos[:2].round(3)} "
+                      f"handle rel {self._body_rel(handle).round(2)}")
 
-        up = np.array([0, 0, 1.0])
         pre = handle - 0.12 * into
-        candidates = [[(0, into, 0.6), (1, up, 0.4)], [(0, into, 0.6), (1, -up, 0.4)],
-                      [(0, into, 0.6), (2, up, 0.4)], [(0, into, 0.6), (2, -up, 0.4)]]
-        # Pushing: fingertips (~11 cm past the palm site) on the drawer front, 8 cm above the bar
-        push_off = (PUSH_FACE - FINGER_REACH) * into + np.array([0, 0, 0.08])
         contact = handle + push_off if push else handle
         if push:
             pre = contact - 0.10 * into
         axes, best, q_best, q_h = self._plan(self.left_ik, self.left_cmd.copy(), pre, contact, candidates)
+        if best > 0.05:
+            # not from here: search the stance again from where we are and step there
+            f0 = float(self._body_rel(contact)[0])
+            l0 = float(-self._body_rel(contact)[1])
+            stn = self._restance(self.left_ik, pre, contact, candidates, f0, l0, [(0.74, 0.0)], None, "close again",
+                                 yaw0=yaw_goal, yaws=(0.0,))
+            if stn is not None:
+                axes, best, q_best, q_h = self._plan(self.left_ik, self.left_cmd.copy(), pre, contact, candidates)
         if best > 0.05 and not push and model.kind == "prismatic":
             return self.close_opened(seconds, 0, push=True)
         if best > 0.05:
@@ -1091,6 +1527,21 @@ class AssistiveRobot:
                     "yaw_goal": round(yaw_goal, 3)}
         # joint-space swing to the pre-grasp (avoids IK local minima from the hand-by-the-hip pose)
         e = self._reach("left", q_best, pre, contact, q_h, axes, duration=0.8)
+        miss = contact - self.left_ik.palm_pose()[0]
+        if e > 0.04 and np.linalg.norm(miss[:2]) < STEP_CORRECT_MAX and not self._left_touching(st["weld"]):
+            # Short by a few cm (the feet landed off the stance): step by the miss, re-plan, again
+            self.move_left_hand(pre - 0.05 * into, None, duration=0.6, settle=0.0)
+            self._step_by(miss[:2])
+            axes2, best2, q_b2, q_h2 = self._plan(self.left_ik, self.left_cmd.copy(), pre, contact, candidates)
+            if best2 <= 0.05:
+                axes = axes2
+                e = self._reach("left", q_b2, pre, contact, q_h2, axes, duration=0.8)
+        # Pushing: the fingertips stop on the drawer front (or its bar) a few cm before the
+        # planned point, which is just what a push needs; the path below presses on from there.
+        if push and e <= 0.09 and self._left_touching(st["weld"]):
+            if DEBUG:
+                print(f"   close: fingertips on the front {e:.3f} m short of the plan: pushing from here")
+            e = 0.0
         if e > 0.04:
             self.left_arm_home()
             if not push and model.kind == "prismatic":
@@ -1196,3 +1647,9 @@ class AssistiveRobot:
         self.arm_home()
         self._item_collisions(item, True)
         return {"ok": True, "released": item}
+
+
+# Backup: abstracted grasp (cheat_grasp.py), only when G1_CHEAT_GRASP is set (1 / fallback)
+if os.environ.get("G1_CHEAT_GRASP", "0").strip().lower() not in ("", "0", "false", "no"):
+    import cheat_grasp
+    cheat_grasp.install(AssistiveRobot)
