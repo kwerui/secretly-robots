@@ -101,16 +101,67 @@ sim/.venv/bin/python -m scripts.voice_robot --mic          # talk to it through 
 
 The window is at http://127.0.0.1:8765 and opens by itself. Each run is also logged to `logs/voice_events.jsonl`; replay one with `python -m brain.voice_window logs/voice_events.jsonl`.
 
-### The G1 voice demo
+### The G1 voice demo (the full sequence)
 
-The full sequence with the Unitree G1 standing in the house (balancing on its GR00T policy):
+The Unitree G1 stands in the house, balancing on its GR00T policy. The person on the sofa speaks; the robot hears, interprets, asks if it needs to, and goes into **fetch mode**. Everything the robot does runs on the laptop: no network, no API key.
+
+**One-time setup** (from the repo root, using the sim's virtualenv):
 
 ```bash
-cd assistive_g1 && ../sim/.venv/bin/python fetch_assets.py     # once: G1 model + policies (~35 MB)
-../sim/.venv/bin/mjpython voice_demo.py                          # V speak · Y/N answer · X cancel
+sim/.venv/bin/pip install -r requirements-hearing.txt -r requirements-stt.txt
+sim/.venv/bin/python -m brain.speech_to_text --download        # Whisper base.en, ~145 MB into models/
+(cd assistive_g1 && ../sim/.venv/bin/python fetch_assets.py)   # G1 model + GR00T policies, ~35 MB
+# Optional, for free-form speech (see "Gemma" below):
+brew install ollama && brew services start ollama && ollama pull gemma4:e4b   # ~9.5 GB
 ```
 
-Press **V** and the person speaks. The G1's head microphone hears it, Whisper transcribes it and the rules (or local Gemma 4) interpret it. A hint makes the robot ask *"Would you like some water?"* and the light above its head turns amber. A request or a yes puts it in **FETCH MODE**: the light turns green, the brain gets the task, and the viewer, the window and the console show the planner's first step and the most likely places (`search water_bottle`, kitchen_counter 57%), with a line to the first place. The step is planned, not carried out yet; `brain_bridge.RobotBridge` is what would carry it out.
+The voice clips are already in the repo (`sim/assets/voice/` for the person, `assets/robot_voice/` for the robot), so the demo needs no Gemini key.
+
+**Run it:**
+
+```bash
+cd assistive_g1 && ../sim/.venv/bin/mjpython voice_demo.py
+```
+
+On macOS the viewer must run under `mjpython`; on Linux use `../sim/.venv/bin/python`. The MuJoCo viewer opens with the G1 at the sofa, and the speech-to-text window opens in your browser at http://127.0.0.1:8765.
+
+| Key | What happens |
+|---|---|
+| **V** | The person says one of eight water lines. Some are requests ("I need water", "Can you get me something to drink?"), some are hints ("My mouth is so dry", "I'm parched", "I am thirsty"). |
+| **Y** / **N** | The person answers the robot's question ("Yes, please." / "No, thank you."). |
+| **X** | Cancel fetch mode and go back to listening. |
+
+**What you see:**
+
+1. **Listening.** Grey light above the G1's head; top-left of the viewer says LISTENING.
+2. **The person speaks.** A caption at the bottom; the G1's head-camera microphone hears it (about 2 m away, quieter with distance), and Whisper transcribes it in about 0.3 s. The window adds a card with the transcript, timing, loudness and distance.
+3. **A hint** makes the robot say *"Would you like some water?"* in its own voice. The light turns amber and the viewer says ASKING. The question lapses after 10 s with no answer.
+4. **A request, or a yes,** puts it in **FETCH MODE**. The light turns green (after a yes, the robot also says *"Okay, I'll get you some water."*). The brain now has the task `water_bottle → sofa`. The viewer, the window and the console show the planner's first step and the likely places (`search water_bottle`; kitchen_counter 57%, kitchen_drawers 33%), and a green line points to the first place. The step is planned, not carried out: the robot stays put. `brain_bridge.RobotBridge.execute_high_level` is what would carry it out.
+5. **A no** gets *"Okay. Just let me know if you need anything."* and it goes back to listening.
+
+Options: `--target kitchen_drawer` (where the bottle starts), `--layout`, `--seed`, `--no-browser`, `--no-gemma`.
+
+**The pipeline** (all onboard):
+
+```text
+person's clip (Gemini TTS, pre-made) -> G1 head_cam microphone (brain/hearing.py: distance falloff, room noise, voice activity)
+  -> Whisper base.en on CPU (brain/speech_to_text.py)
+  -> interpreter (brain/command.py): rules first, instant; local Gemma 4 only for phrasing the rules don't know
+  -> request / hint / yes / no / other -> CommandState: confirming -> understood | declined
+  -> Brain.set_task(...) + planner's first step shown (assistive_g1/voice_demo.py)
+```
+
+**Gemma (optional).** The rules cover every scripted phrase and Y/N, so the demo works without Gemma. Gemma 4 (`gemma4:e4b` on the local Ollama server, `127.0.0.1` only) handles anything else, e.g. "I could do with something cold, it's warm in here" → hint, "pop over and grab my book" → request, "bring me my pills" → refused (no medication). Live-tested: about 0.2–0.45 s per answer once loaded.
+- **The first load takes about 2 minutes** (9.5 GB of weights). The demo starts on the rules straight away and switches Gemma on when it's ready; the window's status line says when. Start the demo a couple of minutes before you present.
+- It then stays in memory (about 9.4 GB) for 2 hours after its last use. On a 16 GB Mac that's a lot: free it with `ollama stop gemma4:e4b`, and stop the server with `brew services stop ollama`.
+- Some Ollama builds (the MLX engine) answer `501` to schema-constrained output. The client then asks for JSON in the prompt instead and validates every field, so this needs no action.
+
+**Troubleshooting**
+- *Window opens but never shows the house:* make sure you're on the latest branch (an early version deadlocked the viewer).
+- *Exit code 143 when you close the viewer:* normal under `mjpython`.
+- *"Gemma 4 unavailable":* Ollama isn't running (`brew services start ollama`) or the model isn't pulled.
+- *No sound:* the clips play with `afplay` (macOS) or `paplay`/`aplay` (Linux); the captions still work without audio.
+- Logs: `logs/voice_events.jsonl` (everything the window shows) and `logs/brain_events.jsonl`. Replay a run with `sim/.venv/bin/python -m brain.voice_window logs/voice_events.jsonl`.
 
 ## How the brain makes decisions
 
@@ -135,20 +186,15 @@ Then the simulation team executes the controller action, reads new state, and as
 
 ### Optional genuine local AI (no Wi-Fi at inference time)
 
-1. Install [Ollama](https://ollama.com/download).
-2. Download a small on-device model while internet is available:
+Gemma 4 runs on the laptop through [Ollama](https://ollama.com/download), using only `http://127.0.0.1:11434`:
 
-   ```bash
-   ollama pull gemma4:e2b
-   ```
+```bash
+brew install ollama && brew services start ollama
+ollama pull gemma4:e4b            # ~9.5 GB, once, while online
+python -m scripts.local_brain     # a real local request
+```
 
-3. Ensure the Ollama local server is running (usually the Ollama app, or `ollama serve`). Test:
-
-   ```bash
-   python -m scripts.local_brain
-   ```
-
-This sends a **real** structured-output request to your local model, using only `http://127.0.0.1:11434`. The trained model's weights must already be downloaded. Memory needs and latency depend on your laptop; the E2B model download can be several GB. The robot's basic high-level planner and safety guard are **still Python**, not the LLM. If Ollama is missing, the example reports that fact rather than faking a successful call.
+The voice demo uses it for speech the rules don't recognise (see "Gemma" above): live-tested, about 0.3 s per answer once loaded, about 2 minutes for the first load. The planner and safety guard are **still Python**, not the LLM, and every model answer is validated. If Ollama is missing, the code says so rather than faking a result, and the rules carry on.
 
 ### Optional Google DeepMind prize integration (cloud, not required for offline base)
 
@@ -181,7 +227,8 @@ The adapter uses `gemini-4-argon` and the official `google-genai` structured JSO
 | Human-near / lost-sensor stop and retry limit | ✅ High-level decision logic; real emergency braking must be wired |
 | JSONL decision and feedback logging | ✅ Implemented |
 | Deterministic Python planner | ✅ Working offline fallback |
-| Gemma 4 local inference through Ollama | 🟡 Optional adapter; not yet confirmed live-tested |
+| Gemma 4 local inference through Ollama | ✅ Live-tested (`gemma4:e4b`, ~0.3 s per answer once loaded); optional, rules fallback |
+| Voice: person speaks (Gemini TTS clips), robot hears, Whisper STT, interprets, asks, fetch mode | ✅ Onboard; headless tests drive the real G1, clips and Whisper (`assistive_g1/voice_demo.py`) |
 | Gemini 4 Argon cloud option | ✅ Implemented and successfully live-tested; still optional and locally validated |
 | Simulated cameras/object-recognition/robot control | ⏳ Teammates' integration needed |
 | Autonomous grasping and delivery | ⏳ Teammates' integration needed |
@@ -204,12 +251,16 @@ brain/
   speech_to_text.py   # onboard Whisper (base.en, CPU): speech segment -> transcript
   voice_pipeline.py   # heard speech -> transcript -> command state, off the sim thread
   voice_window.py     # live speech-to-text window at http://127.0.0.1:8765
+  command.py          # onboard interpreter (rules, then Gemma) + CommandListener: confirm, understood, declined
+  robot_voice.py      # robot's spoken lines (Gemini TTS clips in assets/robot_voice/, played locally)
   gemini_client.py    # official google-genai structured-output boundary
   gemini_optional.py  # checked Gemini task/next-decision adapters
   demo.py             # hand-authored explanatory example
 robot_core/            # original neutral MuJoCo smoke-test scaffold
 scenes/smoke.xml       # real minimal physics test scene
 sim/house_env.py        # teammate-owned house environment used by the adapter
+sim/person_voice.py     # the sofa person's voice lines (Gemini TTS clips in sim/assets/voice/)
+assistive_g1/voice_demo.py # the G1 voice demo: V speak, Y/N answer, fetch mode
 scripts/               # smoke test and local inference checks
 tests/                 # automatic regression tests
 docs/ROADMAP.md        # TWO-DAY execution plan, roles, demo and plan B

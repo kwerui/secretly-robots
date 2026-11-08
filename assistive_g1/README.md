@@ -22,6 +22,11 @@ python run_demo.py --viewer       # interactive MuJoCo viewer (needs working GLX
 python run_demo.py --fps 12.5 --size 800 450   # lighter video if you have no GPU
 ```
 
+**Voice demo:** `../sim/.venv/bin/mjpython voice_demo.py` (macOS; `python` on Linux). The person
+on the sofa speaks (V), the G1 hears and interprets it onboard, asks "Would you like some water?"
+for hints (Y/N to answer), and goes into fetch mode with the planner's first step shown. Setup
+and details: "The G1 voice demo" in the repo's top-level README.
+
 `run_demo.py` records the carer's cupboard demo in sim the first time and saves
 `cupboard_model.json`. To use a real demonstration instead, see "Real carer demo".
 
@@ -70,6 +75,7 @@ from `decoupled_wbc/control/policy/g1_gear_wbc_policy.py`, and they match LeRobo
 | `agent.py` | LLM tool-use agent over the same skills (Anthropic SDK). Untested against the API |
 | `run_demo.py` | Scenario + MP4 recorder (follow cam + head-cam inset + captions) |
 | `calibrate_camera.py` | ChArUco calibration for the real demo camera |
+| `voice_demo.py` | Voice demo: person speaks, G1 hears (head_cam mic), Whisper, rules/Gemma interpreter, asks, fetch mode (planned, not executed) |
 
 ## Real carer demo (for the pitch)
 
