@@ -283,6 +283,13 @@ class DoorDiscovery:
         self.truth = set(env.locked_doors)  # what the house really has locked
         self.known: set[str] = set()  # what the robot has found out
         env.locked_doors = self.known  # the planner only avoids doors the robot knows are locked
+        if getattr(robot, "costmap", None) is not None:
+            # Perceived navigation (costmap.py, G1_NAV=live): the robot built its map while
+            # env.locked_doors still held the truth, so the lock is in its floor plan. Rebuild it
+            # from what the robot knows (every door pushable); mark_door_locked adds a found one.
+            from costmap import make_costmap
+            robot.costmap = env.costmap = make_costmap(env)
+            robot._map_depth()
         self.radius = radius
         self._route_doors: set[str] = set()
         go_to = robot.go_to
@@ -304,6 +311,8 @@ class DoorDiscovery:
                 except DoorLocked as e:
                     robot.wbc.set_velocity(0.0, 0.0, 0.0)
                     self.known.add(e.door)
+                    if getattr(robot, "costmap", None) is not None:
+                        robot.costmap.mark_door_locked(e.door)
                     a, b = e.door.split("_")
                     self.say(f"the {a}-{b} door is locked: rerouting the other way")
                     if self.on_found is not None:

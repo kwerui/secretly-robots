@@ -158,11 +158,11 @@ class HeadLidar:
 class Costmap:
     """Voxel log-odds occupancy of the house from the robot's sensors -> 2D clearance grid."""
 
-    def __init__(self, env, prior_geoms, wall_geoms, door_zones, grid_res: float):
+    def __init__(self, env, prior_geoms, wall_geoms, door_zones, grid_res: float, door_names=None):
         """env: the house (its gx/gy grid, _clearance and planner helpers are reused).
         prior_geoms / wall_geoms: geom ids seeded as fixed furniture / walls.
         door_zones: [(hinge x, hinge y, leaf reach, closed-leaf bearing)] of the unlocked doors
-        (see _is_door_leaf)."""
+        (see _is_door_leaf). door_names: the door of each zone (for mark_door_locked)."""
         self.env = env
         self.res = grid_res
         self.gx, self.gy = env.gx, env.gy
@@ -172,6 +172,8 @@ class Costmap:
         self.L = np.full((self.nb, self.ny, self.nx), L_PRIOR, np.float32)
         self.door_zones = [(float(x), float(y), float(r), float(a)) for x, y, r, a in door_zones]
         self.leaf_bearing: dict[int, float] = {}  # last confident bearing of each door's leaf
+        self.door_names = list(door_names) if door_names is not None else [None] * len(self.door_zones)
+        self._zone_off: set[int] = set()  # zones of doors found locked (their leaf is a wall now)
         self._seed(wall_geoms, L_WALL)
         self._seed(prior_geoms, L_FIXED)
         self.prior = self.L.copy()
@@ -182,7 +184,17 @@ class Costmap:
         self.log: list[dict] = []
 
     # ------------------------------------------------------------------ prior
-    def _seed(self, geoms, value: float) -> None:
+    def mark_door_locked(self, door: str) -> None:
+        """The robot found this door locked (scenario.DoorDiscovery): its leaf becomes a wall in
+        the prior and in the map, and its hits are no longer dropped as a pushable leaf."""
+        geoms = list(self.env.door_geoms.get(door, []))
+        self._seed(geoms, L_WALL)
+        self._seed(geoms, L_WALL, arr=self.prior)
+        self._zone_off |= {n for n, dn in enumerate(self.door_names) if dn == door}
+        self.version += 1
+
+    def _seed(self, geoms, value: float, arr: np.ndarray | None = None) -> None:
+        arr = self.L if arr is None else arr
         m, d = self.env.model, self.env.data
         for g in geoms:
             typ = m.geom_type[g]
@@ -201,7 +213,7 @@ class Costmap:
                 continue
             inside = self.env._clearance([g], 10.0) <= 0.0
             for k in bands:
-                self.L[k][inside] = np.maximum(self.L[k][inside], value)
+                arr[k][inside] = np.maximum(arr[k][inside], value)
 
     # ------------------------------------------------------------------ geometry helpers
     def _cells(self, pts: np.ndarray):
@@ -227,6 +239,8 @@ class Costmap:
         swinging through it is not a wall. Everything else near a door is mapped."""
         out = np.zeros(len(xy), bool)
         for n, (x, y, r, closed) in enumerate(self.door_zones):
+            if n in self._zone_off:
+                continue
             dx, dy = xy[:, 0] - x, xy[:, 1] - y
             rad = np.hypot(dx, dy)
             near = rad <= r
@@ -422,13 +436,14 @@ def make_costmap(env) -> Costmap:
         (walls if name.startswith("wall") or name.startswith("door_frame") else fixed).append(g)
     fixed += list(env.drawer_geoms)
     fixed += [g for dn in env.locked_doors for g in env.door_geoms[dn]]
-    zones = []
+    zones, names = [], []
     for dn in H.DOORWAYS:
         if dn in env.locked_doors:
             continue
         hinge, closed_deg = H.door_frame(dn)  # closed_deg: bearing of the closed leaf from its hinge
         zones.append((hinge[0], hinge[1], H.DOOR_LEAF_L + 0.05, math.radians(closed_deg)))
-    return Costmap(env, fixed, walls, zones, H.GRID_RES)
+        names.append(dn)
+    return Costmap(env, fixed, walls, zones, H.GRID_RES, door_names=names)
 
 
 def pose_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
