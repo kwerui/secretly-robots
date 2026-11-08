@@ -73,9 +73,9 @@ from `decoupled_wbc/control/policy/g1_gear_wbc_policy.py`, and they match LeRobo
 
 ## Real carer demo (for the pitch)
 
-1. Print ArUco 4x4_50 **id 10** (door front) and **id 11** (fixed on the cupboard body or
+1. Print ArUco 4x4_50 **id 46** (door front) and **id 47** (fixed on the cupboard body or
    counter, upright). Size: 6 cm black square, or change `DOOR_MARKER_SIZE`.
-   `scene.marker_png(10)` writes the images to `assets/markers/`.
+   `scene.marker_png(46)` writes the images to `assets/markers/`.
 2. `python calibrate_camera.py board`, print it, then
    `python calibrate_camera.py calib --square <m>`.
 3. `python demo_capture.py video --source 0 --calib calib.npz --grasp gx gy gz`.

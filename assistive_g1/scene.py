@@ -45,18 +45,20 @@ class Item:
     marker_size: float = 0.05  # edge length of the black square, metres
 
 
+# Marker IDs (DICT_4X4_50). Jack's house (sim/aruco.py) owns 0, 1, 10-17, 20-34, 40 and 45,
+# so ours live in the gaps: items 2-4, cupboard 46/47, furniture anchors 35-39.
 ITEMS = {
-    "water_bottle": Item("water_bottle", 1, (0.03, 0.03, 0.10), (0.2, 0.5, 0.9, 1)),
-    "cup": Item("cup", 2, (0.035, 0.035, 0.05), (0.9, 0.9, 0.85, 1)),
-    "pill_box": Item("pill_box", 3, (0.035, 0.03, 0.03), (0.9, 0.3, 0.3, 1)),
+    "water_bottle": Item("water_bottle", 2, (0.03, 0.03, 0.10), (0.2, 0.5, 0.9, 1)),
+    "cup": Item("cup", 3, (0.035, 0.035, 0.05), (0.9, 0.9, 0.85, 1)),
+    "pill_box": Item("pill_box", 4, (0.035, 0.03, 0.03), (0.9, 0.3, 0.3, 1)),
 }
 
 RIGHT_HAND_BODIES = ["right_wrist_yaw_link"] + [f"right_hand_{f}_link" for f in
                                                 ("thumb_0", "thumb_1", "thumb_2", "index_0", "index_1",
                                                  "middle_0", "middle_1")]
 
-DOOR_MARKER = 10  # on the cupboard door front
-ANCHOR_MARKER = 11  # on the cupboard body, fixed
+DOOR_MARKER = 46  # on the cupboard door front
+ANCHOR_MARKER = 47  # on the cupboard body, fixed
 DOOR_MARKER_SIZE = 0.06
 
 STATIONS = {
@@ -147,6 +149,29 @@ def _table(world, name, pos, top, half, rgba=(0.55, 0.4, 0.25, 1)):
     return body
 
 
+def add_robot_extras(spec: mujoco.MjSpec) -> None:
+    """What every scene adds to the bare GR00T G1: head camera, palm sites, self-collision excludes.
+
+    Shared by build_scene() and the house (house.py) so both worlds give the skills the same robot.
+    """
+    # Robot head camera (approximately the G1's RealSense).
+    torso = spec.body("torso_link")
+    pitch = 0.65  # ~37 deg down: sees the floor ~0.6 m ahead up to the top of the cupboard
+    torso.add_camera(name="head_cam", pos=[0.08, 0.0, 0.45], fovy=70,
+                     xyaxes=[0, -1, 0, np.sin(pitch), 0, np.cos(pitch)])
+    # Wrist roll and wrist yaw are two links apart and their meshes touch at the joint.
+    for side in ("left", "right"):
+        spec.add_exclude(bodyname1=f"{side}_wrist_roll_link", bodyname2=f"{side}_wrist_yaw_link")
+    # Arms collide with the torso. Only the two shoulder links that sit against the torso's
+    # collision hull at the joint are excluded (0.8-2 cm apart even in the home pose).
+    for side in ("left", "right"):
+        for link in ("shoulder_pitch", "shoulder_roll"):
+            spec.add_exclude(bodyname1="torso_link", bodyname2=f"{side}_{link}_link")
+    # Palm site used as the grasp point (fingers extend along +x of the wrist yaw link).
+    for side in ("left", "right"):
+        spec.body(f"{side}_wrist_yaw_link").add_site(name=f"{side}_palm", pos=[0.10, 0.0, 0.0], size=[0.012])
+
+
 def build_scene(placement: dict[str, tuple[str, float, float]] | None = None) -> tuple[mujoco.MjModel, mujoco.MjData]:
     placement = placement or DEFAULT_PLACEMENT
     spec = mujoco.MjSpec.from_file(str(ASSET_DIR / "g1" / "g1.xml"))
@@ -169,25 +194,10 @@ def build_scene(placement: dict[str, tuple[str, float, float]] | None = None) ->
     world.add_light(pos=[2.0, 0, 2.6], dir=[0, 0, -1], diffuse=[0.2, 0.2, 0.2], specular=[0, 0, 0], cutoff=70)
     world.add_light(pos=[0, 0, 2.6], dir=[0, 0, -1], diffuse=[0.2, 0.2, 0.2], specular=[0, 0, 0], cutoff=70)
 
-    # Robot head camera (approximately the G1's RealSense).
-    torso = spec.body("torso_link")
-    pitch = 0.65  # ~37 deg down: sees the floor ~0.6 m ahead up to the top of the cupboard
-    torso.add_camera(name="head_cam", pos=[0.08, 0.0, 0.45], fovy=70,
-                     xyaxes=[0, -1, 0, np.sin(pitch), 0, np.cos(pitch)])
-    # Wrist roll and wrist yaw are two links apart and their meshes touch at the joint.
-    for side in ("left", "right"):
-        spec.add_exclude(bodyname1=f"{side}_wrist_roll_link", bodyname2=f"{side}_wrist_yaw_link")
-    # Arms collide with the torso. Only the two shoulder links that sit against the torso's
-    # collision hull at the joint are excluded (0.8-2 cm apart even in the home pose).
-    for side in ("left", "right"):
-        for link in ("shoulder_pitch", "shoulder_roll"):
-            spec.add_exclude(bodyname1="torso_link", bodyname2=f"{side}_{link}_link")
+    add_robot_extras(spec)
     # A fixed room camera (a home camera / the carer's phone on a shelf) that watches the cupboard.
     world.add_camera(name="room_cam", pos=[-0.75, -1.25, 1.45],
                      xyaxes=_look_at_xyaxes([-0.75, -1.25, 1.45], [0.0, -2.05, 0.95]), fovy=60)
-    # Palm site used as the grasp point (fingers extend along +x of the wrist yaw link).
-    for side in ("left", "right"):
-        spec.body(f"{side}_wrist_yaw_link").add_site(name=f"{side}_palm", pos=[0.10, 0.0, 0.0], size=[0.012])
 
     # Furniture
     _table(world, "table", TABLE["pos"], TABLE["top"], TABLE["half"])

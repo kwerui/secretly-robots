@@ -3,7 +3,7 @@
 Two sources, same maths:
 
   1. Real world (the pitch demo): a webcam/phone video of the carer opening a real
-     cupboard that has ArUco 10 on the door front and ArUco 11 fixed on the cupboard
+     cupboard that has ArUco 46 on the door front and ArUco 47 fixed on the cupboard
      body/counter. Needs camera intrinsics (calibrate once, see README).
 
         python demo_capture.py video --source 0 --calib calib.npz --out cupboard_model.json
@@ -138,6 +138,49 @@ def capture_sim(out: Path, open_angle: float = 1.75, seconds: float = 3.5, video
     model = fit_from_tracks(tracks, grasp_in_part)
     model.save(out)
     return model
+
+
+def capture_sim_drawer(robot, dr, open_m: float = 0.36, seconds: float = 3.0, cam: str = "drawer_cam",
+                       video_frames: list | None = None, close_after: bool = True) -> ArticulationModel:
+    """The carer opens one of Jack's drawers (house.G1House) while a room camera watches.
+
+    Moving marker: Jack's marker on the drawer front. Fixed marker: our anchor on the chest.
+    The drawer joint is driven kinematically (the carer's hand); the item inside is pushed
+    along by the drawer walls. Afterwards the carer closes it again, so the robot has to open
+    it itself. Returns the fitted model (expected: prismatic, amount ~= open_m).
+    """
+    import mujoco
+
+    from perception import HeadCamera
+
+    env = robot.world
+    m, d = robot.model, robot.data
+    room = HeadCamera(m, d, cam=cam, width=640, height=480, extra_sizes=env.marker_sizes, labels=env.marker_labels)
+    j = m.joint(dr.joint).id
+    qa, va = m.jnt_qposadr[j], m.jnt_dofadr[j]
+    handle = m.site(dr.handle_site).id
+    tracks, grasp_in_part = [], None
+    n = int(seconds / 0.04)
+    plan = [open_m * min(1.0, k / n) for k in range(n + 10)]
+    if close_after:
+        plan += [open_m * (1 - min(1.0, k / (n // 2))) for k in range(n // 2 + 5)]
+    for k, x in enumerate(plan):
+        d.qpos[qa] = x
+        d.qvel[va] = 0.0
+        robot.wbc.step(20)
+        mujoco.mj_forward(m, d)
+        rgb = room.render()
+        det = room.detect(rgb)
+        if k <= n + 10 and dr.front_marker in det and dr.anchor_marker in det:
+            A, D = det[dr.anchor_marker], det[dr.front_marker]
+            tracks.append(relative_pose(A.rotation, A.position, D.rotation, D.position))
+            if grasp_in_part is None:
+                # where the carer's hand is on the drawer (handle centre), in the front-marker frame
+                grasp_in_part = D.rotation.T @ (d.site_xpos[handle] - D.position)
+        if video_frames is not None:
+            video_frames.append(room.annotate(rgb, det))
+    d.qvel[va] = 0.0
+    return fit_from_tracks(tracks, grasp_in_part)
 
 
 def main():
