@@ -10,3 +10,10 @@ logs/
 .venv/
 models/
 evaluation_results/
+# Internal team documents
+/HANDOVER_G1_OVERNIGHT.md
+/notes.md
+/project-management/team-strengths.md
+
+# Generated simulator logs
+/MUJOCO_LOG.TXT

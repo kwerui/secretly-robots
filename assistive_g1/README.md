@@ -167,14 +167,12 @@ from `decoupled_wbc/control/policy/g1_gear_wbc_policy.py`, and they match LeRobo
 
 ## Known shortcuts (say them if asked)
 
-<<<<<<< HEAD
-- Localisation uses the simulator's base pose; the stations are fixed. (In the house: the
-  robot localises itself, `state_estimation.py`, and maps obstacles itself, `costmap.py`;
-  what it is given is the floor plan with the fixed furniture and where the doors hang.)
-=======
-- Localisation uses simulated IMU, leg-odometry, LiDAR and RGB-D inputs against the static
-  house map; it is still simulation-only, and stations are fixed.
->>>>>>> origin/G1-Integration
+- Localisation depends on the simulation scenario. The original
+  single-room demo uses the simulator's base pose. In the
+  integrated house demo, the G1 estimates its pose using simulated
+  IMU, leg odometry, LiDAR and RGB-D observations against a
+  known floor plan. Station locations are predefined, and the
+  system remains simulation-only.
 - Grasping is a weld switched on when the palm reaches the item (the hand mesh is
   rigid). The door grip is position-only (torquescale 0), like a loose grip on a bar
   handle.
