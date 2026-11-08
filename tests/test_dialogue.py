@@ -284,3 +284,16 @@ def test_gemma_falls_back_to_prompt_json_when_schema_output_is_501(monkeypatch):
     assert g.classify("I'm feeling a bit dried out") == ("hint", "water_bottle")
     assert g.classify("I'm feeling a bit dried out") == ("hint", "water_bottle")
     assert calls == [True, False, False]  # schema tried once, then remembered as unsupported
+
+
+@pytest.mark.parametrize("text,item", [
+    ("Can you bring me my cup?", "cup"), ("Could I have my cup, please?", "cup"), ("I'd like my cup", "cup"),
+    ("I need my mug", "cup"), ("I want my bottle", "water_bottle"), ("Could you bring me my water bottle?", "water_bottle"),
+])
+def test_cup_and_bottle_requests(text, item):
+    assert classify_need(text) == ("direct", item)
+
+
+@pytest.mark.parametrize("text", ["I spilled my cup", "the cup is on the table", "where did I leave my bottle"])
+def test_mentions_are_not_requests(text):
+    assert classify_need(text) is None

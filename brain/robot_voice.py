@@ -26,6 +26,10 @@ LINES: dict[str, str] = {
     "will_fetch_water": "Okay, I'll get you some water.",
     "will_fetch_cup": "Okay, I'll get your cup.",
     "will_fetch_book": "Okay, I'll get your book.",
+    "delivered_water": "Here's your water.",
+    "delivered_cup": "Here's your cup.",
+    "search_failed": "Sorry, I couldn't find it. Could someone give me a hand?",
+    "door_locked": "That door's locked. I'll go round the other way.",
     "declined": "Okay. Just let me know if you need anything.",
 }
 

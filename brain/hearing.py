@@ -209,9 +209,17 @@ def _segments_to_heard(segs, source: str, distance_m: float | None = None) -> li
 class SimAudioSource:
     """The robot's microphone inside the MuJoCo house.
 
-    Call `poll()` each control tick. It returns speech the robot heard since
-    the last call. Speech comes from the sim's `env.info["last_utterance"]`, of
-    which only the clip path and sim time are used; the phrase text is ignored.
+    Call `poll()` each control tick; it returns speech segments the robot has finished
+    hearing. Speech comes from the sim's `env.info["last_utterance"]`, of which only the clip
+    path and start time are used; the phrase text is ignored.
+
+    stream=True (use this in a live demo): the robot hears the clip as it plays, only the
+    audio produced up to `clock()`, and a segment ends only after the voice-activity detector
+    has heard the speech stop (its hangover), so nothing downstream can act before the person
+    has finished. `clock` is the time base of the utterance's `time_key` (sim time by default;
+    pass time.time with time_key="wall_time" to follow the audio playing on the speakers).
+
+    stream=False hears the whole clip at once (tests, batch checks).
     """
 
     def __init__(
@@ -222,13 +230,28 @@ class SimAudioSource:
         noise_dbfs: float = -65.0,
         vad: EnergyVAD | None = None,
         seed: int | None = 0,
+        stream: bool = False,
+        clock: Callable[[], float] | None = None,
+        time_key: str = "sim_time",
     ):
         self.env = env
         self.mouth, self.ears = mouth, ears
         self.noise_dbfs = noise_dbfs
         self.vad = vad or EnergyVAD()
         self.rng = np.random.default_rng(seed)
+        self.stream = stream
+        self.clock = clock or (lambda: float(self.env.data.time))
+        self.time_key = time_key
         self._seen: tuple | None = None
+        self._buf: np.ndarray | None = None  # what the mic will pick up for the current utterance
+        self._fed = 0
+        self._t0 = 0.0
+        self._dist: float | None = None
+
+    @property
+    def hearing(self) -> bool:
+        """True while an utterance is still coming in (the robot is listening to it)."""
+        return self._buf is not None
 
     def mouth_to_ears_m(self) -> float:
         m, d = self.env.model, self.env.data
@@ -236,27 +259,46 @@ class SimAudioSource:
         ears = d.cam_xpos[m.camera(self.ears).id]
         return float(np.linalg.norm(mouth - ears))
 
-    def poll(self) -> list[HeardAudio]:
-        utt = (getattr(self.env, "info", None) or {}).get("last_utterance")
-        if not utt:
-            return []
-        key = (utt.get("wav"), utt.get("sim_time"))
-        if key == self._seen:
-            return []
-        self._seen = key
-        return self.hear_clip(Path(utt["wav"]), float(utt.get("sim_time", 0.0)))
-
-    def hear_clip(self, wav: Path, sim_time: float) -> list[HeardAudio]:
-        """What the robot's mic picks up when `wav` is spoken at the person's head."""
+    def _mic_audio(self, wav: Path, before_s: float = 0.5, after_s: float = 0.5) -> tuple[np.ndarray, float]:
+        """The clip as it reaches the robot's head: quieter with distance, with room noise."""
         audio, rate = load_wav(wav)
         audio = resample(audio, rate)
         dist = self.mouth_to_ears_m()
         audio = audio * distance_gain(dist)
-        # Half a second of room either side, so the VAD sees a real start and end.
-        pad = np.zeros(SAMPLE_RATE // 2, np.float32)
-        audio = np.concatenate([pad, audio, pad])
+        audio = np.concatenate([np.zeros(int(SAMPLE_RATE * before_s), np.float32), audio,
+                                np.zeros(int(SAMPLE_RATE * after_s), np.float32)])
         noise_rms = 10 ** (self.noise_dbfs / 20)
-        audio = audio + self.rng.normal(0, noise_rms, len(audio)).astype(np.float32)
+        return audio + self.rng.normal(0, noise_rms, len(audio)).astype(np.float32), dist
+
+    def poll(self) -> list[HeardAudio]:
+        heard: list[HeardAudio] = []
+        utt = (getattr(self.env, "info", None) or {}).get("last_utterance")
+        if utt:
+            key = (utt.get("wav"), utt.get("sim_time"), utt.get("wall_time"))
+            if key != self._seen:
+                self._seen = key
+                start = float(utt.get(self.time_key, utt.get("sim_time", 0.0)))
+                if not self.stream:
+                    return self.hear_clip(Path(utt["wav"]), start)
+                if self._buf is not None:  # cut off by a new utterance: close what we had
+                    heard += _segments_to_heard(self.vad.flush(), "sim", self._dist)
+                # Room either side; 1 s after so the detector hears the speech end.
+                self._buf, self._dist = self._mic_audio(Path(utt["wav"]), 0.5, 1.0)
+                self._fed, self._t0 = 0, start - 0.5
+                self.vad.reset(t0=self._t0)
+        if self._buf is not None:
+            upto = int(np.clip((self.clock() - self._t0) * SAMPLE_RATE, 0, len(self._buf)))
+            if upto > self._fed:
+                heard += _segments_to_heard(self.vad.feed(self._buf[self._fed:upto]), "sim", self._dist)
+                self._fed = upto
+            if self._fed >= len(self._buf):
+                heard += _segments_to_heard(self.vad.flush(), "sim", self._dist)
+                self._buf = None
+        return heard
+
+    def hear_clip(self, wav: Path, sim_time: float) -> list[HeardAudio]:
+        """What the robot's mic picks up when `wav` is spoken at the person's head (all at once)."""
+        audio, dist = self._mic_audio(wav)
         self.vad.reset(t0=sim_time - 0.5)
         segs = self.vad.feed(audio) + self.vad.flush()
         return _segments_to_heard(segs, "sim", dist)

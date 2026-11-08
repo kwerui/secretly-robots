@@ -24,12 +24,13 @@ def normalize_item(item: str) -> str:
 
 # A request that names what's wanted: act on it directly.
 #   "I need water", "Could I have some water?", "Can you get me something to drink?"
+_ASK = r"\b(need|want|have|could do with|would love|'d love|love|like|'d like|fancy|get|bring|fetch|grab|pass|hand)"
 NEED_PATTERNS = {
     "water_bottle": re.compile(
-        r"\b(need|want|have|could do with|would love|'d love|love|fancy|like|get|bring|fetch)\b"
-        r"[\w\s']{0,25}?\b(drink|water|sip|glass of water)\b"
+        _ASK + r"\b[\w\s']{0,25}?\b(drink|water|sip|glass of water|bottle|water bottle)\b"
         r"|\b(a|some)\s+(drink|water)\s+please\b"
     ),
+    "cup": re.compile(_ASK + r"\b[\w\s']{0,25}?\b(cup|mug|cuppa)\b"),
 }
 
 # A hint at a need that doesn't name the item: the robot should ask first.

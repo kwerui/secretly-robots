@@ -147,12 +147,17 @@ main{max-width:760px;margin:0 auto;padding:16px}
 .mode div.on{display:block}
 .mode .listening{background:var(--line);color:var(--muted)}
 .mode .asking{background:var(--waitbg);color:var(--wait)}
-.mode .fetch{background:var(--okbg);color:var(--ok);font-size:18px}
+.mode .fetch,.mode .done{background:var(--okbg);color:var(--ok);font-size:18px}
+.mode .failed{background:var(--badbg);color:var(--bad);font-size:18px}
+.card.step{padding:8px 14px;margin-left:32px;font-size:14px;border-style:dotted}
+.card.step .likely{color:var(--muted);font-size:12px;margin-top:2px}
+.scen{max-width:760px;margin:8px auto 0;padding:0 16px;color:var(--muted);font-size:13px}
 .mode small{display:block;font-weight:400;font-size:13px;margin-top:4px;opacity:.9}
 footer{color:var(--muted);font-size:12px;text-align:center;padding:8px 16px 24px}
 </style></head><body>
 <header><h1>Robot hearing</h1><div class="status"><span class="dot" id="dot"></span><span id="status">connecting…</span></div></header>
 <div class="mode"><div id="mode"></div></div>
+<div class="scen" id="scen"></div>
 <main><div id="list"><p class="empty" id="empty">Nothing heard yet. Press V in the sim, or speak to the mic.</p></div></main>
 <footer>Onboard speech-to-text. This page is served from 127.0.0.1 and nothing leaves the laptop.</footer>
 <script>
@@ -183,13 +188,20 @@ function apply(e){
   if(e.kind==="status"){$("#status").textContent=e.message; $("#dot").className="dot"+(e.listening?" live":""); return}
   if(e.kind==="transcript"){$("#empty")?.remove(); const c=card(e); byStart[e.start_s]=c; list.prepend(c); return}
   if(e.kind==="mode"){const m=$("#mode"); m.className=e.mode+" on"; m.replaceChildren();
-    if(e.mode==="fetch"&&e.plan){const p=e.plan; m.append(`FETCH MODE: ${p.item} → ${p.destination}`);
+    if((e.mode==="done"||e.mode==="failed")&&e.plan){m.textContent=(e.mode==="done"?"DELIVERED: ":"FETCH FAILED: ")+`${e.plan.item} → ${e.plan.destination}`}
+    else if(e.mode==="fetch"&&e.plan){const p=e.plan; m.append(`FETCH MODE: ${p.item} → ${p.destination}`);
       const s=document.createElement("small");
-      s.textContent=`next step: ${p.action} ${p.target||""} · likely places: ${p.likely.slice(0,3).map(([a,b])=>`${a} ${Math.round(b*100)}%`).join(", ")} · planned, not carried out`;
+      s.textContent=`next step: ${p.action} ${p.target||""} · likely places: ${p.likely.slice(0,3).map(([a,b])=>`${a} ${Math.round(b*100)}%`).join(", ")} · ${e.executing?"carrying it out":"planned, not carried out"}`;
       m.appendChild(s)}
     else if(e.mode==="asking"){m.textContent=`Asking: “${e.question}” · waiting for an answer`}
     else {m.textContent="Listening"}
     return}
+  if(e.kind==="scenario"){$("#scen").textContent=`Scenario: ${e.scenario}`; return}
+  if(e.kind==="step"){$("#empty")?.remove(); const c=document.createElement("div"); c.className="card step new";
+    const t=document.createElement("div"); t.textContent=e.text; c.appendChild(t);
+    if(e.likely&&e.likely.length){const l=document.createElement("div"); l.className="likely";
+      l.textContent="beliefs: "+e.likely.slice(0,5).map(([a,b])=>`${a} ${Math.round(b*100)}%`).join(", "); c.appendChild(l)}
+    list.prepend(c); return}
   if(e.kind==="robot_said"){$("#empty")?.remove(); const c=document.createElement("div"); c.className="card robot new";
     const w=document.createElement("p"); w.className="who"; w.textContent="Robot said (Gemini voice, played onboard)";
     const p=document.createElement("p"); p.className="text"; p.textContent=`“${e.text}”`; c.append(w,p); list.prepend(c); return}

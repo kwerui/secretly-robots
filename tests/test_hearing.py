@@ -164,3 +164,36 @@ def test_mic_calibrates_threshold_to_the_room(monkeypatch):
     assert mic.vad.threshold == pytest.approx(-38, abs=0.5)
     assert len(heard) == 1 and heard[0].source == "mic"
     assert heard[0].start_s == pytest.approx(101.0 + 1.7 - 0.15, abs=0.05)
+
+
+def test_streaming_ears_only_finish_a_phrase_after_the_person_stops(house, clip):
+    """Live mode: the robot hears the clip as it plays and can't hand a phrase on early."""
+    from brain.hearing import load_wav
+    now = {"t": 100.0}
+    ears = SimAudioSource(house, stream=True, clock=lambda: now["t"], time_key="wall_time")
+    house.info["last_utterance"] = {"speaker": "user", "phrase": "x", "wav": str(clip), "sim_time": 0.0,
+                                    "wall_time": 100.0}
+    clip_s = len(load_wav(clip)[0]) / load_wav(clip)[1]
+    got, t_done = [], None
+    while now["t"] < 100.0 + clip_s + 2.0:
+        heard = ears.poll()
+        if heard and t_done is None:
+            got, t_done = heard, now["t"]
+        now["t"] += 0.02
+    assert len(got) == 1
+    h = got[0]
+    speech_end = h.start_s + h.duration_s
+    assert t_done >= speech_end + 0.3  # the detector waited to hear silence after the speech
+    assert t_done <= 100.0 + clip_s + 1.0
+    assert not ears.hearing
+    assert 0.8 < h.duration_s < clip_s + 0.2
+
+
+def test_streaming_ears_hear_nothing_before_the_clip_starts(house, clip):
+    now = {"t": 50.0}
+    ears = SimAudioSource(house, stream=True, clock=lambda: now["t"], time_key="wall_time")
+    house.info["last_utterance"] = {"speaker": "user", "phrase": "x", "wav": str(clip), "sim_time": 0.0,
+                                    "wall_time": 60.0}  # plays in 10 s
+    assert ears.poll() == [] and ears.hearing
+    now["t"] = 59.0
+    assert ears.poll() == []

@@ -46,12 +46,19 @@ PHRASES: tuple[str, ...] = (
     "I'd love a glass of water.",
 )
 
+# Asking for the cup (key C in the G1 voice demo).
+CUP_PHRASES: tuple[str, ...] = (
+    "Could you bring me my cup?",
+    "I'd like my cup, please.",
+    "Can I have my mug?",
+)
+
 # Replies to the robot's "Would you like some water?" (keys Y and N in the viewer).
 ANSWERS: dict[str, str] = {
     "yes": "Yes, please.",
     "no": "No, thank you.",
 }
-ALL_LINES: tuple[str, ...] = PHRASES + tuple(ANSWERS.values())
+ALL_LINES: tuple[str, ...] = PHRASES + CUP_PHRASES + tuple(ANSWERS.values())
 
 TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
 # "Gacrux" is one of Gemini's prebuilt voices, described as mature.

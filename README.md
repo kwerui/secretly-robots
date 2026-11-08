@@ -120,7 +120,9 @@ The voice clips are already in the repo (`sim/assets/voice/` for the person, `as
 **Run it:**
 
 ```bash
-cd assistive_g1 && ../sim/.venv/bin/mjpython voice_demo.py
+cd assistive_g1
+../sim/.venv/bin/python voice_demo.py --list          # the 25 scenarios
+../sim/.venv/bin/mjpython voice_demo.py --scenario 19  # pick one
 ```
 
 On macOS the viewer must run under `mjpython`; on Linux use `../sim/.venv/bin/python`. The MuJoCo viewer opens with the G1 at the sofa, and the speech-to-text window opens in your browser at http://127.0.0.1:8765.
@@ -128,18 +130,47 @@ On macOS the viewer must run under `mjpython`; on Linux use `../sim/.venv/bin/py
 | Key | What happens |
 |---|---|
 | **V** | The person says one of eight water lines. Some are requests ("I need water", "Can you get me something to drink?"), some are hints ("My mouth is so dry", "I'm parched", "I am thirsty"). |
+| **C** | The person asks for their cup ("Could you bring me my cup?", "I'd like my cup, please.", "Can I have my mug?"). |
 | **Y** / **N** | The person answers the robot's question ("Yes, please." / "No, thank you."). |
-| **X** | Cancel fetch mode and go back to listening. |
+| **F** | Toggle what fetch mode does: carry the fetch out (default) or only plan it. |
+| **X** | Cancel and go back to listening. |
+
+**Scenarios: showing adaptation.** There are 25 fixed scenarios, `5 × placement + setup`, all run through with the real G1 (`validate_scenarios.py`):
+
+| Placement | Bottle (spawn odds) | Cup (spawn odds) |
+|---|---|---|
+| 0 | kitchen counter (30%) | kitchen counter (35%) |
+| 1 | kitchen drawer (25%) | kitchen table (25%) |
+| 2 | kitchen table (20%) | study desk (15%) |
+| 3 | study desk (15%) | coffee table (15%) |
+| 4 | coffee table (10%) | TV unit (10%) |
+
+| Setup | Floor |
+|---|---|
+| 0 | tidy |
+| 1 | light clutter (laundry) |
+| 2 | heavy clutter (moving boxes) |
+| 3 | living–kitchen door locked |
+| 4 | living–kitchen door locked + clutter |
+
+So scenario 19 is placement 3 (bottle on the study desk) with setup 4 (locked door + clutter). Each item has five spots with set probabilities (`assistive_g1/scenario.py`, `SPAWNS`), and the robot's location memory starts from the same odds. What adapting looks like:
+- **Where things are:** it searches the likeliest place first. The markers over each place show its beliefs: they shrink and turn red as places are ruled out, and turn green where it finds the item.
+- **Locked door:** it doesn't know which door is locked. It plans through the shortest doorway, finds the door shut when it gets there, says *"That door's locked. I'll go round the other way."*, marks it (red bar) and replans through the bedroom and study.
+- **Clutter:** it plans and walks round it; the route being walked is drawn on the floor.
+
+`--random --seed N` draws a new house from the odds instead (`--bottle`, `--cup`, `--lock-door`, `--clutter` fix parts of it).
 
 **What you see:**
 
 1. **Listening.** Grey light above the G1's head; top-left of the viewer says LISTENING.
 2. **The person speaks.** A caption at the bottom; the G1's head-camera microphone hears it (about 2 m away, quieter with distance), and Whisper transcribes it in about 0.3 s. The window adds a card with the transcript, timing, loudness and distance.
 3. **A hint** makes the robot say *"Would you like some water?"* in its own voice. The light turns amber and the viewer says ASKING. The question lapses after 10 s with no answer.
-4. **A request, or a yes,** puts it in **FETCH MODE**. The light turns green and the robot says *"Okay, I'll get you some water."* (or *"…your cup"* / *"…your book"*). The brain now has the task `water_bottle → sofa`. The viewer, the window and the console show the planner's first step and the likely places (`search water_bottle`; kitchen_counter 57%, kitchen_drawers 33%), and a green line points to the first place. The step is planned, not carried out: the robot stays put. `brain_bridge.RobotBridge.execute_high_level` is what would carry it out.
+4. **A request, or a yes,** puts it in **FETCH MODE**. The light turns green and the robot says *"Okay, I'll get you some water."* (or *"…your cup"*). The brain now has the task `water_bottle → sofa`, and the robot carries it out with the G1 team's `RobotBridge`: search (opening the drawer with the learned motion if needed), grasp, walk to the sofa, put it on the tray, *"Here's your water."* (light turns blue). Each step is captioned and listed in the window with the robot's current beliefs. If it can't find the item it says so and asks for help (light turns red). With **F** (or `--plan-only`) it only shows the first step.
 5. **A no** gets *"Okay. Just let me know if you need anything."* and it goes back to listening.
 
-Options: `--target kitchen_drawer` (where the bottle starts), `--layout`, `--seed`, `--no-browser`, `--no-gemma`.
+Other options: `--plan-only`, `--speed 2` (sim faster than real time while fetching), `--no-browser`, `--no-gemma`. The grasp uses the G1 team's fallback (`G1_CHEAT_GRASP=fallback`): it tries the real grasp first, and abstracts the contact if that fails.
+
+**Test phrasing by talking to it.** `sim/.venv/bin/python -m scripts.voice_robot --mic` listens to the laptop mic. Each thing you say prints one line, FETCH / HINT / DECLINED / NOT A REQUEST, with which interpreter decided and how long it took. The robot answers out loud, and Ctrl+C saves a summary to `logs/phrase_test.csv`. Use headphones, or wait for it to finish talking. The rules handle the bottle and the cup ("Could I have my cup, please?", "I need my mug", "I want my bottle"), and Gemma handles freer phrasing if it's running.
 
 **The pipeline** (all onboard):
 

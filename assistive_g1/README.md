@@ -75,7 +75,10 @@ from `decoupled_wbc/control/policy/g1_gear_wbc_policy.py`, and they match LeRobo
 | `agent.py` | LLM tool-use agent over the same skills (Anthropic SDK). Untested against the API |
 | `run_demo.py` | Scenario + MP4 recorder (follow cam + head-cam inset + captions) |
 | `calibrate_camera.py` | ChArUco calibration for the real demo camera |
-| `voice_demo.py` | Voice demo: person speaks, G1 hears (head_cam mic), Whisper, rules/Gemma interpreter, asks, fetch mode (planned, not executed) |
+| `voice_demo.py` | Voice demo: person speaks, G1 hears (head_cam mic), Whisper, rules/Gemma interpreter, asks, fetches (25 scenarios) |
+| `scenario.py` | Spawn odds (5 spots per item), extra stations, prior memory, the 25 scenarios, clutter, locked-door discovery |
+| `validate_scenarios.py` | Full fetch in every scenario, both items → `logs/scenarios/summary.md` |
+| `probe_spawns.py` | Walk / see / pick check at every spawn spot |
 
 ## Real carer demo (for the pitch)
 

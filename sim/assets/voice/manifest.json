@@ -12,6 +12,9 @@
     "I'm parched.": "i_m_parched.wav",
     "Can you get me something to drink?": "can_you_get_me_something_to_drink.wav",
     "I'd love a glass of water.": "i_d_love_a_glass_of_water.wav",
+    "Could you bring me my cup?": "could_you_bring_me_my_cup.wav",
+    "I'd like my cup, please.": "i_d_like_my_cup_please.wav",
+    "Can I have my mug?": "can_i_have_my_mug.wav",
     "Yes, please.": "yes_please.wav",
     "No, thank you.": "no_thank_you.wav"
   }
