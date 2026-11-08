@@ -155,6 +155,45 @@ def test_recorder_counts_grasp_retry_and_cloud_fallback_provenance():
     assert metrics.decision_provenance == ["gemini_argon", "fallback_after_cloud_rejection_or_failure"]
 
 
+def test_recorder_keeps_memory_evidence_separate_from_physical_outcome():
+    recorder = TrialRecorder(EpisodeMetrics.baseline("memory-evidence", "water_bottle"))
+    recorder.record_memory_execution({
+        "memory_beliefs_before": {"kitchen_counter": 0.5, "kitchen_drawers": 0.5},
+        "memory_beliefs_after": {"kitchen_counter": 0.2, "kitchen_drawers": 0.8},
+        "memory_updates": [{"item": "water_bottle", "station": "kitchen_drawers",
+                            "evidence_source": "head_camera_sighting"}],
+        "search_order": ["kitchen_counter", "kitchen_drawers"],
+        "stations_visited": ["kitchen_counter", "kitchen_drawers"],
+        "confirmed_negative_observations": ["kitchen_counter"],
+        "inaccessible_or_unobserved_stations": ["kitchen_table"],
+    })
+    metrics = recorder.finish(TruthSnapshot(robot_fallen=False))
+
+    assert metrics.memory_beliefs_after["kitchen_drawers"] == 0.8
+    assert metrics.memory_update_events[0]["evidence_source"] == "head_camera_sighting"
+    assert metrics.search_order == ["kitchen_counter", "kitchen_drawers"]
+    assert metrics.persistent_memory_updated is False
+    assert metrics.physical_delivery is Outcome.UNKNOWN
+
+
+def test_recorder_reports_relocation_prediction_and_camera_observations():
+    recorder = TrialRecorder(EpisodeMetrics.baseline("relocation-2", "water_bottle"))
+    recorder.record_memory_execution({
+        "predicted_top_ranked_station": "kitchen_drawers",
+        "positive_camera_observations": [{"item": "water_bottle", "station": "kitchen_counter"}],
+        "camera_diagnostics": [{"station": "kitchen_counter", "marker_ids": [2, 3],
+                                "absence_confirmed": False}],
+        "stations_visited": ["kitchen_drawers", "kitchen_counter"],
+        "stations_searched_before_detection": 2,
+    })
+    metrics = recorder.finish(TruthSnapshot(robot_fallen=False))
+
+    assert metrics.predicted_top_ranked_station == "kitchen_drawers"
+    assert metrics.positive_camera_observations == [{"item": "water_bottle", "station": "kitchen_counter"}]
+    assert metrics.camera_diagnostics[0]["marker_ids"] == [2, 3]
+    assert metrics.stations_searched_before_detection == 2
+
+
 def test_result_writers_emit_json_csv_and_human_summary(tmp_path):
     metrics = EpisodeMetrics.baseline("exp-3", "water_bottle")
     metrics.navigation = Outcome.SUCCESS
