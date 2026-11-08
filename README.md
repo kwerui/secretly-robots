@@ -174,6 +174,7 @@ brain/
   integration.py      # interface teammates implement for actual MuJoCo
   mujoco_observation.py # HouseEnv ground truth -> brain Observation adapter
   teach_once.py       # small symbolic goal memory; not motor imitation
+  hearing.py          # robot's ears, onboard: sim/mic audio -> speech segments (python -m scripts.hearing_demo)
   gemini_client.py    # official google-genai structured-output boundary
   gemini_optional.py  # checked Gemini task/next-decision adapters
   demo.py             # hand-authored explanatory example
