@@ -22,6 +22,43 @@ python run_demo.py --viewer       # interactive MuJoCo viewer (needs working GLX
 python run_demo.py --fps 12.5 --size 800 450   # lighter video if you have no GPU
 ```
 
+### G1 brain demo: live adaptive location memory
+
+`house_brain_demo.py` keeps its original seeded-history scenario by default, explicitly
+labelled as a demo. To demonstrate genuine adaptation, opt in to a blank location memory
+which is updated only by confident G1 head-camera (ArUco) sightings:
+
+```bash
+python house_brain_demo.py --offline --live-memory
+python house_brain_demo.py --offline --live-memory --memory-path state/location_memory.json
+```
+
+The second command reloads the G1-house station list and prior camera sightings from the
+JSON file, then saves new sightings at the end of the run. Repeated frames of an unchanged
+object count once, held/delivered items are ignored, and a station is penalised only for the
+current search episode after a confirmed adequate look. A navigation failure, failed drawer
+opening, or inadequate camera look leaves its belief unchanged. Belief percentages are
+recency-weighted scores, not empirically calibrated probabilities.
+
+Choose a supported simulator placement for a one-episode relocation check (the target and
+initial coordinates are saved as evaluation-only ground truth, never supplied to the brain):
+
+```bash
+python house_brain_demo.py --offline --live-memory --reuse-demo \
+  --bottle-target kitchen_counter --memory-path state/counter-memory.json \
+  --results-dir evaluation_results/counter-check
+```
+
+Run the complete, persistent three-episode relocation experiment—drawer, moved to counter,
+then counter after reload—with separate output directories per episode:
+
+```bash
+python relocation_benchmark.py --output evaluation_results/relocation --run-id demo-001
+```
+
+The supported G1 targets are `kitchen_drawer`, `kitchen_counter`, and `kitchen_table`.
+The relocation runner refuses to overwrite an existing run directory.
+
 `run_demo.py` records the carer's cupboard demo in sim the first time and saves
 `cupboard_model.json`. To use a real demonstration instead, see "Real carer demo".
 

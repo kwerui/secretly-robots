@@ -9,8 +9,11 @@
 
 What happens:
   1. The carer opens the top kitchen drawer once (drawer camera) -> articulation model.
-  2. Location memory from "watching the carer for a week": the bottle has mostly been left on
-     the kitchen counter, once in the kitchen drawers; the cup on the counter.
+  2. By default, location memory is a labelled synthetic-history demo: the bottle has mostly
+     been left on the kitchen counter, once in the kitchen drawers; the cup on the counter.
+     `--live-memory` instead starts with no fictional carer history and learns only from G1
+     head-camera sightings. Add `--memory-path state/location_memory.json` to reuse those
+     learned sightings across runs.
   3. Each request -> brain.start_task -> decision/feedback loop: the brain looks at
      the robot's observation (head-camera sightings, station, drawer open, holding, delivered),
      decides the next step, safety-checks it, and the bridge runs it on the robot.
@@ -39,7 +42,7 @@ from brain.engine import Brain  # noqa: E402
 from brain.safety import RejectedAction  # noqa: E402
 from articulation import ArticulationModel  # noqa: E402
 from demo_capture import capture_sim_drawer  # noqa: E402
-from house import G1House, KITCHEN_TOP  # noqa: E402
+from house import G1House, KITCHEN_TOP, SUPPORTED_BOTTLE_TARGETS  # noqa: E402
 from memory import LocationMemory  # noqa: E402
 from skills import AssistiveRobot  # noqa: E402
 from evaluation import EpisodeMetrics, MujocoTruthReader, TrialRecorder, TruthSnapshot, write_results  # noqa: E402
@@ -74,11 +77,19 @@ def main():
     ap.add_argument("--settle-s", type=float, default=1.0, help="simulated seconds before tray verification")
     ap.add_argument("--drawer-first", action="store_true",
                     help="evaluation only: search kitchen_drawers before learned-memory ranking")
+    ap.add_argument("--bottle-target", choices=SUPPORTED_BOTTLE_TARGETS, default="kitchen_drawer",
+                    help="evaluation-only simulator placement; never exposed to the planner")
+    ap.add_argument("--live-memory", action="store_true",
+                    help="opt in to head-camera-only location learning; do not seed fictional carer history")
+    ap.add_argument("--memory-path", type=Path,
+                    help="optional persistent JSON store (requires --live-memory)")
     args = ap.parse_args()
+    if args.memory_path is not None and not args.live_memory:
+        ap.error("--memory-path requires --live-memory so saved data is never mixed with seeded demo history")
     requests = args.request or ["I'm thirsty", "Could you bring me my cup?"]
 
     env = G1House(seed=args.seed)
-    env.reset(args.layout, "kitchen_drawer", seed=args.seed)
+    env.reset(args.layout, args.bottle_target, seed=args.seed)
 
     sync = None
     viewer = None
@@ -118,7 +129,19 @@ def main():
 
     containers = {"kitchen_drawers": Container(model, KITCHEN_TOP.anchor_marker, f"grasp_{KITCHEN_TOP.body}",
                                                (KITCHEN_TOP.front_marker,), drawer=KITCHEN_TOP)}
-    bridge = RobotBridge(robot, learned_memory(), containers, say=say,
+    memory_loaded = False
+    if args.live_memory:
+        if args.memory_path is not None and args.memory_path.exists():
+            memory = LocationMemory.load(args.memory_path, stations=SEARCHABLE)
+            memory_loaded = True
+        else:
+            memory = LocationMemory(stations=SEARCHABLE)
+        print("Location memory: live head-camera sightings only" +
+              (f" (loaded {args.memory_path})" if memory_loaded else " (empty at start)"))
+    else:
+        memory = learned_memory()
+        print("Location memory: seeded synthetic demo history (not live learning mode)")
+    bridge = RobotBridge(robot, memory, containers, say=say,
                          search_first=("kitchen_drawers",) if args.drawer_first else ())
 
     use_gemini = not args.offline
@@ -151,6 +174,7 @@ def main():
             metrics.model_mode = "offline" if not use_gemini else "gemini_optional"
             metrics.layout, metrics.seed = args.layout, args.seed
             metrics.bottle_placement = {
+                "actual_target": env.target,
                 "configured_target": env.target,
                 "container": env.target_container,
                 "position_xyz": [round(float(x), 4) for x in env.bottle_xyz()],
@@ -162,7 +186,9 @@ def main():
                 "doors_deg": env.info.get("doors"),
                 "locked_doors": env.info.get("locked"),
                 "search_first": list(bridge.search_first),
+                "location_memory_mode": "live_head_camera" if args.live_memory else "seeded_demo",
             }
+            metrics.persistent_memory_loaded = memory_loaded
             recorder = TrialRecorder(metrics)
             say(f'Person: "{req}"')
             try:
@@ -203,6 +229,7 @@ def main():
                                          retry_count=int(bridge.last_execution.get("grasp_retry_count", 0)))
                 recorder.record_navigation_attempts(bridge.last_execution.get("navigation_attempts", []))
                 recorder.record_drawer_opening_attempts(bridge.last_execution.get("drawer_opening_attempts", []))
+                recorder.record_memory_execution(bridge.last_execution)
                 if bridge.last_execution.get("drawer_open_attempted"):
                     recorder.record_stage("drawer_opening", bool(bridge.last_execution["drawer_open_succeeded"]))
                 if bridge.last_execution.get("drawer_close_attempted"):
@@ -221,6 +248,11 @@ def main():
                                   robot_fallen=after_settling.robot_fallen)
             evaluation_records.append(recorder.finish(truth, simulation_duration_s=float(env.data.time)))
     finally:
+        if args.live_memory and args.memory_path is not None:
+            memory.save(args.memory_path)
+            for metrics in evaluation_records:
+                metrics.persistent_memory_updated = bool(metrics.memory_update_events)
+            print(f"  saved live location memory: {args.memory_path}")
         print("\nSummary:")
         for req, outcome in summary:
             print(f"  {req!r}: {outcome}")

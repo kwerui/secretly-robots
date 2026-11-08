@@ -124,15 +124,36 @@ class RobotBridge:
         )
 
     def _look_here(self) -> set[str]:
-        """Look with the head camera at the current station; update what we know is where."""
+        """Look with the head camera at the current station; update sightings and memory.
+
+        This is the only path that adds live location-history evidence.  A sighting says
+        where an item was seen, not that a carer placed it there.
+        """
         st = self.robot.station
-        seen = set(self.robot.look()["items"])
-        container = self.containers[st].kind if st in self.containers else None
+        look = self.robot.look()
+        self._last_look_adequate = bool(look.get("ok", True))
+        self._last_absence_confirmed = bool(look.get("absence_confirmed", self._last_look_adequate))
+        self.last_execution.setdefault("camera_diagnostics", []).append({
+            "station": st,
+            "marker_ids": list(look.get("marker_ids", ())),
+            "absence_confirmed": self._last_absence_confirmed,
+        })
+        seen = set(look.get("items", ())) if self._last_look_adequate else set()
+        container_open = st in self.containers and self.open_station == st and self.robot.open_state is not None
+        container = self.containers[st].kind if container_open else None
         for item in seen:
-            if item != self.robot.holding:
+            if item != self.robot.holding and item != self.delivered:
+                self.last_execution.setdefault("positive_camera_observations", []).append({
+                    "item": item, "station": st,
+                })
                 self.sightings[item] = ObjectSighting(item, self.area(st), container, SEEN_CONFIDENCE)
-        for item, s in list(self.sightings.items()):  # looked here, it's gone: forget the old sighting
-            if s.area == self.area(st) and item not in seen:
+                if self.memory.observe_sighting(item, st):
+                    self.last_execution.setdefault("memory_updates", []).append({
+                        "item": item, "station": st, "evidence_source": "head_camera_sighting",
+                    })
+        can_confirm_absence = self._last_absence_confirmed and (st not in self.containers or container_open)
+        for item, s in list(self.sightings.items()):
+            if can_confirm_absence and s.area == self.area(st) and item not in seen:
                 del self.sightings[item]
         return seen
 
@@ -161,13 +182,16 @@ class RobotBridge:
 
     def _do_search(self, item: str):
         """Visit likely stations in location-memory order until the head camera sees `item`."""
+        self.last_execution["memory_beliefs_before"] = self.memory.belief(item)
         ranked = self.memory.ranked(item)
+        self.last_execution["predicted_top_ranked_station"] = ranked[0][0] if ranked else None
         if self.search_first:
             priority = {station: index for index, station in enumerate(self.search_first)}
             ranked = sorted(ranked, key=lambda pair: (priority.get(pair[0], len(priority)), -pair[1]))
         for station, p in ranked:
             if station in self.searched:
                 continue
+            self.last_execution.setdefault("search_order", []).append(station)
             self.say(f"  searching for the {item.replace('_', ' ')} at the {station} (belief {p:.0%})")
             res = self.robot.go_to(station)
             if not res["ok"]:
@@ -180,6 +204,9 @@ class RobotBridge:
                          "error": res.get("error", ""), "distance_from_station_m": round(off, 3)})
                     self.say(f"    couldn't get to the {station} ({res.get('error', '')}, {off:.2f} m off)")
                     self.searched.add(station)
+                    inaccessible = self.last_execution.setdefault("inaccessible_or_unobserved_stations", [])
+                    if station not in inaccessible:
+                        inaccessible.append(station)
                     continue
                 self.robot.station = station
                 off = self._square_up(station)
@@ -192,14 +219,34 @@ class RobotBridge:
                 self.last_execution.setdefault("navigation_attempts", []).append(
                     {"station": station, "reported_success": True, "accepted_for_search": True, "error": ""})
             seen = self._look_here()
+            self.last_execution.setdefault("stations_visited", []).append(station)
+            container_opened = station not in self.containers or self.open_station == station
             if item not in seen and station in self.containers and self.open_station != station:
                 ok, why = self._do_open_drawer(None)  # look inside, the way the carer showed us
                 self.say(f"    opening the {self.containers[station].kind}: {'ok' if ok else 'FAILED ' + why}")
                 if ok:
                     seen = self._look_here()
+                    container_opened = True
+                else:
+                    inaccessible = self.last_execution.setdefault("inaccessible_or_unobserved_stations", [])
+                    if station not in inaccessible:
+                        inaccessible.append(station)
             self.searched.add(station)
-            self.memory.observe_search(item, station, item in seen)
+            absence_confirmed = bool(self._last_absence_confirmed and container_opened)
+            accepted_negative = self.memory.observe_search(
+                item, station, item in seen, absence_confirmed=absence_confirmed,
+            )
+            if accepted_negative:
+                self.last_execution.setdefault("confirmed_negative_observations", []).append(station)
+            elif item not in seen and not absence_confirmed:
+                inaccessible = self.last_execution.setdefault("inaccessible_or_unobserved_stations", [])
+                if station not in inaccessible:
+                    inaccessible.append(station)
+            self.last_execution["memory_beliefs_after"] = self.memory.belief(item)
             if item in seen:
+                self.last_execution["stations_searched_before_detection"] = len(
+                    self.last_execution.get("stations_visited", [])
+                )
                 return True, f"seen at {station}"
         return False, "searched every likely place"
 
