@@ -41,7 +41,11 @@ class Spot:
 # station; the bottle can also be in the top kitchen drawer (opened with the learned motion).
 SPAWNS: dict[str, list[tuple[Spot, float]]] = {
     "water_bottle": [
-        (Spot("kitchen_counter", "kitchen_counter"), 0.30),
+        # 10 cm towards the front edge: from the counter station the head camera is only ~13 cm
+        # above the cap, and at the back spot the cap marker is seen so edge-on that a 1-2 cm
+        # difference in where the robot stops decides whether it is detected (missed after the
+        # locked-door reroute in scenario 3); from 8 cm forward it is detected reliably
+        (Spot("kitchen_counter", "kitchen_counter", (0.0, 0.10)), 0.30),
         (Spot("kitchen_drawers", None), 0.25),
         (Spot("kitchen_table", "kitchen_table"), 0.20),
         (Spot("study_desk", "study_desk"), 0.15),
@@ -240,10 +244,22 @@ SETUPS = [
 N_SCENARIOS = len(PLACEMENTS) * len(SETUPS)
 
 
+# The presentation demo (scenario 25): scenario 3 (bottle on the counter, the likeliest spot;
+# living-kitchen door locked) plus a big box in the study, on the straight leg of the reroute.
+# The robot can't see into the study when it plans the reroute; its LiDAR picks the box up on
+# the way, the route is cut and it re-plans round it without stopping.
+DEMO_SCENARIO = N_SCENARIOS
+DEMO_OBSTACLE = ("box_large", 1.30, 1.10, 20.0)
+
+
 def scenario(n: int) -> Scenario:
-    """Demo scenario n (0-24): placement n // 5, setup n % 5."""
+    """Demo scenario n (0-24): placement n // 5, setup n % 5. 25: the presentation demo."""
+    if n == DEMO_SCENARIO:
+        sc = scenario(3)
+        sc.clutter, sc.clutter_wanted, sc.seed = [DEMO_OBSTACLE], 1, n
+        return sc
     if not 0 <= n < N_SCENARIOS:
-        raise ValueError(f"scenario must be 0-{N_SCENARIOS - 1}")
+        raise ValueError(f"scenario must be 0-{N_SCENARIOS}")
     place, setup = PLACEMENTS[n // len(SETUPS)], SETUPS[n % len(SETUPS)]
     spots = {item: next(s for s, _ in SPAWNS[item] if s.station == st) for item, st in place.items()}
     clutter = [tuple(c) for c in setup["clutter"]]
@@ -251,6 +267,9 @@ def scenario(n: int) -> Scenario:
 
 
 def describe_scenario(n: int) -> str:
+    if n == DEMO_SCENARIO:
+        return (f"{n:2d}: bottle kitchen_counter (30%), cup kitchen_counter (35%) | "
+                "demo: locked door + box in the study")
     place, setup = PLACEMENTS[n // len(SETUPS)], SETUPS[n % len(SETUPS)]
     prob = {it: dict((s.station, p) for s, p in SPAWNS[it]) for it in SPAWNS}
     return (f"{n:2d}: bottle {place['water_bottle']} ({prob['water_bottle'][place['water_bottle']]:.0%}), "
@@ -266,22 +285,42 @@ class DoorLocked(Exception):
         self.door = door
 
 
+class DoorAhead(Exception):
+    """Walking up to a doorway on the route whose leaf the LiDAR sees closed (or can't see)."""
+
+    def __init__(self, door: str):
+        super().__init__(door)
+        self.door = door
+
+
+LEAF_CLOSED_DEG = 20.0  # a perceived leaf within this of its closed bearing is "closed"
+TOUCH_STAND = 0.36      # m, pelvis in front of the door plane for the push test
+TOUCH_Z = 0.85          # m, palm height on the leaf (doors are 1 m tall)
+TOUCH_REACH = 0.10      # m, palm target past the door plane
+TOUCH_BLOCKED = 0.08    # m, palm still this far short of its target -> the leaf didn't give
+
+
 class DoorDiscovery:
-    """The robot doesn't know in advance which doors are locked.
+    """The robot doesn't know in advance which doors are locked; it finds out by touch.
 
     Its planner starts out treating every door as pushable (env.locked_doors holds only what the
-    robot has found out). It walks the shortest route; when it gets to a doorway on that route
-    whose door stays shut, it stops, says so, remembers the door as locked and replans the same
-    trip through the other doorways. The physics is unchanged: a locked door is welded shut
-    whether or not the robot knows.
+    robot has found out). It walks the shortest route. Coming up to a doorway on it, it checks
+    the door leaf in its LiDAR map (costmap.py tracks each leaf's bearing about its hinge): an
+    open leaf is walked through. A closed leaf (or one it can't make out) is tested: the robot
+    stops square in front of it and pushes it with its right palm. If the palm can't get past
+    the door plane (arm encoders + its own pose estimate, no simulator truth) the door is locked:
+    the robot says so, remembers it, and replans the same trip through the other doorways. The
+    physics is unchanged: a locked door is welded shut whether or not the robot knows.
 
         disc = DoorDiscovery(env, robot, say=print)   # after apply(); wraps robot.go_to
     """
 
-    def __init__(self, env, robot, say=print, on_found=None, radius: float = 0.85):
+    def __init__(self, env, robot, say=print, on_found=None, radius: float = 0.95):
         self.env, self.robot, self.say, self.on_found = env, robot, say, on_found
-        self.truth = set(env.locked_doors)  # what the house really has locked
+        self.truth = set(env.locked_doors)  # what the house really has locked (evaluation only)
         self.known: set[str] = set()  # what the robot has found out
+        self.tested: set[str] = set()  # doors it has looked at / pushed on the way
+        self.touches: list[dict] = []  # push tests (for logs)
         env.locked_doors = self.known  # the planner only avoids doors the robot knows are locked
         if getattr(robot, "costmap", None) is not None:
             # Perceived navigation (costmap.py, G1_NAV=live): the robot built its map while
@@ -294,7 +333,7 @@ class DoorDiscovery:
         self._route_doors: set[str] = set()
         go_to = robot.go_to
 
-        def go_to_finding_locks(station: str, _tries: int = 4):
+        def go_to_finding_locks(station: str, _tries: int = 6):
             for _ in range(_tries):
                 st, p = env.stations.get(station), robot.wbc.base_pos
                 path = env.plan_path((float(p[0]), float(p[1])), (st.x, st.y)) if st else None
@@ -308,20 +347,71 @@ class DoorDiscovery:
                 robot.on_frame = watch
                 try:
                     return go_to(station)
-                except DoorLocked as e:
+                except DoorAhead as e:
+                    robot.on_frame = frame
                     robot.wbc.set_velocity(0.0, 0.0, 0.0)
+                    if self.touch(e.door):
+                        continue  # it gave: carry on through it
                     self.known.add(e.door)
                     if getattr(robot, "costmap", None) is not None:
                         robot.costmap.mark_door_locked(e.door)
                     a, b = e.door.split("_")
-                    self.say(f"the {a}-{b} door is locked: rerouting the other way")
+                    self.say(f"the {a}-{b} door won't open: it's locked. Rerouting the other way")
                     if self.on_found is not None:
                         self.on_found(e.door)
-                    robot.wait(0.8)  # come to a stop before setting off again
+                    robot._step_back(0.3)
                 finally:
                     robot.on_frame = frame
             return {"ok": False, "error": f"couldn't find a way to the {station}"}
         robot.go_to = go_to_finding_locks
+
+    @staticmethod
+    def _frame(door: str):
+        dw = H.DOORWAYS[door]
+        x0, y0, x1, y1 = H.WALLS[dw["wall"]]
+        u = np.array([x1 - x0, y1 - y0], float)
+        u /= np.linalg.norm(u)
+        return np.asarray(dw["center"], float), u, np.array([-u[1], u[0]])
+
+    def leaf_closed(self, door: str) -> bool | None:
+        """From the LiDAR map: is this door's leaf across the doorway? None: not made out yet."""
+        cm = getattr(self.robot, "costmap", None)
+        if cm is None or door not in cm.door_names:
+            return None
+        n = cm.door_names.index(door)
+        a = cm.leaf_bearing.get(n)
+        if a is None:
+            return None
+        closed = cm.door_zones[n][3]
+        return abs((a - closed + math.pi) % (2 * math.pi) - math.pi) < math.radians(LEAF_CLOSED_DEG)
+
+    def touch(self, door: str) -> bool:
+        """Stand square in front of the closed leaf and push it with the right palm. True if it
+        gives (the palm gets past the door plane), False if it is locked."""
+        r = self.robot
+        c, u, nrm = self._frame(door)
+        p = np.asarray(r.wbc.base_pos[:2], float)
+        n_in = -np.sign((p - c) @ nrm) * nrm  # from the robot's side into the door
+        yaw = math.atan2(n_in[1], n_in[0])
+        left = np.array([-n_in[1], n_in[0]])
+        a, b = door.split("_")
+        self.say(f"the {a}-{b} door is closed: pushing it")
+        stand = c - TOUCH_STAND * n_in + 0.15 * left  # door centre in line with the right shoulder
+        r._drive_to(float(stand[0]), float(stand[1]), yaw, tol=0.04, timeout=12.0)
+        pre = np.array([*(c - 0.14 * n_in), TOUCH_Z])
+        push = np.array([*(c + TOUCH_REACH * n_in), TOUCH_Z])
+        r.move_hand(pre, duration=1.0)
+        short = r.move_hand(push, duration=1.5, settle=0.6)  # palm (estimated pose + encoders) vs target
+        palm = r.ik.palm_pose()[0]
+        past = float((palm[:2] - c) @ n_in)  # palm beyond the door plane (m; leaf face at -0.02)
+        r.arm_home()
+        gave = short < TOUCH_BLOCKED
+        self.touches.append({"door": door, "palm_short_m": round(short, 3), "palm_past_plane_m": round(past, 3),
+                             "gave": gave})
+        self.tested.add(door)
+        self.say(f"pushed the {a}-{b} door: palm stopped {short * 100:.0f} cm short - "
+                 + ("it opens" if gave else "it doesn't move"))
+        return gave
 
     @staticmethod
     def _doors_on(path) -> set[str]:
@@ -340,10 +430,15 @@ class DoorDiscovery:
         return out
 
     def check(self) -> None:
-        """Called every control tick while walking: at a doorway on the route whose door is
-        locked (it stays shut), stop."""
-        p = self.robot.wbc.base_pos
-        for dn in (self.truth - self.known) & self._route_doors:
-            c = H.DOORWAYS[dn]["center"]
-            if math.hypot(p[0] - c[0], p[1] - c[1]) < self.radius:
-                raise DoorLocked(dn)
+        """Called every control tick while walking: coming up to a doorway on the route, look at
+        its leaf in the LiDAR map; open -> walk on, closed or unclear -> stop and push it."""
+        p = np.asarray(self.robot.wbc.base_pos[:2], float)
+        for dn in self._route_doors - self.tested - self.known:
+            c, _, nrm = self._frame(dn)
+            if np.linalg.norm(p - c) >= self.radius or abs((p - c) @ nrm) < 0.3:
+                continue  # not there yet, or already in the doorway
+            closed = self.leaf_closed(dn)
+            if closed is False:
+                self.tested.add(dn)  # seen open: walk through
+                continue
+            raise DoorAhead(dn)

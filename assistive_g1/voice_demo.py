@@ -4,6 +4,9 @@
     ../sim/.venv/bin/mjpython voice_demo.py --list                        # the 25 demo scenarios
     ../sim/.venv/bin/mjpython voice_demo.py --scenario 18                 # macOS (viewer needs mjpython)
     ../sim/.venv/bin/mjpython voice_demo.py --random --seed 7 --clutter 4 --lock-door living_kitchen
+    ../sim/.venv/bin/mjpython voice_demo.py --scenario 3 --mic --no-gemma --record reroute.mp4
+        # bottle on the counter (first place checked), living-kitchen door locked -> reroute;
+        # you speak into the laptop mic; rules interpreter only; side-panel video recorded
 
 Keys in the viewer:
     V   the person asks for water (one of eight lines: some direct, some hints)
@@ -40,7 +43,13 @@ import sys  # noqa: E402
 import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-os.environ.setdefault("G1_CHEAT_GRASP", "fallback")  # real grasp first, abstracted contact if it fails
+# --grasp (read before skills.py is imported): "abstracted" (default for the live demo: the item
+# must be seen and the hand must reach it, then it is held upright and set down upright;
+# cheat_grasp.py), "fallback" (real grasp first, abstracted if it fails; the real side pinch can
+# leave a bottle tilted in the hand, and it then topples when put down), "real".
+GRASP_MODES = {"abstracted": "1", "fallback": "fallback", "real": "0"}
+_grasp = next((sys.argv[i + 1] for i, a in enumerate(sys.argv[:-1]) if a == "--grasp"), "abstracted")
+os.environ.setdefault("G1_CHEAT_GRASP", GRASP_MODES.get(_grasp, "1"))
 
 import mujoco  # noqa: E402
 import numpy as np  # noqa: E402
@@ -55,7 +64,7 @@ from scenario import (DOORS, N_SCENARIOS, SPAWNS, DoorDiscovery, Scenario, apply
                       prior_memory, scenario)
 from skills import AssistiveRobot  # noqa: E402
 
-from brain.hearing import SimAudioSource  # noqa: E402
+from brain.hearing import MicAudioSource, SimAudioSource  # noqa: E402
 from brain.safety import RejectedAction  # noqa: E402
 from scripts.voice_robot import build  # noqa: E402
 from sim import house_env as H  # noqa: E402
@@ -100,6 +109,21 @@ class Demo:
         # The robot hears the clip as it plays on the speakers (wall clock), and a phrase only
         # reaches speech-to-text once it has heard the person stop talking.
         self.ears = SimAudioSource(self.env, ears="head_cam", stream=True, clock=time.time, time_key="wall_time")
+        # --mic: also the laptop microphone (a real person talking). The V/C/Y/N clips still go to
+        # the simulated ears above; the mic ignores what it picks up of them from the speakers.
+        self.mic = None
+        self._clip_until = 0.0
+        if args.mic:
+            print("calibrating the laptop mic to the room for 1 s, stay quiet…")
+            self.mic = MicAudioSource().start()
+        self.rec = None
+        self.panel = None
+        if not args.no_panel:
+            from house_demo import SidePanel
+            self.panel = SidePanel()
+        if args.record:
+            from house_demo import LightRecorder
+            self.rec = LightRecorder(Path(args.record), fps=args.fps, size=tuple(args.size))
         self.person = PersonVoice(seed=args.seed)
         self.execute = not args.plan_only
         self.mode, self.question, self.plan, self.item = "listening", "", None, None
@@ -117,7 +141,7 @@ class Demo:
         self.events.add("mode", mode="listening")
         self.events.add("status", listening=True, message=(
             f"G1 in the house · {info['scenario']} · V water · C cup · Y/N · F fetch/plan · X cancel · "
-            f"Whisper {self.pipeline.stt.name} · {self.pipeline.interpreter_name}"))
+            f"{'laptop mic' if args.mic else 'sim mic'} · Whisper {self.pipeline.stt.name} · {self.pipeline.interpreter_name}"))
 
     def door_found(self, door: str) -> None:
         """The robot just found a locked door: say so, and redraw the route it now takes."""
@@ -159,6 +183,7 @@ class Demo:
                                                        "wav": str(utt.wav), "sim_time": utt.sim_time,
                                                        "wall_time": time.time() + PLAYER_LATENCY_S}
                     self.caption("person", utt.phrase, clip_seconds(utt.wav) + 2.0)
+                    self._clip_until = time.time() + PLAYER_LATENCY_S + clip_seconds(utt.wav) + 0.5
                     print(f'  person: "{utt.phrase}"')
             elif p[0] == "toggle":
                 self.execute = not self.execute
@@ -176,11 +201,27 @@ class Demo:
         self.pipeline.tick()
         for h in self.ears.poll():  # a finished phrase: the person has stopped talking
             self.pipeline.submit(h)
+        if self.mic is None:
+            return
+        if not getattr(self, "_mic_ready", False) and self.mic.room_dbfs is not None:
+            self._mic_ready = True
+            print(f"  mic ready: room {self.mic.room_dbfs:.0f} dBFS, speech above {self.mic.vad.threshold:.0f} dBFS")
+        for h in self.mic.poll():
+            if h.start_s < self.robot_voice.speaking_until or h.start_s < self._clip_until:
+                continue  # the robot's voice or a V/C/Y/N clip coming out of the laptop speakers
+            print(f"  mic heard {h.duration_s:.1f} s of speech -> speech-to-text")
+            self.pipeline.submit(h)
+
+    @property
+    def hearing(self) -> bool:
+        return self.ears.hearing or (self.mic is not None and self.mic.hearing)
 
     def follow_events(self) -> None:
         """React to what the voice pipeline decided (it runs on its own thread)."""
         for e in self.events.since(self.seen):
             self.seen = e["seq"] + 1
+            if e["kind"] == "transcript":
+                print(f'  heard: "{e.get("text") or "(not speech)"}"')
             if e["kind"] == "robot_said":
                 self.caption("robot", e["text"], 4.0)
             elif e["kind"] == "command" and not self.busy:
@@ -212,6 +253,8 @@ class Demo:
         msg = msg.strip()
         self.step_text = msg
         self.caption("step", msg, 6.0)
+        if self.rec is not None:
+            self.rec.caption = msg[:110]
         print(f"  [{self.env.data.time:6.1f}s] {msg}")
         self.events.add("step", text=msg, likely=self.likely())
 
@@ -273,16 +316,17 @@ class Demo:
         if self.mode in ("fetch", "done", "failed") and self.plan:
             p = self.plan
             head = {"fetch": "FETCHING" if self.busy else "FETCH MODE", "done": "DELIVERED", "failed": "FETCH FAILED"}[self.mode]
-            texts.append((FONT, mujoco.mjtGridPos.mjGRID_TOPLEFT, head, f"{p['item']} -> {p['destination']}"))
             what = (f"step: {p['action']} {p['target'] or ''}" if self.busy or self.mode != "fetch"
                     else f"next step: {p['action']} {p['target'] or ''}")
             found = f"\nfound at: {self.found_at}" if self.found_at else ""
-            texts.append((FONT, mujoco.mjtGridPos.mjGRID_TOPRIGHT, f"{what}\nbeliefs: {likely}{found}",
-                          "" if self.execute or self.busy else "plan only (F to fetch)"))
+            plan_only = "" if self.execute or self.busy else "\nplan only (F to fetch)"
+            # all top-left: the right edge of the window is the side panel
+            texts.append((FONT, mujoco.mjtGridPos.mjGRID_TOPLEFT, head,
+                          f"{p['item']} -> {p['destination']}\n{what}\nbeliefs: {likely}{found}{plan_only}"))
         elif self.mode == "asking":
-            texts.append((FONT, mujoco.mjtGridPos.mjGRID_TOPLEFT, "ASKING" + (" (listening…)" if self.ears.hearing else ""),
+            texts.append((FONT, mujoco.mjtGridPos.mjGRID_TOPLEFT, "ASKING" + (" (listening…)" if self.hearing else ""),
                           self.question))
-        elif self.ears.hearing:
+        elif self.hearing:
             texts.append((FONT, mujoco.mjtGridPos.mjGRID_TOPLEFT, "LISTENING…", "waiting for the person to finish"))
         else:
             texts.append((FONT, mujoco.mjtGridPos.mjGRID_TOPLEFT, "LISTENING",
@@ -334,6 +378,8 @@ class Demo:
     # ------------------------------------------------------------------ main loop
     def frame(self, _robot=None) -> None:
         """Every 50 Hz control tick (also while the robot is busy fetching)."""
+        if self.rec is not None:
+            self.rec(self.robot)
         v = self.viewer
         if v is None:
             return
@@ -346,13 +392,27 @@ class Demo:
             self.draw_scene(v)
         # set_texts waits for the viewer's GUI thread, which needs the lock: never call it while
         # holding the lock (deadlock), and only when the text actually changes.
+        self.k_panel = getattr(self, "k_panel", 0) + 1
+        if self.panel is not None and self.k_panel % 5 == 1:  # 10 Hz
+            vp = v.viewport
+            if vp is not None and vp.width > 0 and vp.height > 0:
+                pw = max(240, vp.width // 4)
+                img = self.panel.render(self.robot, pw, vp.height)
+                v.set_images((mujoco.MjrRect(vp.left + vp.width - pw, vp.bottom, pw, vp.height), img))
         texts = self.texts()
         if texts != self._shown:
             v.set_texts(texts)
             self._shown = texts
         v.sync()
+        # --speed while the robot is carrying out a fetch; real time while it talks or listens
+        # (its voice clips and the person play in real time). Re-anchor the clock on a change.
+        speaking = self.robot_voice is not None and time.time() < getattr(self.robot_voice, "speaking_until", 0.0)
+        speed = self.args.speed if self.busy and not speaking else 1.0
+        if speed != getattr(self, "_speed_now", None):
+            self._speed_now = speed
+            self._clock = (time.time(), self.env.data.time)
         t0, s0 = self._clock
-        ahead = (self.env.data.time - s0) / self.args.speed - (time.time() - t0)
+        ahead = (self.env.data.time - s0) / speed - (time.time() - t0)
         if ahead > 0:
             time.sleep(ahead)
 
@@ -376,13 +436,18 @@ class Demo:
                         break
             except KeyboardInterrupt:
                 pass
+        if self.rec is not None:
+            self.rec.close()
+            print(f"video: {self.args.record}")
+        if self.mic is not None:
+            self.mic.stop()
         self.pipeline.stop()
 
 
 def main() -> None:
     stations = sorted({s.station for spots in SPAWNS.values() for s, _ in spots})
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--scenario", type=int, default=0, choices=range(N_SCENARIOS), metavar="0-24",
+    ap.add_argument("--scenario", type=int, default=0, choices=range(N_SCENARIOS + 1), metavar="0-25",
                     help="demo scenario: 5 x placement + setup (see --list)")
     ap.add_argument("--list", action="store_true", help="list the 25 scenarios and exit")
     ap.add_argument("--random", action="store_true", help="draw a scenario from the spawn odds instead")
@@ -393,14 +458,22 @@ def main() -> None:
     ap.add_argument("--clutter", type=int, default=0, help="with --random: pieces of clutter (0-8)")
     ap.add_argument("--plan-only", action="store_true", help="fetch mode only plans (F toggles)")
     ap.add_argument("--max-turns", type=int, default=15)
-    ap.add_argument("--speed", type=float, default=1.0, help="sim speed vs real time while fetching")
+    ap.add_argument("--speed", type=float, default=1.0, help="sim speed vs real time while the robot is moving (back to 1 while it speaks)")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-browser", action="store_true")
-    ap.add_argument("--no-gemma", action="store_true")
+    ap.add_argument("--grasp", choices=list(GRASP_MODES), default="abstracted",
+                    help="abstracted (default): held and set down upright; fallback: real grasp first; real")
+    ap.add_argument("--no-gemma", action="store_true", help="rules interpreter only (no local Gemma 4 / Ollama)")
+    ap.add_argument("--mic", action="store_true", help="listen on the laptop microphone (needs sounddevice)")
+    ap.add_argument("--no-panel", action="store_true", help="hide the side panel (head cam, LiDAR/depth map, stats)")
+    ap.add_argument("--record", metavar="MP4", help="also record the run with the side panel (head cam, map, stats)")
+    ap.add_argument("--size", type=int, nargs=2, default=[1280, 720], help="with --record")
+    ap.add_argument("--fps", type=float, default=15, help="with --record")
     args = ap.parse_args()
     if args.list:
         for n in range(N_SCENARIOS):
             print(describe_scenario(n))
+        print(describe_scenario(N_SCENARIOS))
         return
     Demo(args).run()
 

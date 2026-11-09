@@ -343,6 +343,11 @@ class MicAudioSource:
         self._calib = []
         return have[need:]
 
+    @property
+    def hearing(self) -> bool:
+        """True while an utterance is still coming in (same meaning as SimAudioSource.hearing)."""
+        return bool(self.vad._speech)
+
     def start(self) -> "MicAudioSource":
         self.vad.reset(t0=self._clock() + self.calibrate_s)
         self._stream = self._sd.InputStream(

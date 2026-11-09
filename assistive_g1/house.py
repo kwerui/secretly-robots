@@ -322,7 +322,56 @@ class G1House(HouseEnv):
         self.plan_clearance = clear.copy()  # what the route was planned on (for re-plan checks)
         # (the squared crossings are checked against the map only when it is the perceived one;
         # on the true geometry the routes stay exactly Jack's/Eren's)
-        return self._through_doorways(path, grid=grid if self.costmap is not None else None)
+        path = self._through_doorways(path, grid=grid if self.costmap is not None else None)
+        return self._pull_string(path, grid)
+
+    def _door_points(self, path) -> set[int]:
+        """Indices of the squared doorway crossing points (pre/post, on a doorway's centre line)."""
+        keep = set()
+        for k, p in enumerate(path):
+            p = np.asarray(p, float)
+            for dw in H.DOORWAYS.values():
+                x0, y0, x1, y1 = H.WALLS[dw["wall"]]
+                u = np.array([x1 - x0, y1 - y0], float)
+                u /= np.linalg.norm(u)
+                d = p - np.asarray(dw["center"], float)
+                if abs(d @ u) < 1e-6 and 0 < abs(d @ np.array([-u[1], u[0]])) < 0.7:
+                    keep.add(k)
+        return keep
+
+    def _free_between(self, grid, p, q, skip: float = 0.25) -> bool:
+        """Straight run p -> q on free cells; an end that itself stands in a blocked cell (a
+        station close to furniture, the robot next to a wall) may have `skip` m of blocked run."""
+        p, q = np.asarray(p, float), np.asarray(q, float)
+        L = float(np.linalg.norm(q - p))
+        n = max(2, int(L / (H.GRID_RES / 3)) + 1)
+        def blocked(xy):
+            i, j = self._cell(*xy)
+            return bool(grid[min(max(i, 0), grid.shape[0] - 1), min(max(j, 0), grid.shape[1] - 1)])
+        p_in, q_in = blocked(p), blocked(q)
+        for t in np.linspace(0.0, 1.0, n):
+            x = p + t * (q - p)
+            if blocked(x) and not ((p_in and t * L < skip) or (q_in and (1 - t) * L < skip)):
+                return False
+        return True
+
+    def _pull_string(self, path, grid):
+        """Drop waypoints the robot can skip in a straight run on free cells (the doorway
+        squaring can leave a point behind the post-crossing point, which made the robot double
+        back: a zigzag). The squared crossing points themselves are kept: the robot meets a door
+        leaf straight on through them."""
+        if path is None or len(path) <= 2:
+            return path
+        keep = self._door_points(path)
+        out, i = [path[0]], 0
+        while i < len(path) - 1:
+            nxt = next((k for k in sorted(keep) if k > i), len(path) - 1)
+            j = nxt
+            while j > i + 1 and not self._free_between(grid, path[i], path[j]):
+                j -= 1
+            out.append(path[j])
+            i = j
+        return [(float(x), float(y)) for x, y in out]
 
     @staticmethod
     def _length(path) -> float:

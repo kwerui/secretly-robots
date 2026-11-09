@@ -40,46 +40,124 @@ from run_demo import Recorder
 from skills import AssistiveRobot
 
 
+PANEL_BG = (34, 36, 40)
+PANEL_FG = (230, 230, 230)
+PANEL_DIM = (150, 155, 160)
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+
+class SidePanel:
+    """The robot's-eye side panel, as an RGB image `width` x `height`:
+      * the robot's head camera (RGB) with the ArUco markers it detects drawn on,
+      * the robot's own clearance map (costmap.py): grey = floor plan, black = seen by its
+        LiDAR / depth camera, blue = the route it is walking, red = where it thinks it is,
+      * live numbers: LiDAR scans, depth frames, obstacles seen that are not in the floor plan,
+        localisation error, re-plans, locked doors known, what it is holding.
+    Used by LightRecorder (video) and voice_demo.py (live, overlaid on the MuJoCo viewer)."""
+
+    def __init__(self):
+        self.head_r = None
+
+    def render(self, robot, width: int, height: int) -> np.ndarray:
+        import mujoco
+        if self.head_r is None:
+            self.head_r = mujoco.Renderer(robot.model, 240, 320)
+        s = width / 320  # text and spacing scale (1 at 320 px wide; 2 on a retina viewer)
+        img = np.empty((height, width, 3), np.uint8)
+        img[:] = PANEL_BG
+        pad = int(8 * s)
+        iw = width - 2 * pad
+        x0, y = pad, pad
+        th = max(1, int(round(s)))
+
+        def text(t, yy, size=0.42, col=PANEL_FG):
+            cv2.putText(img, t, (x0, int(yy + 12 * s)), FONT, size * s, col, th, cv2.LINE_AA)
+
+        # head camera + the markers the robot detects in it
+        text("Head camera (RGB-D) + ArUco detections", y, 0.4)
+        y += int(18 * s)
+        self.head_r.update_scene(robot.data, camera="head_cam")
+        self.head_r.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = False
+        head = np.ascontiguousarray(self.head_r.render())
+        cam = getattr(robot, "cam", None)
+        if cam is not None:
+            corners, ids = cam._detect_raw(cv2.cvtColor(head, cv2.COLOR_RGB2GRAY))
+            if ids is not None:
+                cv2.aruco.drawDetectedMarkers(head, corners, ids, borderColor=(0, 255, 0))
+                for c, mid in zip(corners, ids.flatten()):
+                    x, yy = c.reshape(4, 2)[0].astype(int)
+                    cv2.putText(head, cam.labels.get(int(mid), str(int(mid))), (x, max(10, yy - 5)), FONT, 0.4,
+                                (255, 255, 0), 1, cv2.LINE_AA)
+        ih = iw * 3 // 4
+        img[y:y + ih, x0:x0 + iw] = cv2.resize(head, (iw, ih), interpolation=cv2.INTER_AREA)
+        y += ih + int(10 * s)
+
+        # the robot's own map
+        cmap = getattr(robot, "costmap", None)
+        text("Robot's own map: LiDAR + depth on the floor plan", y, 0.4)
+        y += int(18 * s)
+        if cmap is not None:
+            amap = cmap.image(path=robot.nav_path, robot_xy=robot.wbc.base_pos[:2], scale=2)
+            mh = int(round(iw * amap.shape[0] / amap.shape[1]))
+            if y + mh < height:
+                img[y:y + mh, x0:x0 + iw] = cv2.resize(amap, (iw, mh), interpolation=cv2.INTER_AREA)
+            y += mh + int(12 * s)
+        else:
+            text("(G1_NAV=static: planning on the true geometry)", y, 0.38, PANEL_DIM)
+            y += int(24 * s)
+
+        # live numbers
+        lines = []
+        if cmap is not None:
+            new_cells, _ = cmap.changed_vs_prior()
+            lines.append(f"LiDAR scans {cmap.scans}   depth frames {cmap.depth_frames}")
+            lines.append(f"obstacles seen (not in plan) {new_cells} cells")
+        est = getattr(robot, "estimator", None)
+        replans = len(getattr(robot, "nav_log", []))
+        loc = f"localisation error {est.error()['xy_m'] * 100:.1f} cm   " if est is not None else ""
+        lines.append(f"{loc}re-plans {replans}")
+        locked = sorted(getattr(robot.world, "locked_doors", ()) or ())
+        if locked:
+            lines.append("locked doors known: " + ", ".join(d.replace("_", "-") for d in locked))
+        lines.append(f"holding: {(robot.holding or '-').replace('_', ' ')}")
+        for ln in lines:
+            if y + 14 * s > height - 22 * s:
+                break
+            text(ln, y)
+            y += int(19 * s)
+        cv2.putText(img, "grey = floor plan  black = seen  blue = route  red = robot", (x0, int(height - 10 * s)),
+                    FONT, 0.33 * s, PANEL_DIM, th, cv2.LINE_AA)
+        return img
+
+
 class LightRecorder(Recorder):
-    """run_demo.Recorder with a cheap head-camera inset (own small renderer, no marker
-    detection per frame): the house has far more geometry than the one-room scene."""
+    """Follow camera on the left, SidePanel on the right, caption in a bar across the top of the
+    main view. Shadows/reflections are off in the main view (with the house's 6 lights they
+    cost ~3.5x per frame on software GL)."""
 
     def __call__(self, robot) -> None:
         self.k += 1
         if self.k % self.every:
             return
         import mujoco
+        W, Ht = self.size
+        P = max(240, W // 4)  # side panel width
+        MW = W - P
         if self.renderer is None:
-            self.renderer = mujoco.Renderer(robot.model, self.size[1], self.size[0])
-            self.inset_r = mujoco.Renderer(robot.model, 240, 320)
+            self.renderer = mujoco.Renderer(robot.model, Ht, MW)
+            self.panel = SidePanel()
             self.cam.distance, self.cam.elevation = 3.6, -35
         target = robot.wbc.base_pos + np.array([0, 0, 0.1])
         self.cam.lookat[:] = 0.92 * self.cam.lookat + 0.08 * target if self.k > 2 else target
-        # no shadows/reflections: with the house's 6 lights they cost ~3.5x per frame (software GL)
         self.renderer.update_scene(robot.data, self.cam)
         self.renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = False
         self.renderer.scene.flags[mujoco.mjtRndFlag.mjRND_REFLECTION] = False
-        frame = self.renderer.render().copy()
-        self.inset_r.update_scene(robot.data, camera="head_cam")
-        self.inset_r.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = False
-        head = self.inset_r.render()
-        iw, ih = self.size[0] * 3 // 10, self.size[0] * 9 // 40
-        x0 = self.size[0] - iw - 12
-        frame[12:12 + ih, x0:x0 + iw] = cv2.resize(head, (iw, ih))
-        cv2.rectangle(frame, (x0, 12), (x0 + iw, 12 + ih), (255, 255, 255), 2)
-        cv2.putText(frame, "robot head camera", (x0 + 8, 12 + ih - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        if getattr(robot, "costmap", None) is not None:
-            # the robot's own clearance map (costmap.py): grey = floor plan, black = seen by its
-            # LiDAR / depth camera, blue = the route it is walking, red = where it thinks it is
-            mw, mh = self.size[0] * 3 // 10, self.size[0] * 9 // 40
-            amap = robot.costmap.image(path=robot.nav_path, robot_xy=robot.wbc.base_pos[:2], scale=2)
-            y0 = 12 + ih + 10
-            frame[y0:y0 + mh, x0:x0 + mw] = cv2.resize(amap, (mw, mh), interpolation=cv2.INTER_AREA)
-            cv2.rectangle(frame, (x0, y0), (x0 + mw, y0 + mh), (255, 255, 255), 2)
-            cv2.putText(frame, "robot's clearance map", (x0 + 8, y0 + mh - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (40, 40, 40), 1)
+        frame = np.empty((Ht, W, 3), np.uint8)
+        frame[:, :MW] = self.renderer.render()
+        frame[:, MW:] = self.panel.render(robot, P, Ht)
         if self.caption:
-            cv2.rectangle(frame, (0, self.size[1] - 40), (self.size[0], self.size[1]), (20, 20, 20), -1)
-            cv2.putText(frame, self.caption, (14, self.size[1] - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            cv2.rectangle(frame, (0, 0), (MW, 34), (20, 20, 20), -1)
+            cv2.putText(frame, self.caption, (12, 23), FONT, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
         self.writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
 
 
@@ -90,7 +168,7 @@ def main():
     ap.add_argument("--viewer", action="store_true", help="interactive MuJoCo viewer (needs GLX), no video")
     ap.add_argument("--speed", type=float, default=1.0, help="with --viewer: playback speed (1 = real time)")
     ap.add_argument("--fps", type=float, default=10)
-    ap.add_argument("--size", type=int, nargs=2, default=[800, 450])
+    ap.add_argument("--size", type=int, nargs=2, default=[1280, 720])
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--layout", default="tidy", help="Jack's layouts: tidy, laundry_day, door_shut, moving_house, long_way_round")
     ap.add_argument("--with-cup", action="store_true", help="after the bottle, also fetch the cup")
